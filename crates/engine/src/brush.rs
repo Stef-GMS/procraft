@@ -159,7 +159,7 @@ mod tests {
         assert!(doc.layers[0].pixels.iter().any(|&b| b != 0));
         let mut e = Stroke::begin(
             &mut doc,
-            Brush { eraser: true, size: 32.0, ..Default::default() },
+            Brush { eraser: true, size: 32.0, softness: 0.0, ..Default::default() },
             Color::rgb(0, 0, 0),
         );
         e.push(16.0, 16.0);

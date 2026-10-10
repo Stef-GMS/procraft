@@ -164,6 +164,8 @@ mod tests {
         );
         e.push(16.0, 16.0);
         drop(e);
-        assert!(doc.layers[0].pixels.iter().all(|&b| b == 0));
+        // Eraser removes alpha (destination-out); color bytes of fully
+        // transparent pixels are intentionally left alone.
+        assert!(doc.layers[0].pixels.iter().skip(3).step_by(4).all(|&b| b == 0));
     }
 }

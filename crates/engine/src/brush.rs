@@ -37,8 +37,9 @@ impl Default for Brush {
 impl Document {
     /// Stamp one dab centered at canvas pixel `(x, y)` on the active layer.
     pub fn dab(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
+        let (w_u32, h_u32) = (self.w, self.h);
         let Some(layer) = self.active_layer_mut() else { return };
-        let (w, h) = (self.w as f32, self.h as f32);
+        let (w, h) = (w_u32 as f32, h_u32 as f32);
         let radius = (brush.size * 0.5).max(0.5);
         let strength = brush.opacity.clamp(0.0, 1.0);
         if strength <= 0.0 {
@@ -48,7 +49,7 @@ impl Document {
         let y0 = (y - radius).floor().max(0.0) as u32;
         let x1 = (x + radius).ceil().min(w - 1.0).max(0.0) as u32;
         let y1 = (y + radius).ceil().min(h - 1.0).max(0.0) as u32;
-        let w = self.w;
+        let w = w_u32;
         for py in y0..=y1 {
             for px in x0..=x1 {
                 let d = ((px as f32 + 0.5 - x).hypot(py as f32 + 0.5 - y)) / radius;

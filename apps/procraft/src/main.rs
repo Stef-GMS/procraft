@@ -46,10 +46,8 @@ impl ProCraftApp {
     }
 
     fn refresh_texture(&mut self, ctx: &egui::Context) {
-        let img = ColorImage::from_rgba_unmultiplied(
-            [self.doc.w as usize, self.doc.h as usize],
-            self.doc.flatten(),
-        );
+        let flat = self.doc.flatten();
+        let img = ColorImage::from_rgba_unmultiplied([self.doc.w as usize, self.doc.h as usize], &flat);
         match &mut self.texture {
             Some(handle) => handle.set(img, TextureOptions::LINEAR),
             None => {
@@ -60,15 +58,16 @@ impl ProCraftApp {
 }
 
 impl eframe::App for ProCraftApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Ctrl+Z undo.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z)) && self.doc.undo() {
+        if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z)) && self.doc.undo()
+        {
             self.status = "Undone.".to_string();
         }
 
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+        egui::Panel::top("menu").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("💾 Save PNG").clicked() {
+                if ui.button("Save PNG").clicked() {
                     if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).save_file() {
                         match self.doc.save_png(&path) {
                             Ok(()) => self.status = format!("Saved {}", path.display()),
@@ -76,7 +75,7 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                 }
-                if ui.button("📂 Open image").clicked() {
+                if ui.button("Open image").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"])
                         .pick_file()
@@ -90,28 +89,25 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                 }
-                if ui.button("🧹 Clear layer").clicked() {
+                if ui.button("Clear layer").clicked() {
                     self.doc.checkpoint();
                     if let Some(layer) = self.doc.active_layer_mut() {
                         layer.clear();
                     }
                 }
-                if ui.button("↩ Undo").clicked() && self.doc.undo() {
+                if ui.button("Undo").clicked() && self.doc.undo() {
                     self.status = "Undone.".to_string();
                 }
             });
         });
 
-        egui::SidePanel::left("tools").show(ctx, |ui| {
+        egui::Panel::left("tools").show(ui, |ui| {
             ui.heading("Tool");
-            ui.radio_value(&mut self.tool, Tool::Brush, "🖌 Brush");
-            ui.radio_value(&mut self.tool, Tool::Eraser, "🧽 Eraser");
+            ui.radio_value(&mut self.tool, Tool::Brush, "Brush");
+            ui.radio_value(&mut self.tool, Tool::Eraser, "Eraser");
             ui.separator();
             ui.heading("Color");
-            let mut c = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
-            if egui::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
-                self.color = [c.r(), c.g(), c.b()];
-            }
+            egui::color_picker::color_edit_button_srgb(ui, &mut self.color);
             ui.separator();
             ui.add(egui::Slider::new(&mut self.brush.size, 1.0..=200.0).text("Size"));
             ui.add(egui::Slider::new(&mut self.brush.opacity, 0.05..=1.0).text("Opacity"));
@@ -119,9 +115,9 @@ impl eframe::App for ProCraftApp {
             ui.add(egui::Slider::new(&mut self.brush.spacing, 0.05..=1.0).text("Spacing"));
         });
 
-        egui::SidePanel::right("layers").show(ctx, |ui| {
+        egui::Panel::right("layers").show(ui, |ui| {
             ui.heading("Layers");
-            if ui.button("＋ Add layer").clicked() {
+            if ui.button("Add layer").clicked() {
                 self.doc.add_layer(format!("Layer {}", self.doc.layers.len() + 1));
             }
             let mut remove = None;
@@ -136,7 +132,7 @@ impl eframe::App for ProCraftApp {
                     if ui.selectable_label(selected, &layer.name).clicked() {
                         select = Some(i);
                     }
-                    if ui.small_button("🗑").clicked() {
+                    if ui.small_button("del").clicked() {
                         remove = Some(i);
                     }
                 });
@@ -160,12 +156,13 @@ impl eframe::App for ProCraftApp {
             ));
         });
 
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        egui::Panel::bottom("status").show(ui, |ui| {
             ui.label(&self.status);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            self.refresh_texture(ctx);
+        egui::CentralPanel::default().show(ui, |ui| {
+            let ctx = ui.ctx().clone();
+            self.refresh_texture(&ctx);
             let tex = self.texture.as_ref().unwrap().id();
             let (w, h) = (self.doc.w as f32, self.doc.h as f32);
             egui::ScrollArea::both().show(ui, |ui| {
@@ -195,7 +192,7 @@ impl eframe::App for ProCraftApp {
                         self.leftover = leftover;
                     }
                 }
-                if resp.drag_stopped() || resp.drag_released() {
+                if resp.drag_stopped() {
                     self.painting = false;
                     self.last = None;
                 }

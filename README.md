@@ -25,7 +25,7 @@ original.
 
 ## Icon
 
-Original peacock-feather mark drawn natively in VectorCraft (headless batch;
+Original layer-stack mark drawn natively in VectorCraft (headless batch;
 `assets/icon-generator.py` replays the whole construction, `assets/icon.svg`
 is the editable source). Shipped as the window icon and the embedded exe icon.
 

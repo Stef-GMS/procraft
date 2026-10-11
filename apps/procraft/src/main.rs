@@ -273,7 +273,9 @@ impl eframe::App for ProCraftApp {
             });
         });
 
-        egui::Panel::left("tools").default_size(230.0).show(ui, |ui| {
+        // Fresh id (not "tools"): eframe persists panel widths to disk, and the
+        // old narrow width would otherwise override `default_size` forever.
+        egui::Panel::left("tools-wide").default_size(250.0).show(ui, |ui| {
             ui.heading("Tool");
             ui.radio_value(&mut self.tool, Tool::Brush, "✏ Brush");
             ui.radio_value(&mut self.tool, Tool::Eraser, "⌫ Eraser");

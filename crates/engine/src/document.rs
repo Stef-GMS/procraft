@@ -88,7 +88,7 @@ impl Document {
             h,
             layers: vec![Layer::blank("Layer 1".to_string(), w, h)],
             active: 0,
-            background: [128, 128, 128, 255],
+            background: [255, 255, 255, 255],
             selection: None,
             dirty: None,
             undo: Vec::new(),

@@ -72,15 +72,28 @@ struct ProCraftApp {
 }
 
 impl ProCraftApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Extra glyph coverage (tool icons) from a system symbol font; the
+        // app works fine without it.
+        let mut fonts = egui::FontDefinitions::default();
+        if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\seguisym.ttf") {
+            fonts.font_data.insert(
+                "segui-symbol".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                list.push("segui-symbol".to_owned());
+            }
+        }
+        cc.egui_ctx.set_fonts(fonts);
         Self {
             doc: Document::new(1280, 800),
             brush: Brush::default(),
             color: [30, 144, 255],
             tool: Tool::Brush,
-            theme: Theme::Dark,
+            theme: Theme::Paper,
             theme_applied: None,
-            page_custom: [128, 128, 128],
+            page_custom: [255, 255, 255],
             dynamics: 0.6,
             texture: None,
             painting: false,
@@ -260,11 +273,11 @@ impl eframe::App for ProCraftApp {
             });
         });
 
-        egui::Panel::left("tools").show(ui, |ui| {
+        egui::Panel::left("tools").default_size(230.0).show(ui, |ui| {
             ui.heading("Tool");
-            ui.radio_value(&mut self.tool, Tool::Brush, "🖌 Brush");
-            ui.radio_value(&mut self.tool, Tool::Eraser, "🧽 Eraser");
-            ui.radio_value(&mut self.tool, Tool::Select, "🔳 Select");
+            ui.radio_value(&mut self.tool, Tool::Brush, "✏ Brush");
+            ui.radio_value(&mut self.tool, Tool::Eraser, "⌫ Eraser");
+            ui.radio_value(&mut self.tool, Tool::Select, "⬚ Select");
             if ui.button("Clear selection").clicked() {
                 self.doc.selection = None;
                 self.status = "Selection cleared.".to_string();
@@ -272,10 +285,15 @@ impl eframe::App for ProCraftApp {
             ui.separator();
             ui.heading("Brushes");
             for (name, preset) in procraft_engine::presets() {
-                if ui.button(name).clicked() {
-                    self.brush = preset;
-                    self.tool = Tool::Brush;
-                }
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+                    let r = (preset.size * 0.5).clamp(2.0, 10.0);
+                    ui.painter().circle_filled(rect.center(), r, Color32::from_gray(200));
+                    if ui.button(name).clicked() {
+                        self.brush = preset;
+                        self.tool = Tool::Brush;
+                    }
+                });
             }
             ui.separator();
             ui.heading("Color");

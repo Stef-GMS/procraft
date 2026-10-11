@@ -1,5 +1,5 @@
-//! ProCraft milestone 2: smooth partial-upload painting, page colors, themes,
-//! brush presets, velocity dynamics and rectangular selections. Original code.
+//! ProCraft milestone 4: move tool, shape tools (line/rect/ellipse with fill),
+//! layer scale/rotate transforms, plus all milestone 2-3 features. Original code.
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
 use procraft_engine::{BlendMode, Brush, Color, Document};
@@ -9,6 +9,27 @@ enum Tool {
     Brush,
     Eraser,
     Select,
+    Move,
+    Shapes,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShapeKind {
+    Line,
+    Rect,
+    Ellipse,
+}
+
+impl ShapeKind {
+    const ALL: [ShapeKind; 3] = [ShapeKind::Line, ShapeKind::Rect, ShapeKind::Ellipse];
+
+    fn name(self) -> &'static str {
+        match self {
+            ShapeKind::Line => "Line",
+            ShapeKind::Rect => "Rect",
+            ShapeKind::Ellipse => "Ellipse",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,6 +89,12 @@ struct ProCraftApp {
     leftover: f32,
     sel_anchor: Option<(f32, f32)>,
     sel_current: Option<(f32, f32)>,
+    move_from: Option<(f32, f32)>,
+    move_acc: (f32, f32),
+    shape_anchor: Option<(f32, f32)>,
+    shape_current: Option<(f32, f32)>,
+    shape_kind: ShapeKind,
+    shape_fill: bool,
     zoom: f32,
     status: String,
 }
@@ -104,6 +131,12 @@ impl ProCraftApp {
             leftover: 0.0,
             sel_anchor: None,
             sel_current: None,
+            move_from: None,
+            move_acc: (0.0, 0.0),
+            shape_anchor: None,
+            shape_current: None,
+            shape_kind: ShapeKind::Rect,
+            shape_fill: false,
             zoom: 1.0,
             status: "Drag on the canvas to paint. Ctrl+Z undoes, Esc clears selection.".to_string(),
         }
@@ -190,8 +223,14 @@ impl eframe::App for ProCraftApp {
             self.sel_anchor = None;
             self.sel_current = None;
         }
-        // Keep frames coming while painting, selecting, or marching ants.
-        if self.painting || self.sel_anchor.is_some() || self.doc.selection.is_some() {
+        // Keep frames coming while painting, selecting, moving, shaping,
+        // or marching ants.
+        if self.painting
+            || self.sel_anchor.is_some()
+            || self.shape_anchor.is_some()
+            || self.move_from.is_some()
+            || self.doc.selection.is_some()
+        {
             ui.ctx().request_repaint();
         }
 
@@ -278,19 +317,47 @@ impl eframe::App for ProCraftApp {
         // Fresh id (not "tools"): eframe persists panel widths to disk, and the
         // old narrow width would otherwise override `default_size` forever.
         egui::Panel::left("tools-wide").default_size(300.0).show(ui, |ui| {
-        // Experiment: hide the panel scrollbar entirely (wheel still scrolls)
-        // to identify the thick black bar at the panel edge.
-        egui::ScrollArea::vertical()
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-            .show(ui, |ui| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Tool");
             ui.radio_value(&mut self.tool, Tool::Brush, "✏ Brush");
             ui.radio_value(&mut self.tool, Tool::Eraser, "⌫ Eraser");
             ui.radio_value(&mut self.tool, Tool::Select, "⬚ Select");
+            ui.radio_value(&mut self.tool, Tool::Move, "↔ Move");
+            ui.radio_value(&mut self.tool, Tool::Shapes, "○ Shapes");
+            if self.tool == Tool::Shapes {
+                ui.horizontal(|ui| {
+                    for k in ShapeKind::ALL {
+                        ui.radio_value(&mut self.shape_kind, k, k.name());
+                    }
+                });
+                ui.checkbox(&mut self.shape_fill, "Fill");
+            }
             if ui.button("Clear selection").clicked() {
                 self.doc.selection = None;
                 self.status = "Selection cleared.".to_string();
             }
+            ui.separator();
+            ui.heading("Transform layer");
+            ui.horizontal(|ui| {
+                if ui.button("Scale +").clicked() {
+                    self.doc.checkpoint();
+                    self.doc.affine_layer(self.doc.active, 1.25, 0.0);
+                }
+                if ui.button("Scale −").clicked() {
+                    self.doc.checkpoint();
+                    self.doc.affine_layer(self.doc.active, 1.0 / 1.25, 0.0);
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("⟲ −15°").clicked() {
+                    self.doc.checkpoint();
+                    self.doc.affine_layer(self.doc.active, 1.0, -15.0);
+                }
+                if ui.button("⟳ +15°").clicked() {
+                    self.doc.checkpoint();
+                    self.doc.affine_layer(self.doc.active, 1.0, 15.0);
+                }
+            });
             ui.separator();
             ui.heading("Brushes");
             for (name, preset) in procraft_engine::presets() {
@@ -500,6 +567,94 @@ impl eframe::App for ProCraftApp {
                             egui::Pos2::new(rect.min.x + x1 * z, rect.min.y + y1 * z),
                         );
                         paint_selection(ui.painter(), r, ctx.input(|i| i.time));
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                }
+
+                if self.tool == Tool::Move {
+                    // Drag the active layer around (integer steps).
+                    if resp.drag_started() {
+                        if let Some(pos) = resp.hover_pos() {
+                            self.doc.checkpoint();
+                            self.move_from = Some(to_canvas(pos));
+                            self.move_acc = (0.0, 0.0);
+                        }
+                    }
+                    if self.move_from.is_some() && resp.dragged() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            let (fx, fy) = self.move_from.unwrap();
+                            let ax = self.move_acc.0 + x - fx;
+                            let ay = self.move_acc.1 + y - fy;
+                            let (dx, dy) = (ax.trunc() as i32, ay.trunc() as i32);
+                            if dx != 0 || dy != 0 {
+                                self.doc.translate_layer(self.doc.active, dx, dy);
+                            }
+                            self.move_acc = (ax - dx as f32, ay - dy as f32);
+                            self.move_from = Some((x, y));
+                        }
+                    }
+                    if resp.drag_stopped() {
+                        self.move_from = None;
+                        self.status = "Layer moved.".to_string();
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                }
+
+                if self.tool == Tool::Shapes {
+                    // Drag a preview, rasterize on release.
+                    if resp.drag_started() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            self.shape_anchor = Some(clamp_pt(x, y));
+                            self.shape_current = self.shape_anchor;
+                        }
+                    }
+                    if self.shape_anchor.is_some() && resp.dragged() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            self.shape_current = Some(clamp_pt(x, y));
+                        }
+                    }
+                    if let (Some((ax, ay)), Some((bx, by))) = (self.shape_anchor, self.shape_current) {
+                        let r = egui::Rect::from_min_max(
+                            egui::Pos2::new(rect.min.x + ax.min(bx) * z, rect.min.y + ay.min(by) * z),
+                            egui::Pos2::new(rect.min.x + ax.max(bx) * z, rect.min.y + ay.max(by) * z),
+                        );
+                        paint_selection(ui.painter(), r, ctx.input(|i| i.time));
+                    }
+                    if resp.drag_stopped() {
+                        if let (Some((ax, ay)), Some((bx, by))) = (self.shape_anchor, self.shape_current) {
+                            self.doc.checkpoint();
+                            let brush = self.base_brush();
+                            let color = self.current_color();
+                            match self.shape_kind {
+                                ShapeKind::Line => {
+                                    self.doc.shape_line(&brush, color, Some((ax, ay)), (bx, by), 0.0);
+                                }
+                                ShapeKind::Rect => {
+                                    if self.shape_fill {
+                                        self.doc.fill_rect(&brush, color, ax as u32, ay as u32, bx as u32, by as u32);
+                                    } else {
+                                        self.doc.shape_rect(&brush, color, ax, ay, bx, by);
+                                    }
+                                }
+                                ShapeKind::Ellipse => {
+                                    if self.shape_fill {
+                                        self.doc.fill_ellipse(&brush, color, ax, ay, bx, by);
+                                    } else {
+                                        self.doc.shape_ellipse(&brush, color, ax, ay, bx, by);
+                                    }
+                                }
+                            }
+                            self.status = format!("{} drawn.", self.shape_kind.name());
+                        }
+                        self.shape_anchor = None;
+                        self.shape_current = None;
                     }
                     self.painting = false;
                     self.last = None;

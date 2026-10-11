@@ -221,6 +221,83 @@ impl Document {
         out
     }
 
+    /// Shift a layer by whole pixels (clipped, transparent fill).
+    /// Caller checkpoints for undo first.
+    pub fn translate_layer(&mut self, index: usize, dx: i32, dy: i32) {
+        if (dx == 0 && dy == 0) || index >= self.layers.len() {
+            return;
+        }
+        let (w, h) = (self.w as i32, self.h as i32);
+        let mut next = vec![0u8; (self.w * self.h * 4) as usize];
+        let src = self.layers[index].pixels.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let (sx, sy) = (x - dx, y - dy);
+                if sx >= 0 && sx < w && sy >= 0 && sy < h {
+                    let s = ((sy * w + sx) * 4) as usize;
+                    let d = ((y * w + x) * 4) as usize;
+                    next[d..d + 4].copy_from_slice(&src[s..s + 4]);
+                }
+            }
+        }
+        self.layers[index].pixels = next;
+        self.mark_full_dirty();
+    }
+
+    fn sample_bilinear(pixels: &[u8], w: u32, h: u32, x: f32, y: f32) -> [u8; 4] {
+        let x0 = x.floor().clamp(0.0, w as f32 - 1.0) as u32;
+        let y0 = y.floor().clamp(0.0, h as f32 - 1.0) as u32;
+        let x1 = (x0 + 1).min(w - 1);
+        let y1 = (y0 + 1).min(h - 1);
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        let at = |x: u32, y: u32| -> [f32; 4] {
+            let o = ((y * w + x) * 4) as usize;
+            [
+                pixels[o] as f32,
+                pixels[o + 1] as f32,
+                pixels[o + 2] as f32,
+                pixels[o + 3] as f32,
+            ]
+        };
+        let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+        let mut out = [0u8; 4];
+        for i in 0..4 {
+            let v = a[i] * (1.0 - fx) * (1.0 - fy) + b[i] * fx * (1.0 - fy) + c[i] * (1.0 - fx) * fy + d[i] * fx * fy;
+            out[i] = v.round().clamp(0.0, 255.0) as u8;
+        }
+        out
+    }
+
+    /// Scale (about the canvas center) then rotate (degrees clockwise) a
+    /// layer with bilinear sampling. Caller checkpoints for undo first.
+    pub fn affine_layer(&mut self, index: usize, scale: f32, degrees: f32) {
+        if index >= self.layers.len() || (scale - 1.0).abs() < 1e-6 && degrees.abs() < 1e-6 {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
+        let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
+        let theta = degrees.to_radians();
+        let (sin, cos) = theta.sin_cos();
+        let s = scale.max(0.01);
+        let src = self.layers[index].pixels.clone();
+        let mut next = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                // Inverse map: destination -> source.
+                let px = x as f32 - cx;
+                let py = y as f32 - cy;
+                let sx = (px * cos + py * sin) / s + cx;
+                let sy = (-px * sin + py * cos) / s + cy;
+                let o = ((y * w + x) * 4) as usize;
+                if sx >= 0.0 && sx < w as f32 && sy >= 0.0 && sy < h as f32 {
+                    next[o..o + 4].copy_from_slice(&Self::sample_bilinear(&src, w, h, sx, sy));
+                }
+            }
+        }
+        self.layers[index].pixels = next;
+        self.mark_full_dirty();
+    }
+
     /// Save the composite as PNG.
     pub fn save_png(&self, path: &std::path::Path) -> Result<(), String> {
         image::save_buffer(path, &self.flatten(), self.w, self.h, image::ColorType::Rgba8)
@@ -391,8 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn project_roundtrip_keeps_everything() {
-        let mut doc = Document::new(4, 3);
+    fn project_roundtrip_keeps_everything() {        let mut doc = Document::new(4, 3);
         doc.background = [10, 20, 30, 255];
         doc.layers[0].pixels = vec![7; 4 * 3 * 4];
         doc.layers[0].opacity = 0.5;
@@ -414,5 +490,40 @@ mod tests {
         assert!(!back.layers[1].visible);
         assert_eq!(back.active, 1);
         assert!(Document::open_project(&dir.join("missing.pcraft")).is_err());
+    }
+
+    #[test]
+    fn translate_shifts_pixels() {
+        let mut doc = Document::new(4, 1);
+        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.translate_layer(0, 2, 0);
+        assert_eq!(&doc.layers[0].pixels[8..12], &[255, 0, 0, 255]);
+        assert_eq!(&doc.layers[0].pixels[0..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn affine_identity_keeps_pixels() {
+        let mut doc = Document::new(8, 8);
+        for b in doc.layers[0].pixels.iter_mut() {
+            *b = 100;
+        }
+        let before = doc.layers[0].pixels.clone();
+        doc.affine_layer(0, 1.0, 0.0);
+        assert_eq!(doc.layers[0].pixels, before);
+        // 2x zoom of solid color stays solid.
+        doc.affine_layer(0, 2.0, 0.0);
+        assert!(doc.layers[0].pixels.chunks_exact(4).all(|p| p[0] == 100 && p[3] == 100));
+    }
+
+    #[test]
+    fn shape_fill_respects_selection() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(10, 10);
+        let brush = Brush { opacity: 1.0, ..Default::default() };
+        doc.selection = Some((2, 2, 5, 5));
+        doc.fill_rect(&brush, Color::rgb(1, 2, 3), 0, 0, 9, 9);
+        assert_eq!(doc.layers[0].pixels[0..4], vec![0, 0, 0, 0]);
+        let o = ((3 * 10 + 3) * 4) as usize;
+        assert_eq!(doc.layers[0].pixels[o + 3], 255);
     }
 }

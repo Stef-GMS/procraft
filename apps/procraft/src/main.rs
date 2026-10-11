@@ -605,6 +605,17 @@ impl eframe::App for ProCraftApp {
                     }
                     _ => {}
                 }
+                // Committed lasso outline stays visible on every tool (it is
+                // skipped while a new loop is being dragged: the Lasso branch
+                // below draws the live path instead).
+                if !self.lasso_poly.is_empty() && self.lasso_points.is_empty() {
+                    let pts: Vec<egui::Pos2> = self
+                        .lasso_poly
+                        .iter()
+                        .map(|&(x, y)| egui::Pos2::new(rect.min.x + x * z, rect.min.y + y * z))
+                        .collect();
+                    paint_path(ui.painter(), &pts, true);
+                }
 
                 if self.tool == Tool::Select {
                     // Marquee selection.
@@ -711,15 +722,6 @@ impl eframe::App for ProCraftApp {
                             self.lasso_poly.clear();
                         }
                         self.lasso_points.clear();
-                    }
-                    // Committed lasso outline.
-                    if !self.lasso_poly.is_empty() {
-                        let pts: Vec<egui::Pos2> = self
-                            .lasso_poly
-                            .iter()
-                            .map(|&(x, y)| egui::Pos2::new(rect.min.x + x * z, rect.min.y + y * z))
-                            .collect();
-                        paint_path(ui.painter(), &pts, true);
                     }
                     self.painting = false;
                     self.last = None;
@@ -878,11 +880,21 @@ impl eframe::App for ProCraftApp {
     }
 }
 
+/// Window icon: original peacock-feather art drawn in VectorCraft
+/// (see `assets/icon-generator.py`, rendered to `assets/icon-48.png`).
+fn app_icon() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../../../assets/icon-48.png");
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    Some(egui::IconData { rgba: img.into_raw(), width: w, height: h })
+}
+
 fn main() {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 900.0]),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1400.0, 900.0]);
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     let _ = eframe::run_native(
         "ProCraft",
         options,

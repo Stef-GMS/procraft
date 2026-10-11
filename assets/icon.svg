@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>ProCraft icon</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <path d="M232 0 L792 0 C946.667 0 1024 77.333 1024 232 L1024 792 C1024 946.667 946.667 1024 792 1024 L232 1024 C77.333 1024 0 946.667 0 792 L0 232 C0 77.333 77.333 0 232 0 Z" fill="#0b3d3a"/>
+    <path d="M247 330 C247 183.6 365.6 65 512 65 C658.4 65 777 183.6 777 330 C777 476.4 658.4 595 512 595 C365.6 595 247 476.4 247 330 Z" fill="#d9a441" opacity="0.12"/>
+    <path d="M499 955 L199 790" fill="none" stroke="#2fa36b" stroke-width="10" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M525 955 L825 790" fill="none" stroke="#2fa36b" stroke-width="10" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M499 918.8 L212.8 761.3" fill="none" stroke="#1e8c7a" stroke-width="9.7" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M525 918.8 L811.2 761.3" fill="none" stroke="#1e8c7a" stroke-width="9.7" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M499 882.5 L226.5 732.6" fill="none" stroke="#8fc25a" stroke-width="9.3" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M525 882.5 L797.5 732.6" fill="none" stroke="#8fc25a" stroke-width="9.3" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M499 846.2 L240.2 703.9" fill="none" stroke="#d9a441" stroke-width="9" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M525 846.2 L783.8 703.9" fill="none" stroke="#d9a441" stroke-width="9" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M499 810 L254 675.2" fill="none" stroke="#1e8c7a" stroke-width="8.7" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M525 810 L770 675.2" fill="none" stroke="#1e8c7a" stroke-width="8.7" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M499 773.8 L267.8 646.6" fill="none" stroke="#8fc25a" stroke-width="8.3" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M525 773.8 L756.2 646.6" fill="none" stroke="#8fc25a" stroke-width="8.3" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M499 737.5 L281.5 617.9" fill="none" stroke="#2fa36b" stroke-width="8" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M525 737.5 L742.5 617.9" fill="none" stroke="#2fa36b" stroke-width="8" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M499 701.2 L295.2 589.2" fill="none" stroke="#d9a441" stroke-width="7.7" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M525 701.2 L728.8 589.2" fill="none" stroke="#d9a441" stroke-width="7.7" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M499 665 L309 560.5" fill="none" stroke="#8fc25a" stroke-width="7.3" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M525 665 L715 560.5" fill="none" stroke="#8fc25a" stroke-width="7.3" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M499 628.8 L322.8 531.8" fill="none" stroke="#2fa36b" stroke-width="7" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M525 628.8 L701.2 531.8" fill="none" stroke="#2fa36b" stroke-width="7" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M499 592.5 L336.5 503.1" fill="none" stroke="#1e8c7a" stroke-width="6.7" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M525 592.5 L687.5 503.1" fill="none" stroke="#1e8c7a" stroke-width="6.7" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M499 556.2 L350.2 474.4" fill="none" stroke="#d9a441" stroke-width="6.3" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M525 556.2 L673.8 474.4" fill="none" stroke="#d9a441" stroke-width="6.3" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M499 520 L364 445.8" fill="none" stroke="#2fa36b" stroke-width="6" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M525 520 L660 445.8" fill="none" stroke="#2fa36b" stroke-width="6" stroke-linecap="round" stroke-miterlimit="10"/>
+    <path d="M499 992 L525 992 L516 470 L508 470 Z" fill="#e9d9a6"/>
+    <path d="M362 320 C362 217.8 429.2 135 512 135 C594.8 135 662 217.8 662 320 C662 422.2 594.8 505 512 505 C429.2 505 362 422.2 362 320 Z" fill="#c9a227"/>
+    <path d="M396 320 C396 238.3 447.9 172 512 172 C576.1 172 628 238.3 628 320 C628 401.7 576.1 468 512 468 C447.9 468 396 401.7 396 320 Z" fill="#1f9d63"/>
+    <path d="M430 320 C430 259.2 466.7 210 512 210 C557.3 210 594 259.2 594 320 C594 380.8 557.3 430 512 430 C466.7 430 430 380.8 430 320 Z" fill="#17b89f"/>
+    <path d="M462 320 C462 280.2 484.4 248 512 248 C539.6 248 562 280.2 562 320 C562 359.8 539.6 392 512 392 C484.4 392 462 359.8 462 320 Z" fill="#1e46b4"/>
+    <path d="M488 320 C488 299 498.7 282 512 282 C525.3 282 536 299 536 320 C536 341 525.3 358 512 358 C498.7 358 488 341 488 320 Z" fill="#191944"/>
+    <path d="M484 282 C484 271 488.5 262 494 262 C499.5 262 504 271 504 282 C504 293 499.5 302 494 302 C488.5 302 484 293 484 282 Z" fill="#ffffff" opacity="0.85"/>
+    <path d="M235 30 L789 30 C925.667 30 994 98.333 994 235 L994 789 C994 925.667 925.667 994 789 994 L235 994 C98.333 994 30 925.667 30 789 L30 235 C30 98.333 98.333 30 235 30 Z" fill="none" stroke="#d9a441" stroke-width="7" stroke-miterlimit="10" opacity="0.65"/>
+  </g>
+</svg>

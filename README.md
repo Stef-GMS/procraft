@@ -23,6 +23,12 @@ original.
 - [ ] Brush library file format (import/export sets)
 - [ ] Native iOS build (same playbook as our PdfCraft iOS spike)
 
+## Icon
+
+Original peacock-feather mark drawn natively in VectorCraft (headless batch;
+`assets/icon-generator.py` replays the whole construction, `assets/icon.svg`
+is the editable source). Shipped as the window icon and the embedded exe icon.
+
 ## Build
 
 Needs Rust 1.85+ ([rustup](https://rustup.rs)):

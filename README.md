@@ -9,7 +9,7 @@ original.
 > Interactive. ProCraft is an independent project with its own name, branding
 > and code, and is not affiliated with or endorsed by any other vendor.
 
-## Status: milestone 6
+## Status: milestone 7
 
 - [x] Layered document model (add / hide / reorder / opacity / blend)
 - [x] Soft-round brush + eraser with spacing, dynamics and undo
@@ -20,6 +20,7 @@ original.
 - [x] Move tool (drag active layer), shape tools (line/rect/ellipse + fill)
 - [x] Layer transforms (scale, rotate, flip H/V with bilinear sampling)
 - [x] Mirror symmetry painting (horizontal / vertical / both + axis overlay)
+- [x] Layer filters: brightness/contrast, box blur, unsharp sharpen (selection-masked)
 - [ ] Brush library file format (import/export sets)
 - [ ] Native iOS build (same playbook as our PdfCraft iOS spike)
 

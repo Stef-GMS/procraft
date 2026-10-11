@@ -1,5 +1,5 @@
-//! ProCraft milestone 6: lasso selections, flood fill, plus all earlier
-//! features. Original code.
+//! ProCraft milestone 7: layer filters (tone, blur, sharpen), plus all
+//! earlier features. Original code.
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
 use procraft_engine::{BlendMode, Brush, Color, Document, SymmetryMode};
@@ -94,6 +94,10 @@ struct ProCraftApp {
     lasso_points: Vec<(f32, f32)>,
     lasso_poly: Vec<(f32, f32)>,
     fill_tolerance: u8,
+    filt_brightness: i32,
+    filt_contrast: f32,
+    filt_blur: i32,
+    filt_sharpen: f32,
     move_from: Option<(f32, f32)>,
     move_acc: (f32, f32),
     shape_anchor: Option<(f32, f32)>,
@@ -139,6 +143,10 @@ impl ProCraftApp {
             lasso_points: Vec::new(),
             lasso_poly: Vec::new(),
             fill_tolerance: 32,
+            filt_brightness: 0,
+            filt_contrast: 100.0,
+            filt_blur: 0,
+            filt_sharpen: 0.0,
             move_from: None,
             move_acc: (0.0, 0.0),
             shape_anchor: None,
@@ -415,6 +423,32 @@ impl eframe::App for ProCraftApp {
                 if ui.radio_value(&mut self.doc.symmetry, m, m.name()).changed() {
                     self.status = format!("Symmetry: {}.", m.name());
                 }
+            }
+            ui.separator();
+            ui.heading("Filters");
+            ui.label("Active layer. Selections mask filters.");
+            ui.add(egui::Slider::new(&mut self.filt_brightness, -100..=100).text("Brightness"));
+            ui.add(egui::Slider::new(&mut self.filt_contrast, 0.0..=200.0).text("Contrast %"));
+            if ui.button("Apply tone").clicked() {
+                self.doc.checkpoint();
+                self.doc.adjust_tone(
+                    self.doc.active,
+                    (self.filt_brightness as f32 * 2.55).round() as i32,
+                    self.filt_contrast / 100.0,
+                );
+                self.status = "Tone applied.".to_string();
+            }
+            ui.add(egui::Slider::new(&mut self.filt_blur, 0..=25).text("Blur"));
+            if ui.button("Apply blur").clicked() {
+                self.doc.checkpoint();
+                self.doc.blur_layer(self.doc.active, self.filt_blur.max(0) as u32);
+                self.status = "Blur applied.".to_string();
+            }
+            ui.add(egui::Slider::new(&mut self.filt_sharpen, 0.0..=200.0).text("Sharpen %"));
+            if ui.button("Apply sharpen").clicked() {
+                self.doc.checkpoint();
+                self.doc.sharpen_layer(self.doc.active, self.filt_sharpen / 100.0);
+                self.status = "Sharpen applied.".to_string();
             }
             ui.separator();
             ui.heading("Brushes");

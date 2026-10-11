@@ -475,14 +475,174 @@ impl Document {
 
     /// Pixels covered by the active selection (lasso pixel count, else the
     /// rectangle area, else 0 when nothing is selected).
-    pub fn selection_pixel_count(&self) -> usize {
-        if let Some(mask) = self.selection_mask.as_deref() {
+    pub fn selection_pixel_count(&self) -> usize {        if let Some(mask) = self.selection_mask.as_deref() {
             mask.iter().filter(|&&b| b != 0).count()
         } else if let Some((x0, y0, x1, y1)) = self.selection {
             ((x1 - x0 + 1) * (y1 - y0 + 1)) as usize
         } else {
             0
         }
+    }
+
+    /// Separable sliding-window box blur (all channels), O(w*h).
+    fn box_blur(src: &[u8], w: u32, h: u32, r: i32) -> Vec<u8> {
+        let (w, h) = (w as i32, h as i32);
+        let wu = w as u32;
+        let window = (2 * r + 1) as u32;
+        let px = |buf: &[u8], x: i32, y: i32, ch: usize| -> u32 {
+            let x = x.clamp(0, w - 1) as u32;
+            let y = y.clamp(0, h - 1) as u32;
+            buf[((y * wu + x) * 4) as usize + ch] as u32
+        };
+        // Horizontal pass: src -> tmp.
+        let mut tmp = vec![0u8; src.len()];
+        for y in 0..h {
+            let mut sum = [0u32; 4];
+            for dx in -r..=r {
+                for ch in 0..4 {
+                    sum[ch] += px(src, dx, y, ch);
+                }
+            }
+            for x in 0..w {
+                for ch in 0..4 {
+                    tmp[((y as u32 * wu + x as u32) * 4) as usize + ch] = (sum[ch] / window) as u8;
+                }
+                for ch in 0..4 {
+                    sum[ch] += px(src, x + r + 1, y, ch);
+                    sum[ch] -= px(src, x - r, y, ch);
+                }
+            }
+        }
+        // Vertical pass: tmp -> out.
+        let mut out = vec![0u8; src.len()];
+        for x in 0..w {
+            let mut sum = [0u32; 4];
+            for dy in -r..=r {
+                for ch in 0..4 {
+                    sum[ch] += px(&tmp, x, dy, ch);
+                }
+            }
+            for y in 0..h {
+                for ch in 0..4 {
+                    out[((y as u32 * wu + x as u32) * 4) as usize + ch] = (sum[ch] / window) as u8;
+                }
+                for ch in 0..4 {
+                    sum[ch] += px(&tmp, x, y + r + 1, ch);
+                    sum[ch] -= px(&tmp, x, y - r, ch);
+                }
+            }
+        }
+        out
+    }
+
+    /// Brightness/contrast on a layer: `brightness` -255..=255 is added,
+    /// `contrast` 0.0..=3.0 scales around mid-gray (1.0 keeps contrast).
+    /// RGB only; alpha is untouched. Honors the active selection.
+    /// Caller checkpoints for undo first.
+    pub fn adjust_tone(&mut self, index: usize, brightness: i32, contrast: f32) {
+        if index >= self.layers.len()
+            || (brightness == 0 && (contrast - 1.0).abs() < f32::EPSILON)
+        {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
+        let sel = self.selection;
+        let mask = self.selection_mask.as_deref();
+        let pixels = &mut self.layers[index].pixels;
+        for y in 0..h {
+            for x in 0..w {
+                if let Some((a, b, c, d)) = sel {
+                    if x < a || x > c || y < b || y > d {
+                        continue;
+                    }
+                }
+                if let Some(m) = mask {
+                    if m[(y * w + x) as usize] == 0 {
+                        continue;
+                    }
+                }
+                let o = ((y * w + x) * 4) as usize;
+                if o + 2 >= pixels.len() {
+                    continue;
+                }
+                for ch in 0..3 {
+                    let v = (pixels[o + ch] as f32 - 128.0) * contrast + 128.0 + brightness as f32;
+                    pixels[o + ch] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        self.mark_full_dirty();
+    }
+
+    /// Box blur on a layer, `radius` 1..=25 (0 is a no-op). Honors the
+    /// active selection for writes. Caller checkpoints for undo first.
+    pub fn blur_layer(&mut self, index: usize, radius: u32) {
+        if index >= self.layers.len() || radius == 0 {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
+        let blurred = Self::box_blur(
+            &self.layers[index].pixels.clone(),
+            w,
+            h,
+            radius.min(25) as i32,
+        );
+        let sel = self.selection;
+        let mask = self.selection_mask.as_deref();
+        let pixels = &mut self.layers[index].pixels;
+        for y in 0..h {
+            for x in 0..w {
+                let selected = match sel {
+                    Some((a, b, c, d)) if x < a || x > c || y < b || y > d => false,
+                    _ => true,
+                } && match mask {
+                    Some(m) => m[(y * w + x) as usize] != 0,
+                    None => true,
+                };
+                if selected {
+                    let o = ((y * w + x) * 4) as usize;
+                    pixels[o..o + 4].copy_from_slice(&blurred[o..o + 4]);
+                }
+            }
+        }
+        self.mark_full_dirty();
+    }
+
+    /// Unsharp mask on a layer: `amount` 0.0..=2.0 mixes the high-frequency
+    /// detail back in (0 is a no-op). Honors the active selection.
+    /// Caller checkpoints for undo first.
+    pub fn sharpen_layer(&mut self, index: usize, amount: f32) {
+        if index >= self.layers.len() || amount <= 0.0 {
+            return;
+        }
+        let amount = amount.min(2.0);
+        let (w, h) = (self.w, self.h);
+        let src = self.layers[index].pixels.clone();
+        let blurred = Self::box_blur(&src, w, h, 2);
+        let sel = self.selection;
+        let mask = self.selection_mask.as_deref();
+        let pixels = &mut self.layers[index].pixels;
+        for y in 0..h {
+            for x in 0..w {
+                let selected = match sel {
+                    Some((a, b, c, d)) if x < a || x > c || y < b || y > d => false,
+                    _ => true,
+                } && match mask {
+                    Some(m) => m[(y * w + x) as usize] != 0,
+                    None => true,
+                };
+                if !selected {
+                    continue;
+                }
+                let o = ((y * w + x) * 4) as usize;
+                for ch in 0..3 {
+                    let v = pixels[o + ch] as f32
+                        + (pixels[o + ch] as f32 - blurred[o + ch] as f32) * amount;
+                    pixels[o + ch] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        self.mark_full_dirty();
     }
 
     /// Save the composite as PNG.
@@ -776,6 +936,81 @@ mod tests {
         // 2x zoom of solid color stays solid.
         doc.affine_layer(0, 2.0, 0.0);
         assert!(doc.layers[0].pixels.chunks_exact(4).all(|p| p[0] == 100 && p[3] == 100));
+    }
+
+    #[test]
+    fn tone_brightness_contrast_and_alpha() {
+        let mut doc = Document::new(2, 1);
+        doc.layers[0].pixels = vec![100, 100, 100, 200, 100, 100, 100, 200];
+        doc.adjust_tone(0, 10, 1.0);
+        assert_eq!(&doc.layers[0].pixels[0..4], &[110, 110, 110, 200]);
+        // Zero contrast flattens to mid-gray; alpha still untouched.
+        doc.adjust_tone(0, 0, 0.0);
+        assert_eq!(&doc.layers[0].pixels[0..4], &[128, 128, 128, 200]);
+        // Identity is a no-op.
+        let before = doc.layers[0].pixels.clone();
+        doc.adjust_tone(0, 0, 1.0);
+        assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
+    fn blur_spreads_dot_keeps_flat() {
+        let mut doc = Document::new(8, 8);
+        for b in doc.layers[0].pixels.iter_mut() {
+            *b = 77;
+        }
+        let before = doc.layers[0].pixels.clone();
+        doc.blur_layer(0, 3);
+        assert_eq!(doc.layers[0].pixels, before);
+        // Single opaque dot on transparency spreads out.
+        let mut doc = Document::new(9, 9);
+        doc.layers[0].pixels[((4 * 9 + 4) * 4 + 3) as usize] = 255;
+        doc.layers[0].pixels[((4 * 9 + 4) * 4) as usize] = 255;
+        doc.blur_layer(0, 2);
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 9 + x) * 4 + 3) as usize];
+        assert!(at(&doc, 4, 4) < 255);
+        assert!(at(&doc, 5, 4) > 0);
+        assert_eq!(at(&doc, 0, 0), 0);
+    }
+
+    #[test]
+    fn sharpen_boosts_edge_contrast() {
+        // Left half 100, right half 200.
+        let mut doc = Document::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                let v = if x < 4 { 100u8 } else { 200u8 };
+                let o = ((y * 8 + x) * 4) as usize;
+                doc.layers[0].pixels[o] = v;
+                doc.layers[0].pixels[o + 1] = v;
+                doc.layers[0].pixels[o + 2] = v;
+                doc.layers[0].pixels[o + 3] = 255;
+            }
+        }
+        doc.sharpen_layer(0, 1.0);
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 8 + x) * 4) as usize];
+        assert!(at(&doc, 3, 4) < 100, "dark edge pixel dips");
+        assert!(at(&doc, 4, 4) > 200 || at(&doc, 4, 4) == 255, "bright edge pixel rises");
+        // Flat area is untouched by sharpening.
+        assert_eq!(at(&doc, 0, 0), 100);
+        assert_eq!(at(&doc, 7, 7), 200);
+    }
+
+    #[test]
+    fn filters_respect_selection() {
+        let mut doc = Document::new(6, 6);
+        for b in doc.layers[0].pixels.chunks_exact_mut(4) {
+            b.copy_from_slice(&[255, 255, 255, 255]);
+        }
+        doc.selection = Some((0, 0, 2, 2));
+        doc.adjust_tone(0, -50, 1.0);
+        assert_eq!(doc.layers[0].pixels[0], 205);
+        let o = ((5 * 6 + 5) * 4) as usize;
+        assert_eq!(doc.layers[0].pixels[o], 255);
+        doc.blur_layer(0, 2);
+        assert_eq!(doc.layers[0].pixels[o], 255);
+        doc.clear_selection();
+        assert!(doc.selection.is_none() && doc.selection_mask.is_none());
     }
 
     #[test]

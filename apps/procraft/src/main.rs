@@ -60,6 +60,7 @@ struct ProCraftApp {
     theme_applied: Option<Theme>,
     page_custom: [u8; 3],
     dynamics: f32,
+    picker_size: f32,
     texture: Option<TextureHandle>,
     painting: bool,
     last: Option<(f32, f32)>,
@@ -95,6 +96,7 @@ impl ProCraftApp {
             theme_applied: None,
             page_custom: [255, 255, 255],
             dynamics: 0.6,
+            picker_size: 280.0,
             texture: None,
             painting: false,
             last: None,
@@ -276,6 +278,7 @@ impl eframe::App for ProCraftApp {
         // Fresh id (not "tools"): eframe persists panel widths to disk, and the
         // old narrow width would otherwise override `default_size` forever.
         egui::Panel::left("tools-wide").default_size(300.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Tool");
             ui.radio_value(&mut self.tool, Tool::Brush, "✏ Brush");
             ui.radio_value(&mut self.tool, Tool::Eraser, "⌫ Eraser");
@@ -299,11 +302,16 @@ impl eframe::App for ProCraftApp {
             }
             ui.separator();
             ui.heading("Color");
+            ui.horizontal(|ui| {
+                ui.label("Picker size:");
+                ui.add(egui::Slider::new(&mut self.picker_size, 140.0..=420.0).text("px"));
+            });
             let mut c = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
             // The SV square + hue strip size themselves from `slider_width`,
-            // not the panel width: pin it explicitly for a big picker.
+            // not the panel width: drive it from the slider above.
+            let picker_width = self.picker_size;
             ui.scope(|ui| {
-                ui.spacing_mut().slider_width = 280.0;
+                ui.spacing_mut().slider_width = picker_width;
                 if egui::color_picker::color_picker_color32(
                     ui,
                     &mut c,
@@ -334,6 +342,7 @@ impl eframe::App for ProCraftApp {
                 ui.separator();
                 ui.label(format!("Selected {}x{} px", x1 - x0 + 1, y1 - y0 + 1));
             }
+            });
         });
 
         egui::Panel::right("layers").show(ui, |ui| {

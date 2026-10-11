@@ -64,12 +64,22 @@ impl Document {
         let y1 = (y + radius).ceil().min(h - 1.0).max(0.0) as u32;
         self.mark_dirty(x0, y0, x1, y1);
         let selection = self.selection;
-        let Some(layer) = self.active_layer_mut() else { return };
+        let active = self.active;
+        if active >= self.layers.len() {
+            return;
+        }
+        let mask = self.selection_mask.as_deref();
+        let layer = &mut self.layers[active];
         let w = w_u32;
         for py in y0..=y1 {
             for px in x0..=x1 {
                 if let Some((sx0, sy0, sx1, sy1)) = selection {
                     if px < sx0 || px > sx1 || py < sy0 || py > sy1 {
+                        continue;
+                    }
+                }
+                if let Some(m) = mask {
+                    if m.get((py * w + px) as usize).copied().unwrap_or(0) == 0 {
                         continue;
                     }
                 }
@@ -175,6 +185,11 @@ impl Document {
                 return;
             }
         }
+        if let Some(mask) = self.selection_mask.as_deref() {
+            if mask.get((py * self.w + px) as usize).copied().unwrap_or(0) == 0 {
+                return;
+            }
+        }
         let o = ((py * self.w + px) * 4) as usize;
         let Some(layer) = self.active_layer_mut() else { return };
         if o + 3 >= layer.pixels.len() {
@@ -269,6 +284,111 @@ impl Document {
             }
         }
     }
+
+    /// Flood-fill the contiguous region containing `(x, y)` on the active
+    /// layer with `color` at brush opacity. A pixel belongs to the region
+    /// when every channel is within `tolerance` of the seed pixel. Honors
+    /// the active selection and mirrors across symmetry axes.
+    /// Caller checkpoints first.
+    pub fn flood_fill(&mut self, brush: &Brush, color: Color, x: u32, y: u32, tolerance: u8) {
+        if self.active >= self.layers.len() || !self.pixel_selected(x, y) {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
+        let snap = self.layers[self.active].pixels.clone();
+        let seed_off = ((y * w + x) * 4) as usize;
+        if seed_off + 3 >= snap.len() {
+            return;
+        }
+        let target = [snap[seed_off], snap[seed_off + 1], snap[seed_off + 2], snap[seed_off + 3]];
+        let opacity = brush.opacity.clamp(0.0, 1.0);
+        if blend_over(target, color, opacity) == target {
+            return;
+        }
+        let matches = |px: &[u8]| {
+            px[0].abs_diff(target[0]) <= tolerance
+                && px[1].abs_diff(target[1]) <= tolerance
+                && px[2].abs_diff(target[2]) <= tolerance
+                && px[3].abs_diff(target[3]) <= tolerance
+        };
+        // Mirror the seed across symmetry axes (deduped).
+        let mut seeds = Vec::with_capacity(4);
+        for (sx, sy) in self.symmetry.mirrored_pixels(w, h, x, y) {
+            if sx < w && sy < h && self.pixel_selected(sx, sy) && !seeds.contains(&(sx, sy)) {
+                seeds.push((sx, sy));
+            }
+        }
+        // Selection consulted per pixel without borrowing the layer.
+        let sel = self.selection;
+        let mask = self.selection_mask.clone();
+        let selected = |px: u32, py: u32| {
+            if px >= w || py >= h {
+                return false;
+            }
+            if let Some((a, b, c, d)) = sel {
+                if px < a || px > c || py < b || py > d {
+                    return false;
+                }
+            }
+            if let Some(m) = mask.as_deref() {
+                if m[(py * w + px) as usize] == 0 {
+                    return false;
+                }
+            }
+            true
+        };
+        let layer = &mut self.layers[self.active];
+        let mut visited = vec![0u8; (w * h) as usize];
+        let mut stack = seeds;
+        let mut any = false;
+        while let Some((cx, cy)) = stack.pop() {
+            let idx = (cy * w + cx) as usize;
+            if visited[idx] == 1 {
+                continue;
+            }
+            visited[idx] = 1;
+            let o = idx * 4;
+            if o + 3 >= layer.pixels.len() || !matches(&layer.pixels[o..o + 4]) {
+                continue;
+            }
+            let dst = [layer.pixels[o], layer.pixels[o + 1], layer.pixels[o + 2], layer.pixels[o + 3]];
+            layer.pixels[o..o + 4].copy_from_slice(&blend_over(dst, color, opacity));
+            any = true;
+            if cx > 0 && selected(cx - 1, cy) {
+                stack.push((cx - 1, cy));
+            }
+            if cx + 1 < w && selected(cx + 1, cy) {
+                stack.push((cx + 1, cy));
+            }
+            if cy > 0 && selected(cx, cy - 1) {
+                stack.push((cx, cy - 1));
+            }
+            if cy + 1 < h && selected(cx, cy + 1) {
+                stack.push((cx, cy + 1));
+            }
+        }
+        if any {
+            self.mark_full_dirty();
+        }
+    }
+}
+
+/// Source-over blend of `color` at `opacity` onto `dst`. Matches the math in
+/// [`Document::dab`] so fills look like brush paint.
+fn blend_over(dst: [u8; 4], color: Color, opacity: f32) -> [u8; 4] {
+    let src_a = opacity.clamp(0.0, 1.0);
+    let dst_a = dst[3] as f32 / 255.0;
+    let out_a = src_a + dst_a * (1.0 - src_a);
+    if out_a <= 0.0 {
+        return [0, 0, 0, 0];
+    }
+    let c = color.0;
+    [
+        ((c[0] as f32 * src_a + dst[0] as f32 * dst_a * (1.0 - src_a)) / out_a).round() as u8,
+        ((c[1] as f32 * src_a + dst[1] as f32 * dst_a * (1.0 - src_a)) / out_a).round() as u8,
+        ((c[2] as f32 * src_a + dst[2] as f32 * dst_a * (1.0 - src_a)) / out_a).round() as u8,
+        (out_a * 255.0).round() as u8,
+    ]
 }
 pub struct Stroke<'a> {
     doc: &'a mut Document,
@@ -298,6 +418,39 @@ impl<'a> Stroke<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flood_fill_stays_inside_barrier() {
+        let mut doc = Document::new(10, 10);
+        let brush = Brush { opacity: 1.0, ..Default::default() };
+        // Opaque red wall splitting the canvas.
+        doc.fill_rect(&brush, Color::rgb(255, 0, 0), 5, 0, 5, 9);
+        doc.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 0);
+        let at = |d: &Document, x: u32, y: u32| {
+            let o = ((y * 10 + x) * 4) as usize;
+            [d.layers[0].pixels[o], d.layers[0].pixels[o + 1], d.layers[0].pixels[o + 2], d.layers[0].pixels[o + 3]]
+        };
+        assert_eq!(at(&doc, 0, 5), [0, 0, 255, 255]);
+        assert_eq!(at(&doc, 5, 5), [255, 0, 0, 255]);
+        assert_eq!(at(&doc, 9, 5)[3], 0);
+    }
+
+    #[test]
+    fn flood_fill_mirrors_with_symmetry() {
+        use crate::document::SymmetryMode;
+        let mut doc = Document::new(11, 11);
+        doc.symmetry = SymmetryMode::Horizontal;
+        let brush = Brush { opacity: 1.0, ..Default::default() };
+        doc.fill_rect(&brush, Color::rgb(255, 0, 0), 5, 0, 5, 10);
+        doc.flood_fill(&brush, Color::rgb(0, 255, 0), 1, 5, 0);
+        let at = |d: &Document, x: u32, y: u32| {
+            let o = ((y * 11 + x) * 4) as usize;
+            [d.layers[0].pixels[o], d.layers[0].pixels[o + 1], d.layers[0].pixels[o + 2], d.layers[0].pixels[o + 3]]
+        };
+        assert_eq!(at(&doc, 1, 5), [0, 255, 0, 255]);
+        assert_eq!(at(&doc, 9, 5), [0, 255, 0, 255]);
+        assert_eq!(at(&doc, 5, 5), [255, 0, 0, 255]);
+    }
 
     #[test]
     fn symmetry_mirrors_dabs() {

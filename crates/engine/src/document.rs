@@ -118,6 +118,9 @@ pub struct Document {
     /// Optional rectangular selection (inclusive canvas pixels): painting
     /// outside it is ignored.
     pub selection: Option<(u32, u32, u32, u32)>,
+    /// Optional freehand lasso mask (row-major, 1 = inside): painting outside
+    /// it is ignored. Session-only, never saved to project files.
+    pub selection_mask: Option<Vec<u8>>,
     /// Mirror painting mode (not all versions of the file format store it).
     pub symmetry: SymmetryMode,
     dirty: Option<(u32, u32, u32, u32)>,
@@ -139,6 +142,7 @@ impl Document {
             active: 0,
             background: [255, 255, 255, 255],
             selection: None,
+            selection_mask: None,
             symmetry: SymmetryMode::Off,
             dirty: None,
             undo: Vec::new(),
@@ -367,7 +371,7 @@ impl Document {
         self.mark_full_dirty();
     }
 
-    /// Mirror a layer top-bottom in place. Caller checkpoints for undo first.
+    /// Flip a layer top-bottom in place. Caller checkpoints for undo first.
     pub fn flip_layer_vertical(&mut self, index: usize) {
         if index >= self.layers.len() {
             return;
@@ -386,6 +390,101 @@ impl Document {
         self.mark_full_dirty();
     }
 
+    /// Clear both the rectangular selection and the lasso mask.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selection_mask = None;
+    }
+
+    /// True when `(px, py)` is inside the active selection (rectangular
+    /// and/or lasso). With no selection active every pixel counts.
+    pub fn pixel_selected(&self, px: u32, py: u32) -> bool {
+        if px >= self.w || py >= self.h {
+            return false;
+        }
+        if let Some((sx0, sy0, sx1, sy1)) = self.selection {
+            if px < sx0 || px > sx1 || py < sy0 || py > sy1 {
+                return false;
+            }
+        }
+        if let Some(mask) = self.selection_mask.as_deref() {
+            if mask.get((py * self.w + px) as usize).copied().unwrap_or(0) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Build a lasso mask from a freehand loop (canvas float coordinates).
+    /// Sets the rectangular selection to the loop's bounding box and returns
+    /// it, or clears the mask and returns `None` for degenerate loops.
+    pub fn set_lasso(&mut self, points: &[(f32, f32)]) -> Option<(u32, u32, u32, u32)> {
+        if points.len() < 3 || self.w == 0 || self.h == 0 {
+            self.selection_mask = None;
+            return None;
+        }
+        let (w, h) = (self.w, self.h);
+        let mut fx0 = f32::INFINITY;
+        let mut fy0 = f32::INFINITY;
+        let mut fx1 = f32::NEG_INFINITY;
+        let mut fy1 = f32::NEG_INFINITY;
+        for &(x, y) in points {
+            fx0 = fx0.min(x);
+            fy0 = fy0.min(y);
+            fx1 = fx1.max(x);
+            fy1 = fy1.max(y);
+        }
+        let (x0, y0) = (fx0.floor().max(0.0) as u32, fy0.floor().max(0.0) as u32);
+        let (x1, y1) = (fx1.ceil().min(w as f32 - 1.0).max(0.0) as u32, fy1.ceil().min(h as f32 - 1.0).max(0.0) as u32);
+        if x1 <= x0 || y1 <= y0 {
+            self.selection_mask = None;
+            return None;
+        }
+        // Even-odd scanline fill of the polygon.
+        let n = points.len();
+        let mut mask = vec![0u8; (w * h) as usize];
+        for y in y0..=y1 {
+            let yc = y as f32 + 0.5;
+            let mut xs = Vec::new();
+            for i in 0..n {
+                let (ax, ay) = points[i];
+                let (bx, by) = points[(i + 1) % n];
+                if (ay > yc) != (by > yc) {
+                    xs.push(ax + (yc - ay) / (by - ay) * (bx - ax));
+                }
+            }
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            for pair in xs.chunks_exact(2) {
+                let xa = (pair[0] - 0.5).ceil() as i32;
+                let xb = (pair[1] - 0.5 - 1e-6).floor() as i32;
+                for x in xa.max(x0 as i32)..=xb.min(x1 as i32) {
+                    if x >= 0 {
+                        mask[(y * w + x as u32) as usize] = 1;
+                    }
+                }
+            }
+        }
+        if mask.iter().all(|&b| b == 0) {
+            self.selection_mask = None;
+            return None;
+        }
+        self.selection = Some((x0, y0, x1, y1));
+        self.selection_mask = Some(mask);
+        Some((x0, y0, x1, y1))
+    }
+
+    /// Pixels covered by the active selection (lasso pixel count, else the
+    /// rectangle area, else 0 when nothing is selected).
+    pub fn selection_pixel_count(&self) -> usize {
+        if let Some(mask) = self.selection_mask.as_deref() {
+            mask.iter().filter(|&&b| b != 0).count()
+        } else if let Some((x0, y0, x1, y1)) = self.selection {
+            ((x1 - x0 + 1) * (y1 - y0 + 1)) as usize
+        } else {
+            0
+        }
+    }
+
     /// Save the composite as PNG.
     pub fn save_png(&self, path: &std::path::Path) -> Result<(), String> {
         image::save_buffer(path, &self.flatten(), self.w, self.h, image::ColorType::Rgba8)
@@ -402,6 +501,8 @@ impl Document {
         layer.pixels.copy_from_slice(img.as_raw());
         self.layers = vec![layer];
         self.active = 0;
+        self.selection = None;
+        self.selection_mask = None;
         self.undo.clear();
         Ok(())
     }
@@ -518,6 +619,7 @@ impl Document {
             active: active.min(count as usize - 1),
             background: bg,
             selection: None,
+            selection_mask: None,
             symmetry,
             dirty: None,
             undo: Vec::new(),
@@ -674,6 +776,31 @@ mod tests {
         // 2x zoom of solid color stays solid.
         doc.affine_layer(0, 2.0, 0.0);
         assert!(doc.layers[0].pixels.chunks_exact(4).all(|p| p[0] == 100 && p[3] == 100));
+    }
+
+    #[test]
+    fn lasso_selects_interior_only() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(20, 20);
+        let pts = vec![(0.0, 0.0), (12.0, 0.0), (0.0, 12.0), (0.0, 0.0)];
+        let bbox = doc.set_lasso(&pts).expect("lasso builds");
+        assert!(doc.pixel_selected(2, 2));
+        assert!(!doc.pixel_selected(15, 15));
+        assert_eq!(doc.selection, Some(bbox));
+        assert!(doc.selection_pixel_count() > 0);
+        // Painting is constrained to the lasso.
+        let brush = Brush { opacity: 1.0, ..Default::default() };
+        doc.fill_rect(&brush, Color::rgb(9, 9, 9), 0, 0, 19, 19);
+        let inside = ((2 * 20 + 2) * 4) as usize;
+        assert_eq!(doc.layers[0].pixels[inside + 3], 255);
+        let outside = ((15 * 20 + 15) * 4) as usize;
+        assert_eq!(doc.layers[0].pixels[outside + 3], 0);
+        // Degenerate loops clear.
+        assert!(doc.set_lasso(&[]).is_none());
+        assert!(doc.selection_mask.is_none());
+        doc.clear_selection();
+        assert!(doc.selection.is_none() && doc.selection_mask.is_none());
+        assert_eq!(doc.selection_pixel_count(), 0);
     }
 
     #[test]

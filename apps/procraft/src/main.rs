@@ -1,5 +1,5 @@
-//! ProCraft milestone 5: mirror symmetry painting, layer flip, plus all
-//! earlier features. Original code.
+//! ProCraft milestone 6: lasso selections, flood fill, plus all earlier
+//! features. Original code.
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
 use procraft_engine::{BlendMode, Brush, Color, Document, SymmetryMode};
@@ -9,6 +9,8 @@ enum Tool {
     Brush,
     Eraser,
     Select,
+    Lasso,
+    Fill,
     Move,
     Shapes,
 }
@@ -89,6 +91,9 @@ struct ProCraftApp {
     leftover: f32,
     sel_anchor: Option<(f32, f32)>,
     sel_current: Option<(f32, f32)>,
+    lasso_points: Vec<(f32, f32)>,
+    lasso_poly: Vec<(f32, f32)>,
+    fill_tolerance: u8,
     move_from: Option<(f32, f32)>,
     move_acc: (f32, f32),
     shape_anchor: Option<(f32, f32)>,
@@ -131,6 +136,9 @@ impl ProCraftApp {
             leftover: 0.0,
             sel_anchor: None,
             sel_current: None,
+            lasso_points: Vec::new(),
+            lasso_poly: Vec::new(),
+            fill_tolerance: 32,
             move_from: None,
             move_acc: (0.0, 0.0),
             shape_anchor: None,
@@ -207,6 +215,23 @@ fn paint_selection(painter: &egui::Painter, rect: egui::Rect, time: f64) {
     draw_dashed(rect.left_bottom(), rect.left_top());
 }
 
+/// Freehand path overlay: dark base plus light top, visible on any art.
+fn paint_path(painter: &egui::Painter, pts: &[egui::Pos2], close: bool) {
+    if pts.len() < 2 {
+        return;
+    }
+    let mut segs: Vec<[egui::Pos2; 2]> = pts.windows(2).map(|w| [w[0], w[1]]).collect();
+    if close {
+        segs.push([pts[pts.len() - 1], pts[0]]);
+    }
+    for [a, b] in &segs {
+        painter.line_segment([*a, *b], (3.0, Color32::BLACK));
+    }
+    for [a, b] in &segs {
+        painter.line_segment([*a, *b], (1.5, Color32::WHITE));
+    }
+}
+
 impl eframe::App for ProCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.theme_applied != Some(self.theme) {
@@ -219,17 +244,21 @@ impl eframe::App for ProCraftApp {
             self.status = "Undone.".to_string();
         }
         if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            self.doc.selection = None;
+            self.doc.clear_selection();
             self.sel_anchor = None;
             self.sel_current = None;
+            self.lasso_points.clear();
+            self.lasso_poly.clear();
         }
-        // Keep frames coming while painting, selecting, moving, shaping,
-        // or marching ants.
+        // Keep frames coming while painting, selecting, lassoing, moving,
+        // shaping, or marching ants.
         if self.painting
             || self.sel_anchor.is_some()
+            || !self.lasso_points.is_empty()
             || self.shape_anchor.is_some()
             || self.move_from.is_some()
             || self.doc.selection.is_some()
+            || self.doc.selection_mask.is_some()
         {
             ui.ctx().request_repaint();
         }
@@ -252,6 +281,8 @@ impl eframe::App for ProCraftApp {
                         match self.doc.load_background(&path) {
                             Ok(()) => {
                                 self.texture = None;
+                                self.lasso_points.clear();
+                                self.lasso_poly.clear();
                                 self.status = format!("Opened {}", path.display());
                             }
                             Err(e) => self.status = format!("Open failed: {e}"),
@@ -279,6 +310,8 @@ impl eframe::App for ProCraftApp {
                             Ok(doc) => {
                                 self.doc = doc;
                                 self.texture = None;
+                                self.lasso_points.clear();
+                                self.lasso_poly.clear();
                                 self.status = format!("Project opened {}", path.display());
                             }
                             Err(e) => self.status = format!("Project open failed: {e}"),
@@ -322,8 +355,13 @@ impl eframe::App for ProCraftApp {
             ui.radio_value(&mut self.tool, Tool::Brush, "✏ Brush");
             ui.radio_value(&mut self.tool, Tool::Eraser, "⌫ Eraser");
             ui.radio_value(&mut self.tool, Tool::Select, "⬚ Select");
+            ui.radio_value(&mut self.tool, Tool::Lasso, "◌ Lasso");
+            ui.radio_value(&mut self.tool, Tool::Fill, "◧ Fill");
             ui.radio_value(&mut self.tool, Tool::Move, "↔ Move");
             ui.radio_value(&mut self.tool, Tool::Shapes, "○ Shapes");
+            if self.tool == Tool::Fill {
+                ui.add(egui::Slider::new(&mut self.fill_tolerance, 0..=255).text("Tolerance"));
+            }
             if self.tool == Tool::Shapes {
                 ui.horizontal(|ui| {
                     for k in ShapeKind::ALL {
@@ -333,7 +371,8 @@ impl eframe::App for ProCraftApp {
                 ui.checkbox(&mut self.shape_fill, "Fill");
             }
             if ui.button("Clear selection").clicked() {
-                self.doc.selection = None;
+                self.doc.clear_selection();
+                self.lasso_poly.clear();
                 self.status = "Selection cleared.".to_string();
             }
             ui.separator();
@@ -428,7 +467,10 @@ impl eframe::App for ProCraftApp {
             if egui::color_picker::color_edit_button_srgb(ui, &mut self.page_custom).changed() {
                 self.set_page_color(self.page_custom);
             }
-            if let Some((x0, y0, x1, y1)) = self.doc.selection {
+            if self.doc.selection_mask.is_some() {
+                ui.separator();
+                ui.label(format!("Lasso: {} px", self.doc.selection_pixel_count()));
+            } else if let Some((x0, y0, x1, y1)) = self.doc.selection {
                 ui.separator();
                 ui.label(format!("Selected {}x{} px", x1 - x0 + 1, y1 - y0 + 1));
             }
@@ -585,9 +627,11 @@ impl eframe::App for ProCraftApp {
                             let (y0, y1) = if ay <= by { (ay as u32, by as u32) } else { (by as u32, ay as u32) };
                             if x1.saturating_sub(x0) >= 2 && y1.saturating_sub(y0) >= 2 {
                                 self.doc.selection = Some((x0, y0, x1, y1));
+                                self.doc.selection_mask = None;
+                                self.lasso_poly.clear();
                                 self.status = format!("Selected {}x{} px.", x1 - x0 + 1, y1 - y0 + 1);
                             } else {
-                                self.doc.selection = None;
+                                self.doc.clear_selection();
                             }
                         }
                         self.sel_anchor = None;
@@ -608,6 +652,98 @@ impl eframe::App for ProCraftApp {
                             egui::Pos2::new(rect.min.x + x1 * z, rect.min.y + y1 * z),
                         );
                         paint_selection(ui.painter(), r, ctx.input(|i| i.time));
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                }
+
+                if self.tool == Tool::Lasso {
+                    // Freehand loop: collect points, build the mask on release.
+                    if resp.drag_started() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            self.lasso_points = vec![clamp_pt(x, y)];
+                        }
+                    }
+                    if resp.dragged() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            let p = clamp_pt(x, y);
+                            let push = match self.lasso_points.last() {
+                                Some(&(lx, ly)) => {
+                                    (p.0 - lx) * (p.0 - lx) + (p.1 - ly) * (p.1 - ly) >= 4.0
+                                }
+                                None => true,
+                            };
+                            if push {
+                                self.lasso_points.push(p);
+                            }
+                        }
+                    }
+                    if !self.lasso_points.is_empty() {
+                        let pts: Vec<egui::Pos2> = self
+                            .lasso_points
+                            .iter()
+                            .map(|&(x, y)| egui::Pos2::new(rect.min.x + x * z, rect.min.y + y * z))
+                            .collect();
+                        paint_path(ui.painter(), &pts, true);
+                    }
+                    if resp.drag_stopped() {
+                        if self.lasso_points.len() >= 3 {
+                            let pts = self.lasso_points.clone();
+                            match self.doc.set_lasso(&pts) {
+                                Some(_) => {
+                                    self.lasso_poly = pts;
+                                    self.status = format!(
+                                        "Lasso: {} px selected.",
+                                        self.doc.selection_pixel_count()
+                                    );
+                                }
+                                None => {
+                                    self.doc.clear_selection();
+                                    self.lasso_poly.clear();
+                                    self.status = "Lasso too small.".to_string();
+                                }
+                            }
+                        } else {
+                            self.doc.clear_selection();
+                            self.lasso_poly.clear();
+                        }
+                        self.lasso_points.clear();
+                    }
+                    // Committed lasso outline.
+                    if !self.lasso_poly.is_empty() {
+                        let pts: Vec<egui::Pos2> = self
+                            .lasso_poly
+                            .iter()
+                            .map(|&(x, y)| egui::Pos2::new(rect.min.x + x * z, rect.min.y + y * z))
+                            .collect();
+                        paint_path(ui.painter(), &pts, true);
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                }
+
+                if self.tool == Tool::Fill {
+                    // Bucket fill at the press point (one undo step).
+                    if resp.drag_started() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            let (cx, cy) = clamp_pt(x, y);
+                            self.doc.checkpoint();
+                            let brush = self.base_brush();
+                            let color = self.current_color();
+                            self.doc.flood_fill(
+                                &brush,
+                                color,
+                                cx as u32,
+                                cy as u32,
+                                self.fill_tolerance,
+                            );
+                            self.status = "Filled.".to_string();
+                        }
                     }
                     self.painting = false;
                     self.last = None;

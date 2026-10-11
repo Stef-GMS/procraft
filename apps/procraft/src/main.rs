@@ -275,7 +275,7 @@ impl eframe::App for ProCraftApp {
 
         // Fresh id (not "tools"): eframe persists panel widths to disk, and the
         // old narrow width would otherwise override `default_size` forever.
-        egui::Panel::left("tools-wide").default_size(250.0).show(ui, |ui| {
+        egui::Panel::left("tools-wide").default_size(300.0).show(ui, |ui| {
             ui.heading("Tool");
             ui.radio_value(&mut self.tool, Tool::Brush, "✏ Brush");
             ui.radio_value(&mut self.tool, Tool::Eraser, "⌫ Eraser");
@@ -300,13 +300,18 @@ impl eframe::App for ProCraftApp {
             ui.separator();
             ui.heading("Color");
             let mut c = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
-            if egui::color_picker::color_picker_color32(
-                ui,
-                &mut c,
-                egui::color_picker::Alpha::Opaque,
-            ) {
-                self.color = [c.r(), c.g(), c.b()];
-            }
+            // The SV square + hue strip size themselves from `slider_width`,
+            // not the panel width: pin it explicitly for a big picker.
+            ui.scope(|ui| {
+                ui.spacing_mut().slider_width = 280.0;
+                if egui::color_picker::color_picker_color32(
+                    ui,
+                    &mut c,
+                    egui::color_picker::Alpha::Opaque,
+                ) {
+                    self.color = [c.r(), c.g(), c.b()];
+                }
+            });
             ui.separator();
             ui.add(egui::Slider::new(&mut self.brush.size, 1.0..=200.0).text("Size"));
             ui.add(egui::Slider::new(&mut self.brush.opacity, 0.05..=1.0).text("Opacity"));

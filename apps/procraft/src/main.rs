@@ -278,7 +278,11 @@ impl eframe::App for ProCraftApp {
         // Fresh id (not "tools"): eframe persists panel widths to disk, and the
         // old narrow width would otherwise override `default_size` forever.
         egui::Panel::left("tools-wide").default_size(300.0).show(ui, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        // Experiment: hide the panel scrollbar entirely (wheel still scrolls)
+        // to identify the thick black bar at the panel edge.
+        egui::ScrollArea::vertical()
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
             ui.heading("Tool");
             ui.radio_value(&mut self.tool, Tool::Brush, "✏ Brush");
             ui.radio_value(&mut self.tool, Tool::Eraser, "⌫ Eraser");

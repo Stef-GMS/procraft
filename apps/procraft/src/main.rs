@@ -278,7 +278,18 @@ impl eframe::App for ProCraftApp {
         // Fresh id (not "tools"): eframe persists panel widths to disk, and the
         // old narrow width would otherwise override `default_size` forever.
         egui::Panel::left("tools-wide").default_size(300.0).show(ui, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        // Scrollbar on the panel's LEFT edge: reserve a strip for the bar,
+        // run the scrolled content inset past it.
+        let bar_w = 12.0;
+        let avail = ui.available_rect_before_wrap();
+        let bar_rect =
+            egui::Rect::from_min_size(avail.min, Vec2::new(bar_w, avail.height()));
+        let content_rect = egui::Rect::from_min_max(
+            egui::Pos2::new(avail.min.x + bar_w, avail.min.y),
+            avail.max,
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
+        egui::ScrollArea::vertical().scroll_bar_rect(bar_rect).show(ui, |ui| {
             ui.heading("Tool");
             ui.radio_value(&mut self.tool, Tool::Brush, "✏ Brush");
             ui.radio_value(&mut self.tool, Tool::Eraser, "⌫ Eraser");
@@ -343,6 +354,7 @@ impl eframe::App for ProCraftApp {
                 ui.label(format!("Selected {}x{} px", x1 - x0 + 1, y1 - y0 + 1));
             }
             });
+        });
         });
 
         egui::Panel::right("layers").show(ui, |ui| {

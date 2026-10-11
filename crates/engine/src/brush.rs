@@ -35,9 +35,22 @@ impl Default for Brush {
 }
 
 impl Document {
-    /// Stamp one dab centered at canvas pixel `(x, y)` on the active layer.
+    /// Stamp one dab centered at canvas pixel `(x, y)` on the active layer,
+    /// mirrored per [`Document::symmetry`].
     /// Pixels outside [`Document::selection`] (when set) are skipped.
     pub fn dab(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
+        let pts = self.symmetry.mirrored_points(self.w, self.h, x, y);
+        let mut done: Vec<(f32, f32)> = Vec::with_capacity(4);
+        for (mx, my) in pts {
+            if done.iter().any(|&(dx, dy)| (dx - mx).abs() < 0.001 && (dy - my).abs() < 0.001) {
+                continue;
+            }
+            done.push((mx, my));
+            self.dab_one(brush, color, mx, my);
+        }
+    }
+
+    fn dab_one(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
         let (w_u32, h_u32) = (self.w, self.h);
         let (w, h) = (w_u32 as f32, h_u32 as f32);
         let radius = (brush.size * 0.5).max(0.5);
@@ -139,8 +152,21 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
     ]
 }
 impl Document {
-    /// Paint one pixel with source-over at brush opacity, honoring selection.
+    /// Paint one pixel with source-over at brush opacity, honoring selection
+    /// and mirroring per [`Document::symmetry`].
     fn put(&mut self, brush: &Brush, color: Color, px: u32, py: u32) {
+        let pts = self.symmetry.mirrored_pixels(self.w, self.h, px, py);
+        let mut done: Vec<(u32, u32)> = Vec::with_capacity(4);
+        for (mx, my) in pts {
+            if done.contains(&(mx, my)) {
+                continue;
+            }
+            done.push((mx, my));
+            self.put_one(brush, color, mx, my);
+        }
+    }
+
+    fn put_one(&mut self, brush: &Brush, color: Color, px: u32, py: u32) {
         if px >= self.w || py >= self.h {
             return;
         }
@@ -272,6 +298,32 @@ impl<'a> Stroke<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symmetry_mirrors_dabs() {
+        use crate::document::SymmetryMode;
+        // Off: one-sided.
+        let mut doc = Document::new(21, 21);
+        let brush = Brush { size: 3.0, softness: 0.0, opacity: 1.0, ..Default::default() };
+        doc.dab(&brush, Color::rgb(255, 0, 0), 2.5, 10.5);
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 21 + x) * 4) as usize + 3];
+        assert!(at(&doc, 2, 10) > 0);
+        assert_eq!(at(&doc, 18, 10), 0);
+        // Horizontal: mirrored left-right.
+        let mut doc = Document::new(21, 21);
+        doc.symmetry = SymmetryMode::Horizontal;
+        doc.dab(&brush, Color::rgb(255, 0, 0), 2.5, 10.5);
+        assert!(at(&doc, 2, 10) > 0);
+        assert!(at(&doc, 18, 10) > 0);
+        // Both: four quadrants.
+        let mut doc = Document::new(21, 21);
+        doc.symmetry = SymmetryMode::Both;
+        doc.dab(&brush, Color::rgb(0, 255, 0), 2.5, 3.5);
+        assert!(at(&doc, 2, 3) > 0);
+        assert!(at(&doc, 18, 3) > 0);
+        assert!(at(&doc, 2, 17) > 0);
+        assert!(at(&doc, 18, 17) > 0);
+    }
 
     #[test]
     fn shapes_paint_pixels() {

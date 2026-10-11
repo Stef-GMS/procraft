@@ -38,6 +38,53 @@ impl BlendMode {
     }
 }
 
+/// Mirror painting mode: strokes are stamped on both sides of the canvas
+/// center line(s). Horizontal mirrors left-right, Vertical mirrors top-bottom.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SymmetryMode {
+    #[default]
+    Off,
+    Horizontal,
+    Vertical,
+    Both,
+}
+
+impl SymmetryMode {
+    pub const ALL: [SymmetryMode; 4] =
+        [SymmetryMode::Off, SymmetryMode::Horizontal, SymmetryMode::Vertical, SymmetryMode::Both];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SymmetryMode::Off => "Off",
+            SymmetryMode::Horizontal => "Horizontal",
+            SymmetryMode::Vertical => "Vertical",
+            SymmetryMode::Both => "Both",
+        }
+    }
+
+    pub(crate) fn mirrored_points(self, w: u32, h: u32, x: f32, y: f32) -> [(f32, f32); 4] {
+        let mx = w as f32 - 1.0 - x;
+        let my = h as f32 - 1.0 - y;
+        match self {
+            SymmetryMode::Off => [(x, y), (x, y), (x, y), (x, y)],
+            SymmetryMode::Horizontal => [(x, y), (mx, y), (x, y), (x, y)],
+            SymmetryMode::Vertical => [(x, y), (x, my), (x, y), (x, y)],
+            SymmetryMode::Both => [(x, y), (mx, y), (x, my), (mx, my)],
+        }
+    }
+
+    pub(crate) fn mirrored_pixels(self, w: u32, h: u32, px: u32, py: u32) -> [(u32, u32); 4] {
+        let mx = w.saturating_sub(1).saturating_sub(px);
+        let my = h.saturating_sub(1).saturating_sub(py);
+        match self {
+            SymmetryMode::Off => [(px, py), (px, py), (px, py), (px, py)],
+            SymmetryMode::Horizontal => [(px, py), (mx, py), (px, py), (px, py)],
+            SymmetryMode::Vertical => [(px, py), (px, my), (px, py), (px, py)],
+            SymmetryMode::Both => [(px, py), (mx, py), (px, my), (mx, my)],
+        }
+    }
+}
+
 /// One raster layer: row-major RGBA bytes plus presentation state.
 #[derive(Clone, Debug)]
 pub struct Layer {
@@ -71,6 +118,8 @@ pub struct Document {
     /// Optional rectangular selection (inclusive canvas pixels): painting
     /// outside it is ignored.
     pub selection: Option<(u32, u32, u32, u32)>,
+    /// Mirror painting mode (not all versions of the file format store it).
+    pub symmetry: SymmetryMode,
     dirty: Option<(u32, u32, u32, u32)>,
     undo: Vec<UndoEntry>,
 }
@@ -90,6 +139,7 @@ impl Document {
             active: 0,
             background: [255, 255, 255, 255],
             selection: None,
+            symmetry: SymmetryMode::Off,
             dirty: None,
             undo: Vec::new(),
         }
@@ -298,6 +348,44 @@ impl Document {
         self.mark_full_dirty();
     }
 
+    /// Mirror a layer left-right in place. Caller checkpoints for undo first.
+    pub fn flip_layer_horizontal(&mut self, index: usize) {
+        if index >= self.layers.len() {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
+        let src = self.layers[index].pixels.clone();
+        let mut next = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let s = ((y * w + (w - 1 - x)) * 4) as usize;
+                let d = ((y * w + x) * 4) as usize;
+                next[d..d + 4].copy_from_slice(&src[s..s + 4]);
+            }
+        }
+        self.layers[index].pixels = next;
+        self.mark_full_dirty();
+    }
+
+    /// Mirror a layer top-bottom in place. Caller checkpoints for undo first.
+    pub fn flip_layer_vertical(&mut self, index: usize) {
+        if index >= self.layers.len() {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
+        let src = self.layers[index].pixels.clone();
+        let mut next = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let s = (((h - 1 - y) * w + x) * 4) as usize;
+                let d = ((y * w + x) * 4) as usize;
+                next[d..d + 4].copy_from_slice(&src[s..s + 4]);
+            }
+        }
+        self.layers[index].pixels = next;
+        self.mark_full_dirty();
+    }
+
     /// Save the composite as PNG.
     pub fn save_png(&self, path: &std::path::Path) -> Result<(), String> {
         image::save_buffer(path, &self.flatten(), self.w, self.h, image::ColorType::Rgba8)
@@ -318,17 +406,26 @@ impl Document {
         Ok(())
     }
 
-    /// Save the full project (layers, opacity, blend, background) to a
-    /// `.procraft` file: magic + little-endian records, raw pixels.
+    /// Save the full project (layers, opacity, blend, background, symmetry)
+    /// to a `.procraft` file: magic + little-endian records, raw pixels.
+    /// Version 2 adds one symmetry byte after the active layer; version 1
+    /// files (magic `PCRAFT01`, no symmetry byte) still open with symmetry off.
     pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        f.write_all(b"PCRAFT01").map_err(|e| e.to_string())?;
+        f.write_all(b"PCRAFT02").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes()).map_err(|e| e.to_string())?;
         f.write_all(&self.h.to_le_bytes()).map_err(|e| e.to_string())?;
         f.write_all(&self.background).map_err(|e| e.to_string())?;
         f.write_all(&(self.layers.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
         f.write_all(&(self.active as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+        let symmetry = match self.symmetry {
+            SymmetryMode::Off => 0u8,
+            SymmetryMode::Horizontal => 1u8,
+            SymmetryMode::Vertical => 2u8,
+            SymmetryMode::Both => 3u8,
+        };
+        f.write_all(&[symmetry]).map_err(|e| e.to_string())?;
         for layer in &self.layers {
             let name = layer.name.as_bytes();
             f.write_all(&(name.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
@@ -366,7 +463,9 @@ impl Document {
             cur = tail;
             Ok(head)
         };
-        if take(8)? != b"PCRAFT01" {
+        let magic = take(8)?.to_vec();
+        let v2 = magic == b"PCRAFT02";
+        if magic != b"PCRAFT01" && !v2 {
             return Err("not a ProCraft project file".to_string());
         }
         let w = u32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad width".to_string())?);
@@ -380,6 +479,16 @@ impl Document {
             return Err("project has bad layer count".to_string());
         }
         let active = u32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad active layer".to_string())?) as usize;
+        let symmetry = if v2 {
+            match take(1)?[0] {
+                1 => SymmetryMode::Horizontal,
+                2 => SymmetryMode::Vertical,
+                3 => SymmetryMode::Both,
+                _ => SymmetryMode::Off,
+            }
+        } else {
+            SymmetryMode::Off
+        };
         let mut layers = Vec::new();
         for _ in 0..count {
             let name_len = u32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad name".to_string())?) as usize;
@@ -409,6 +518,7 @@ impl Document {
             active: active.min(count as usize - 1),
             background: bg,
             selection: None,
+            symmetry,
             dirty: None,
             undo: Vec::new(),
         })
@@ -468,11 +578,13 @@ mod tests {
     }
 
     #[test]
-    fn project_roundtrip_keeps_everything() {        let mut doc = Document::new(4, 3);
+    fn project_roundtrip_keeps_everything() {
+        let mut doc = Document::new(4, 3);
         doc.background = [10, 20, 30, 255];
         doc.layers[0].pixels = vec![7; 4 * 3 * 4];
         doc.layers[0].opacity = 0.5;
         doc.layers[0].blend = BlendMode::Overlay;
+        doc.symmetry = SymmetryMode::Both;
         doc.add_layer("second".to_string());
         doc.layers[1].visible = false;
         let dir = std::env::temp_dir();
@@ -489,7 +601,56 @@ mod tests {
         assert_eq!(back.layers[1].name, "second");
         assert!(!back.layers[1].visible);
         assert_eq!(back.active, 1);
+        assert_eq!(back.symmetry, SymmetryMode::Both);
         assert!(Document::open_project(&dir.join("missing.pcraft")).is_err());
+    }
+
+    #[test]
+    fn v1_project_still_opens_with_symmetry_off() {
+        // Hand-build a minimal version-1 file (no symmetry byte).
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v1-compat.pcraft");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT01");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]);
+        buf.extend_from_slice(&vec![9u8; 2 * 1 * 4]);
+        std::fs::write(&path, &buf).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((back.w, back.h), (2, 1));
+        assert_eq!(back.symmetry, SymmetryMode::Off);
+        assert_eq!(back.layers[0].pixels, vec![9u8; 8]);
+    }
+
+    #[test]
+    fn flip_horizontal_mirrors_pixels() {
+        let mut doc = Document::new(4, 1);
+        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.flip_layer_horizontal(0);
+        assert_eq!(&doc.layers[0].pixels[12..16], &[255, 0, 0, 255]);
+        assert_eq!(&doc.layers[0].pixels[0..4], &[0, 0, 0, 0]);
+        // Double flip restores.
+        doc.flip_layer_horizontal(0);
+        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn flip_vertical_mirrors_pixels() {
+        let mut doc = Document::new(1, 4);
+        doc.layers[0].pixels[0..4].copy_from_slice(&[0, 255, 0, 255]);
+        doc.flip_layer_vertical(0);
+        assert_eq!(&doc.layers[0].pixels[12..16], &[0, 255, 0, 255]);
+        doc.flip_layer_vertical(0);
+        assert_eq!(&doc.layers[0].pixels[0..4], &[0, 255, 0, 255]);
     }
 
     #[test]

@@ -1,8 +1,8 @@
-//! ProCraft milestone 4: move tool, shape tools (line/rect/ellipse with fill),
-//! layer scale/rotate transforms, plus all milestone 2-3 features. Original code.
+//! ProCraft milestone 5: mirror symmetry painting, layer flip, plus all
+//! earlier features. Original code.
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
-use procraft_engine::{BlendMode, Brush, Color, Document};
+use procraft_engine::{BlendMode, Brush, Color, Document, SymmetryMode};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
@@ -358,6 +358,25 @@ impl eframe::App for ProCraftApp {
                     self.doc.affine_layer(self.doc.active, 1.0, 15.0);
                 }
             });
+            ui.horizontal(|ui| {
+                if ui.button("⇄ Flip H").clicked() {
+                    self.doc.checkpoint();
+                    self.doc.flip_layer_horizontal(self.doc.active);
+                    self.status = "Layer flipped horizontally.".to_string();
+                }
+                if ui.button("⇅ Flip V").clicked() {
+                    self.doc.checkpoint();
+                    self.doc.flip_layer_vertical(self.doc.active);
+                    self.status = "Layer flipped vertically.".to_string();
+                }
+            });
+            ui.separator();
+            ui.heading("Symmetry");
+            for m in SymmetryMode::ALL {
+                if ui.radio_value(&mut self.doc.symmetry, m, m.name()).changed() {
+                    self.status = format!("Symmetry: {}.", m.name());
+                }
+            }
             ui.separator();
             ui.heading("Brushes");
             for (name, preset) in procraft_engine::presets() {
@@ -522,6 +541,28 @@ impl eframe::App for ProCraftApp {
                 let clamp_pt = |x: f32, y: f32| {
                     (x.clamp(0.0, w - 1.0), y.clamp(0.0, h - 1.0))
                 };
+                // Mirror axis overlay so the symmetry center is visible.
+                let axis_color = Color32::from_rgba_unmultiplied(220, 40, 40, 180);
+                match self.doc.symmetry {
+                    SymmetryMode::Horizontal | SymmetryMode::Both => {
+                        let cx = rect.min.x + w * z * 0.5;
+                        ui.painter().line_segment(
+                            [egui::Pos2::new(cx, rect.min.y), egui::Pos2::new(cx, rect.max.y)],
+                            (1.0, axis_color),
+                        );
+                    }
+                    _ => {}
+                }
+                match self.doc.symmetry {
+                    SymmetryMode::Vertical | SymmetryMode::Both => {
+                        let cy = rect.min.y + h * z * 0.5;
+                        ui.painter().line_segment(
+                            [egui::Pos2::new(rect.min.x, cy), egui::Pos2::new(rect.max.x, cy)],
+                            (1.0, axis_color),
+                        );
+                    }
+                    _ => {}
+                }
 
                 if self.tool == Tool::Select {
                     // Marquee selection.

@@ -5,4 +5,4 @@ mod brush;
 mod document;
 
 pub use brush::{presets, Brush, Color, Stroke};
-pub use document::{BlendMode, Document, Layer};
+pub use document::{BlendMode, Document, Layer, SymmetryMode};

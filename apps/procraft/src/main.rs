@@ -262,9 +262,9 @@ impl eframe::App for ProCraftApp {
 
         egui::Panel::left("tools").show(ui, |ui| {
             ui.heading("Tool");
-            ui.radio_value(&mut self.tool, Tool::Brush, "Brush");
-            ui.radio_value(&mut self.tool, Tool::Eraser, "Eraser");
-            ui.radio_value(&mut self.tool, Tool::Select, "Select");
+            ui.radio_value(&mut self.tool, Tool::Brush, "🖌 Brush");
+            ui.radio_value(&mut self.tool, Tool::Eraser, "🧽 Eraser");
+            ui.radio_value(&mut self.tool, Tool::Select, "🔳 Select");
             if ui.button("Clear selection").clicked() {
                 self.doc.selection = None;
                 self.status = "Selection cleared.".to_string();
@@ -279,7 +279,14 @@ impl eframe::App for ProCraftApp {
             }
             ui.separator();
             ui.heading("Color");
-            egui::color_picker::color_edit_button_srgb(ui, &mut self.color);
+            let mut c = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
+            if egui::color_picker::color_picker_color32(
+                ui,
+                &mut c,
+                egui::color_picker::Alpha::Opaque,
+            ) {
+                self.color = [c.r(), c.g(), c.b()];
+            }
             ui.separator();
             ui.add(egui::Slider::new(&mut self.brush.size, 1.0..=200.0).text("Size"));
             ui.add(egui::Slider::new(&mut self.brush.opacity, 0.05..=1.0).text("Opacity"));

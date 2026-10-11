@@ -27,8 +27,12 @@ pub struct Document {
     pub h: u32,
     pub layers: Vec<Layer>,
     pub active: usize,
-    /// Backdrop shown under transparent pixels (checkerboard-ish default).
+    /// Backdrop shown under transparent pixels (the page color).
     pub background: [u8; 4],
+    /// Optional rectangular selection (inclusive canvas pixels): painting
+    /// outside it is ignored.
+    pub selection: Option<(u32, u32, u32, u32)>,
+    dirty: Option<(u32, u32, u32, u32)>,
     undo: Vec<UndoEntry>,
 }
 
@@ -46,8 +50,31 @@ impl Document {
             layers: vec![Layer::blank("Layer 1".to_string(), w, h)],
             active: 0,
             background: [128, 128, 128, 255],
+            selection: None,
+            dirty: None,
             undo: Vec::new(),
         }
+    }
+
+    /// Take and clear the dirty region (inclusive bounds) for partial
+    /// texture uploads. `None` means nothing changed: skip the upload.
+    pub fn take_dirty(&mut self) -> Option<(u32, u32, u32, u32)> {
+        self.dirty.take()
+    }
+
+    /// Mark the whole canvas dirty (structural changes, undo, background).
+    pub fn mark_full_dirty(&mut self) {
+        if self.w > 0 && self.h > 0 {
+            self.dirty = Some((0, 0, self.w - 1, self.h - 1));
+        }
+    }
+
+    pub(crate) fn mark_dirty(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) {
+        let r = (x0, y0, x1, y1);
+        self.dirty = Some(match self.dirty {
+            Some((a, b, c, d)) => (a.min(r.0), b.min(r.1), c.max(r.2), d.max(r.3)),
+            None => r,
+        });
     }
 
     pub fn active_layer_mut(&mut self) -> Option<&mut Layer> {
@@ -57,6 +84,7 @@ impl Document {
     pub fn add_layer(&mut self, name: String) {
         self.layers.push(Layer::blank(name, self.w, self.h));
         self.active = self.layers.len() - 1;
+        self.mark_full_dirty();
     }
 
     pub fn remove_layer(&mut self, index: usize) {
@@ -65,6 +93,7 @@ impl Document {
         }
         self.layers.remove(index);
         self.active = self.active.min(self.layers.len() - 1);
+        self.mark_full_dirty();
     }
 
     pub fn move_layer(&mut self, from: usize, to: usize) {
@@ -74,6 +103,7 @@ impl Document {
         let layer = self.layers.remove(from);
         self.layers.insert(to, layer);
         self.active = to;
+        self.mark_full_dirty();
     }
 
     /// Snapshot the active layer for one undo step (call when a stroke starts).
@@ -92,36 +122,61 @@ impl Document {
             if let Some(layer) = self.layers.get_mut(entry.layer) {
                 layer.pixels = entry.pixels;
                 self.active = entry.layer.min(self.layers.len().saturating_sub(1));
+                self.mark_full_dirty();
                 return true;
             }
         }
         false
     }
 
+    fn composite_pixel(&self, x: u32, y: u32) -> [u8; 4] {
+        let (mut r, mut g, mut b) =
+            (self.background[0] as f32, self.background[1] as f32, self.background[2] as f32);
+        let o = ((y * self.w + x) * 4) as usize;
+        for layer in &self.layers {
+            if !layer.visible || layer.opacity <= 0.0 || o + 3 >= layer.pixels.len() {
+                continue;
+            }
+            let a = layer.pixels[o + 3] as f32 / 255.0 * layer.opacity.clamp(0.0, 1.0);
+            if a <= 0.0 {
+                continue;
+            }
+            r = layer.pixels[o] as f32 * a + r * (1.0 - a);
+            g = layer.pixels[o + 1] as f32 * a + g * (1.0 - a);
+            b = layer.pixels[o + 2] as f32 * a + b * (1.0 - a);
+        }
+        [
+            r.round().clamp(0.0, 255.0) as u8,
+            g.round().clamp(0.0, 255.0) as u8,
+            b.round().clamp(0.0, 255.0) as u8,
+            255,
+        ]
+    }
+
     /// Composite bottom-to-top over the background into RGBA bytes.
     pub fn flatten(&self) -> Vec<u8> {
         let n = (self.w * self.h) as usize;
         let mut out = vec![0u8; n * 4];
-        for i in 0..n {
-            let (mut r, mut g, mut b) =
-                (self.background[0] as f32, self.background[1] as f32, self.background[2] as f32);
-            for layer in &self.layers {
-                if !layer.visible || layer.opacity <= 0.0 {
-                    continue;
-                }
-                let o = (i * 4).min(layer.pixels.len().saturating_sub(4));
-                let a = layer.pixels[o + 3] as f32 / 255.0 * layer.opacity.clamp(0.0, 1.0);
-                if a <= 0.0 {
-                    continue;
-                }
-                r = layer.pixels[o] as f32 * a + r * (1.0 - a);
-                g = layer.pixels[o + 1] as f32 * a + g * (1.0 - a);
-                b = layer.pixels[o + 2] as f32 * a + b * (1.0 - a);
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let i = ((y * self.w + x) * 4) as usize;
+                out[i..i + 4].copy_from_slice(&self.composite_pixel(x, y));
             }
-            out[i * 4] = r.round().clamp(0.0, 255.0) as u8;
-            out[i * 4 + 1] = g.round().clamp(0.0, 255.0) as u8;
-            out[i * 4 + 2] = b.round().clamp(0.0, 255.0) as u8;
-            out[i * 4 + 3] = 255;
+        }
+        out
+    }
+
+    /// Composite only the inclusive region `(x0, y0)..=(x1, y1)` (clamped),
+    /// row-major RGBA, for partial texture uploads.
+    pub fn flatten_region(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> Vec<u8> {
+        let x1 = x1.min(self.w.saturating_sub(1));
+        let y1 = y1.min(self.h.saturating_sub(1));
+        let (x0, y0) = (x0.min(x1), y0.min(y1));
+        let mut out = Vec::with_capacity(((x1 - x0 + 1) * (y1 - y0 + 1) * 4) as usize);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                out.extend_from_slice(&self.composite_pixel(x, y));
+            }
         }
         out
     }

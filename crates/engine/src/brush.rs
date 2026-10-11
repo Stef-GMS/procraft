@@ -36,22 +36,30 @@ impl Default for Brush {
 
 impl Document {
     /// Stamp one dab centered at canvas pixel `(x, y)` on the active layer.
+    /// Pixels outside [`Document::selection`] (when set) are skipped.
     pub fn dab(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
         let (w_u32, h_u32) = (self.w, self.h);
-        let Some(layer) = self.active_layer_mut() else { return };
         let (w, h) = (w_u32 as f32, h_u32 as f32);
         let radius = (brush.size * 0.5).max(0.5);
         let strength = brush.opacity.clamp(0.0, 1.0);
-        if strength <= 0.0 {
+        if strength <= 0.0 || self.layers.get(self.active).is_none() {
             return;
         }
         let x0 = (x - radius).floor().max(0.0) as u32;
         let y0 = (y - radius).floor().max(0.0) as u32;
         let x1 = (x + radius).ceil().min(w - 1.0).max(0.0) as u32;
         let y1 = (y + radius).ceil().min(h - 1.0).max(0.0) as u32;
+        self.mark_dirty(x0, y0, x1, y1);
+        let selection = self.selection;
+        let Some(layer) = self.active_layer_mut() else { return };
         let w = w_u32;
         for py in y0..=y1 {
             for px in x0..=x1 {
+                if let Some((sx0, sy0, sx1, sy1)) = selection {
+                    if px < sx0 || px > sx1 || py < sy0 || py > sy1 {
+                        continue;
+                    }
+                }
                 let d = ((px as f32 + 0.5 - x).hypot(py as f32 + 0.5 - y)) / radius;
                 if d > 1.0 {
                     continue;
@@ -118,8 +126,18 @@ impl Document {
     }
 }
 
-/// One in-progress stroke (convenience wrapper; the GUI drives
-/// [`Document::stroke_to`] directly so paint state survives across frames).
+/// Built-in brush presets: name plus settings. Original set, roughly grouped
+/// from hard sketching to soft painting.
+pub fn presets() -> Vec<(&'static str, Brush)> {
+    vec![
+        ("Pencil", Brush { size: 3.0, opacity: 1.0, softness: 0.15, spacing: 0.1, eraser: false }),
+        ("Ink Pen", Brush { size: 6.0, opacity: 1.0, softness: 0.3, spacing: 0.1, eraser: false }),
+        ("Round", Brush { size: 24.0, opacity: 1.0, softness: 0.6, spacing: 0.15, eraser: false }),
+        ("Marker", Brush { size: 28.0, opacity: 0.85, softness: 0.5, spacing: 0.12, eraser: false }),
+        ("Airbrush", Brush { size: 64.0, opacity: 0.25, softness: 1.0, spacing: 0.08, eraser: false }),
+        ("Chalk", Brush { size: 18.0, opacity: 0.8, softness: 0.9, spacing: 0.25, eraser: false }),
+    ]
+}
 pub struct Stroke<'a> {
     doc: &'a mut Document,
     brush: Brush,

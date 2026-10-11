@@ -4,5 +4,5 @@
 mod brush;
 mod document;
 
-pub use brush::{Brush, Color, Stroke};
+pub use brush::{presets, Brush, Color, Stroke};
 pub use document::{Document, Layer};

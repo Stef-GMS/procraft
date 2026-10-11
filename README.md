@@ -9,13 +9,15 @@ original.
 > Interactive. ProCraft is an independent project with its own name, branding
 > and code, and is not affiliated with or endorsed by any other vendor.
 
-## Status: milestone 1
+## Status: milestone 3
 
-- [x] Layered document model (add / hide / reorder / opacity)
-- [x] Soft-round brush + eraser with spacing and undo
+- [x] Layered document model (add / hide / reorder / opacity / blend)
+- [x] Soft-round brush + eraser with spacing, dynamics and undo
 - [x] egui desktop app: paint, layers panel, color/size sliders, PNG export
-- [ ] Brush library + pressure simulation
-- [ ] Selections, transform, filters
+- [x] Project files (`.procraft` keeps every layer), zoom, themes, page colors
+- [x] Rectangular selections constraining paint
+- [ ] Brush library file format (import/export sets)
+- [ ] Selections: ellipse/lasso, fill, transform
 - [ ] Native iOS build (same playbook as our PdfCraft iOS spike)
 
 ## Build

@@ -1,5 +1,43 @@
 //! Layers, documents, compositing and undo.
 
+/// How a layer's pixels combine with what's beneath.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+}
+
+impl BlendMode {
+    pub const ALL: [BlendMode; 4] = [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen, BlendMode::Overlay];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::Screen => "Screen",
+            BlendMode::Overlay => "Overlay",
+        }
+    }
+
+    fn apply(self, src: f32, dst: f32) -> f32 {
+        match self {
+            BlendMode::Normal => src,
+            BlendMode::Multiply => src * dst / 255.0,
+            BlendMode::Screen => 255.0 - (255.0 - src) * (255.0 - dst) / 255.0,
+            BlendMode::Overlay => {
+                if dst < 128.0 {
+                    2.0 * src * dst / 255.0
+                } else {
+                    255.0 - 2.0 * (255.0 - src) * (255.0 - dst) / 255.0
+                }
+            }
+        }
+    }
+}
+
 /// One raster layer: row-major RGBA bytes plus presentation state.
 #[derive(Clone, Debug)]
 pub struct Layer {
@@ -7,12 +45,13 @@ pub struct Layer {
     pub visible: bool,
     /// 0.0 (transparent) ..= 1.0 (opaque).
     pub opacity: f32,
+    pub blend: BlendMode,
     pub pixels: Vec<u8>,
 }
 
 impl Layer {
     pub fn blank(name: String, w: u32, h: u32) -> Self {
-        Self { name, visible: true, opacity: 1.0, pixels: vec![0; (w * h * 4) as usize] }
+        Self { name, visible: true, opacity: 1.0, blend: BlendMode::Normal, pixels: vec![0; (w * h * 4) as usize] }
     }
 
     pub fn clear(&mut self) {
@@ -141,9 +180,10 @@ impl Document {
             if a <= 0.0 {
                 continue;
             }
-            r = layer.pixels[o] as f32 * a + r * (1.0 - a);
-            g = layer.pixels[o + 1] as f32 * a + g * (1.0 - a);
-            b = layer.pixels[o + 2] as f32 * a + b * (1.0 - a);
+            let blend = layer.blend;
+            r = blend.apply(layer.pixels[o] as f32, r) * a + r * (1.0 - a);
+            g = blend.apply(layer.pixels[o + 1] as f32, g) * a + g * (1.0 - a);
+            b = blend.apply(layer.pixels[o + 2] as f32, b) * a + b * (1.0 - a);
         }
         [
             r.round().clamp(0.0, 255.0) as u8,
@@ -200,6 +240,102 @@ impl Document {
         self.undo.clear();
         Ok(())
     }
+
+    /// Save the full project (layers, opacity, blend, background) to a
+    /// `.procraft` file: magic + little-endian records, raw pixels.
+    pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        f.write_all(b"PCRAFT01").map_err(|e| e.to_string())?;
+        f.write_all(&self.w.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&self.h.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&self.background).map_err(|e| e.to_string())?;
+        f.write_all(&(self.layers.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&(self.active as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+        for layer in &self.layers {
+            let name = layer.name.as_bytes();
+            f.write_all(&(name.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+            f.write_all(name).map_err(|e| e.to_string())?;
+            f.write_all(&[u8::from(layer.visible)]).map_err(|e| e.to_string())?;
+            f.write_all(&layer.opacity.to_le_bytes()).map_err(|e| e.to_string())?;
+            let blend = match layer.blend {
+                BlendMode::Normal => 0u8,
+                BlendMode::Multiply => 1u8,
+                BlendMode::Screen => 2u8,
+                BlendMode::Overlay => 3u8,
+            };
+            f.write_all(&[blend]).map_err(|e| e.to_string())?;
+            let expect = (self.w * self.h * 4) as usize;
+            if layer.pixels.len() != expect {
+                return Err("layer has wrong pixel size".to_string());
+            }
+            f.write_all(&layer.pixels).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Load a `.procraft` file, replacing the current document.
+    pub fn open_project(path: &std::path::Path) -> Result<Document, String> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        let mut cur = &buf[..];
+        let mut take = |n: usize| -> Result<&[u8], String> {
+            if cur.len() < n {
+                return Err("project file is truncated".to_string());
+            }
+            let (head, tail) = cur.split_at(n);
+            cur = tail;
+            Ok(head)
+        };
+        if take(8)? != b"PCRAFT01" {
+            return Err("not a ProCraft project file".to_string());
+        }
+        let w = u32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad width".to_string())?);
+        let h = u32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad height".to_string())?);
+        if w == 0 || h == 0 || w > 16384 || h > 16384 {
+            return Err("project has bad dimensions".to_string());
+        }
+        let bg: [u8; 4] = take(4)?[..4].try_into().map_err(|_| "bad background".to_string())?;
+        let count = u32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad layer count".to_string())?);
+        if count == 0 || count > 256 {
+            return Err("project has bad layer count".to_string());
+        }
+        let active = u32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad active layer".to_string())?) as usize;
+        let mut layers = Vec::new();
+        for _ in 0..count {
+            let name_len = u32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad name".to_string())?) as usize;
+            if name_len > 512 {
+                return Err("project has bad layer name".to_string());
+            }
+            let name = String::from_utf8(take(name_len)?.to_vec()).map_err(|_| "bad layer name".to_string())?;
+            let visible = take(1)?[0] != 0;
+            let opacity = f32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad opacity".to_string())?).clamp(0.0, 1.0);
+            let blend = match take(1)?[0] {
+                1 => BlendMode::Multiply,
+                2 => BlendMode::Screen,
+                3 => BlendMode::Overlay,
+                _ => BlendMode::Normal,
+            };
+            let expect = (w * h * 4) as usize;
+            let pixels = take(expect)?.to_vec();
+            layers.push(Layer { name, visible, opacity, blend, pixels });
+        }
+        if !cur.is_empty() {
+            return Err("project has trailing data".to_string());
+        }
+        Ok(Document {
+            w,
+            h,
+            layers,
+            active: active.min(count as usize - 1),
+            background: bg,
+            selection: None,
+            dirty: None,
+            undo: Vec::new(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -233,5 +369,50 @@ mod tests {
         assert!(doc.undo());
         assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
         assert!(!doc.undo());
+    }
+
+    #[test]
+    fn multiply_blends_channels() {
+        let mut doc = Document::new(1, 1);
+        doc.background = [255, 255, 255, 255];
+        doc.layers[0].pixels = vec![128, 200, 64, 255];
+        doc.layers[0].blend = BlendMode::Multiply;
+        let flat = doc.flatten();
+        assert_eq!(&flat[0..4], &[128, 200, 64, 255]);
+        // Screen over black returns the source unchanged.
+        doc.background = [0, 0, 0, 255];
+        doc.layers[0].blend = BlendMode::Screen;
+        let flat = doc.flatten();
+        assert_eq!(&flat[0..4], &[128, 200, 64, 255]);
+        // Screen over mid-gray lightens past the source.
+        doc.background = [128, 128, 128, 255];
+        let flat = doc.flatten();
+        assert!(flat[0] > 128 && flat[1] > 200 && flat[2] > 64, "{flat:?}");
+    }
+
+    #[test]
+    fn project_roundtrip_keeps_everything() {
+        let mut doc = Document::new(4, 3);
+        doc.background = [10, 20, 30, 255];
+        doc.layers[0].pixels = vec![7; 4 * 3 * 4];
+        doc.layers[0].opacity = 0.5;
+        doc.layers[0].blend = BlendMode::Overlay;
+        doc.add_layer("second".to_string());
+        doc.layers[1].visible = false;
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-roundtrip.pcraft");
+        doc.save_project(&path).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((back.w, back.h), (4, 3));
+        assert_eq!(back.background, [10, 20, 30, 255]);
+        assert_eq!(back.layers.len(), 2);
+        assert_eq!(back.layers[0].opacity, 0.5);
+        assert_eq!(back.layers[0].blend, BlendMode::Overlay);
+        assert_eq!(back.layers[0].pixels, vec![7; 4 * 3 * 4]);
+        assert_eq!(back.layers[1].name, "second");
+        assert!(!back.layers[1].visible);
+        assert_eq!(back.active, 1);
+        assert!(Document::open_project(&dir.join("missing.pcraft")).is_err());
     }
 }

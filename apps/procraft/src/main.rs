@@ -2,7 +2,7 @@
 //! brush presets, velocity dynamics and rectangular selections. Original code.
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
-use procraft_engine::{Brush, Color, Document};
+use procraft_engine::{BlendMode, Brush, Color, Document};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
@@ -34,8 +34,15 @@ impl Theme {
     }
 }
 
-fn page_presets() -> Vec<(&'static str, [u8; 3])> {
-    vec![
+/// Append `.ext` when the chosen path has none (rfd doesn't force it).
+fn ensure_extension(mut path: std::path::PathBuf, ext: &str) -> std::path::PathBuf {
+    if path.extension().is_none() {
+        path.set_extension(ext);
+    }
+    path
+}
+
+fn page_presets() -> Vec<(&'static str, [u8; 3])> {    vec![
         ("White", [255, 255, 255]),
         ("Black", [0, 0, 0]),
         ("Gray", [128, 128, 128]),
@@ -60,6 +67,7 @@ struct ProCraftApp {
     leftover: f32,
     sel_anchor: Option<(f32, f32)>,
     sel_current: Option<(f32, f32)>,
+    zoom: f32,
     status: String,
 }
 
@@ -81,6 +89,7 @@ impl ProCraftApp {
             leftover: 0.0,
             sel_anchor: None,
             sel_current: None,
+            zoom: 1.0,
             status: "Drag on the canvas to paint. Ctrl+Z undoes, Esc clears selection.".to_string(),
         }
     }
@@ -195,6 +204,33 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                 }
+                if ui.button("Save project").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("ProCraft project", &["procraft"])
+                        .save_file()
+                    {
+                        let path = ensure_extension(path, "procraft");
+                        match self.doc.save_project(&path) {
+                            Ok(()) => self.status = format!("Project saved {}", path.display()),
+                            Err(e) => self.status = format!("Project save failed: {e}"),
+                        }
+                    }
+                }
+                if ui.button("Open project").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("ProCraft project", &["procraft"])
+                        .pick_file()
+                    {
+                        match Document::open_project(&path) {
+                            Ok(doc) => {
+                                self.doc = doc;
+                                self.texture = None;
+                                self.status = format!("Project opened {}", path.display());
+                            }
+                            Err(e) => self.status = format!("Project open failed: {e}"),
+                        }
+                    }
+                }
                 if ui.button("Clear layer").clicked() {
                     self.doc.checkpoint();
                     if let Some(layer) = self.doc.active_layer_mut() {
@@ -210,6 +246,17 @@ impl eframe::App for ProCraftApp {
                 ui.radio_value(&mut self.theme, Theme::Dark, "Dark");
                 ui.radio_value(&mut self.theme, Theme::Light, "Light");
                 ui.radio_value(&mut self.theme, Theme::Paper, "Paper");
+                ui.separator();
+                if ui.button("−").clicked() {
+                    self.zoom = (self.zoom / 1.25).clamp(0.1, 8.0);
+                }
+                ui.label(format!("{}%", (self.zoom * 100.0).round() as u32));
+                if ui.button("+").clicked() {
+                    self.zoom = (self.zoom * 1.25).clamp(0.1, 8.0);
+                }
+                if ui.button("Fit").clicked() {
+                    self.zoom = 0.0; // recomputed in the canvas view
+                }
             });
         });
 
@@ -295,8 +342,35 @@ impl eframe::App for ProCraftApp {
                 ui.label(format!("Opacity: {}", layer.name));
                 let before = layer.opacity;
                 ui.add(egui::Slider::new(&mut layer.opacity, 0.0..=1.0).text(""));
-                if (layer.opacity - before).abs() > f32::EPSILON {
-                    drop(layer);
+                let mut blend = layer.blend;
+                let mut moved = 0;
+                egui::ComboBox::from_label("Blend")
+                    .selected_text(blend.name())
+                    .show_ui(ui, |ui| {
+                        for m in BlendMode::ALL {
+                            ui.selectable_value(&mut blend, m, m.name());
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    if ui.button("▲ Up").clicked() {
+                        moved = 1;
+                    }
+                    if ui.button("▼ Down").clicked() {
+                        moved = -1;
+                    }
+                });
+                let active = self.doc.active;
+                let mut dirty = (self.doc.layers[active].opacity - before).abs() > f32::EPSILON;
+                if self.doc.layers[active].blend != blend {
+                    self.doc.layers[active].blend = blend;
+                    dirty = true;
+                }
+                if moved > 0 && active + 1 < self.doc.layers.len() {
+                    self.doc.move_layer(active, active + 1);
+                } else if moved < 0 && active > 0 {
+                    self.doc.move_layer(active, active - 1);
+                }
+                if dirty {
                     self.doc.mark_full_dirty();
                 }
             }
@@ -317,16 +391,22 @@ impl eframe::App for ProCraftApp {
             self.refresh_texture(&ctx);
             let tex = self.texture.as_ref().unwrap().id();
             let (w, h) = (self.doc.w as f32, self.doc.h as f32);
+            let avail = ui.available_size();
+            if self.zoom <= 0.0 {
+                self.zoom = (avail.x / w).min(avail.y / h).clamp(0.1, 8.0);
+            }
+            let z = self.zoom;
             egui::ScrollArea::both().show(ui, |ui| {
                 let (rect, resp) =
-                    ui.allocate_exact_size(Vec2::new(w, h), Sense::click_and_drag());
+                    ui.allocate_exact_size(Vec2::new(w * z, h * z), Sense::click_and_drag());
                 ui.painter().image(
                     tex,
                     rect,
                     egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
                     Color32::WHITE,
                 );
-                let to_canvas = |pos: egui::Pos2| (pos.x - rect.min.x, pos.y - rect.min.y);
+                let to_canvas =
+                    |pos: egui::Pos2| ((pos.x - rect.min.x) / z, (pos.y - rect.min.y) / z);
                 let clamp_pt = |x: f32, y: f32| {
                     (x.clamp(0.0, w - 1.0), y.clamp(0.0, h - 1.0))
                 };
@@ -371,8 +451,8 @@ impl eframe::App for ProCraftApp {
                         let (x0, x1) = if ax <= bx { (ax, bx) } else { (bx, ax) };
                         let (y0, y1) = if ay <= by { (ay, by) } else { (by, ay) };
                         let r = egui::Rect::from_min_max(
-                            egui::Pos2::new(rect.min.x + x0, rect.min.y + y0),
-                            egui::Pos2::new(rect.min.x + x1, rect.min.y + y1),
+                            egui::Pos2::new(rect.min.x + x0 * z, rect.min.y + y0 * z),
+                            egui::Pos2::new(rect.min.x + x1 * z, rect.min.y + y1 * z),
                         );
                         paint_selection(ui.painter(), r, ctx.input(|i| i.time));
                     }

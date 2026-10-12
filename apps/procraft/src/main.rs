@@ -100,6 +100,7 @@ struct ProCraftApp {
     filt_sharpen: f32,
     renaming: Option<usize>,
     preset_textures: Vec<TextureHandle>,
+    preview_theme: Option<Theme>,
     move_from: Option<(f32, f32)>,
     move_acc: (f32, f32),
     shape_anchor: Option<(f32, f32)>,
@@ -151,6 +152,7 @@ impl ProCraftApp {
             filt_sharpen: 0.0,
             renaming: None,
             preset_textures: Vec::new(),
+            preview_theme: None,
             move_from: None,
             move_acc: (0.0, 0.0),
             shape_anchor: None,
@@ -199,19 +201,19 @@ impl ProCraftApp {
 
     /// Honest brush previews: each preset paints a wavy sample stroke through
     /// the real engine into a thumbnail texture (dotted chalk reads dotted).
-    fn build_preset_previews(&mut self, ctx: &egui::Context) {
+    /// Ink follows the theme so cards stay crisp on dark and paper alike.
+    fn build_preset_previews(&mut self, ctx: &egui::Context, ink: Color) {
         self.preset_textures.clear();
         for (idx, (_, preset)) in procraft_engine::presets().into_iter().enumerate() {
             let mut doc = Document::new(144, 36);
             let brush = Brush { eraser: false, ..preset };
-            let color = Color::rgb(150, 150, 150);
             let mut last = None;
             let mut left = 0.0;
             let mut x = 8.0;
             while x <= 136.0 {
                 let y = 18.0
                     + 8.0 * ((x - 8.0) / 128.0 * std::f32::consts::PI * 2.0).sin();
-                let (l, lo) = doc.stroke_to(&brush, color, last, (x, y), left);
+                let (l, lo) = doc.stroke_to(&brush, ink, last, (x, y), left);
                 last = l;
                 left = lo;
                 x += 2.0;
@@ -433,21 +435,34 @@ impl eframe::App for ProCraftApp {
             }
             ui.separator();
             ui.heading("Brushes");
-            if self.preset_textures.len() != procraft_engine::presets().len() {
+            // Theme ink: light strokes on dark theme, dark strokes otherwise.
+            let ink = match self.theme {
+                Theme::Dark => Color::rgb(215, 215, 215),
+                _ => Color::rgb(70, 70, 70),
+            };
+            if self.preview_theme != Some(self.theme)
+                || self.preset_textures.len() != procraft_engine::presets().len()
+            {
                 let ctx = ui.ctx().clone();
-                self.build_preset_previews(&ctx);
+                self.build_preset_previews(&ctx, ink);
+                self.preview_theme = Some(self.theme);
             }
-            for (idx, (name, preset)) in procraft_engine::presets().into_iter().enumerate() {
-                ui.horizontal(|ui| {
-                    if ui.button(name).clicked() {
-                        self.brush = preset;
-                        self.tool = Tool::Brush;
-                    }
-                    if let Some(tex) = self.preset_textures.get(idx) {
-                        ui.image((tex.id(), Vec2::new(120.0, 30.0)));
-                    }
-                });
-            }
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 3.0);
+                for (idx, (name, preset)) in procraft_engine::presets().into_iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.add_sized([64.0, 22.0], egui::Button::new(name)).clicked() {
+                            self.brush = preset;
+                            self.tool = Tool::Brush;
+                        }
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            if let Some(tex) = self.preset_textures.get(idx) {
+                                ui.image((tex.id(), Vec2::new(96.0, 24.0)));
+                            }
+                        });
+                    });
+                }
+            });
             ui.separator();
             ui.heading("Color");
             ui.horizontal(|ui| {

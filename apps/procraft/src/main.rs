@@ -134,7 +134,7 @@ impl ProCraftApp {
             theme_applied: None,
             page_custom: [255, 255, 255],
             dynamics: 0.6,
-            picker_size: 280.0,
+            picker_size: 165.0,
             texture: None,
             painting: false,
             last: None,
@@ -439,12 +439,12 @@ impl eframe::App for ProCraftApp {
             }
             for (idx, (name, preset)) in procraft_engine::presets().into_iter().enumerate() {
                 ui.horizontal(|ui| {
-                    if let Some(tex) = self.preset_textures.get(idx) {
-                        ui.image((tex.id(), Vec2::new(120.0, 30.0)));
-                    }
                     if ui.button(name).clicked() {
                         self.brush = preset;
                         self.tool = Tool::Brush;
+                    }
+                    if let Some(tex) = self.preset_textures.get(idx) {
+                        ui.image((tex.id(), Vec2::new(120.0, 30.0)));
                     }
                 });
             }

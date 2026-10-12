@@ -8,10 +8,27 @@ pub enum BlendMode {
     Multiply,
     Screen,
     Overlay,
+    Darken,
+    Lighten,
+    Difference,
+    Exclusion,
+    SoftLight,
+    HardLight,
 }
 
 impl BlendMode {
-    pub const ALL: [BlendMode; 4] = [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen, BlendMode::Overlay];
+    pub const ALL: [BlendMode; 10] = [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+        BlendMode::SoftLight,
+        BlendMode::HardLight,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -19,6 +36,12 @@ impl BlendMode {
             BlendMode::Multiply => "Multiply",
             BlendMode::Screen => "Screen",
             BlendMode::Overlay => "Overlay",
+            BlendMode::Darken => "Darken",
+            BlendMode::Lighten => "Lighten",
+            BlendMode::Difference => "Difference",
+            BlendMode::Exclusion => "Exclusion",
+            BlendMode::SoftLight => "Soft light",
+            BlendMode::HardLight => "Hard light",
         }
     }
 
@@ -29,6 +52,28 @@ impl BlendMode {
             BlendMode::Screen => 255.0 - (255.0 - src) * (255.0 - dst) / 255.0,
             BlendMode::Overlay => {
                 if dst < 128.0 {
+                    2.0 * src * dst / 255.0
+                } else {
+                    255.0 - 2.0 * (255.0 - src) * (255.0 - dst) / 255.0
+                }
+            }
+            BlendMode::Darken => src.min(dst),
+            BlendMode::Lighten => src.max(dst),
+            BlendMode::Difference => (src - dst).abs(),
+            BlendMode::Exclusion => src + dst - 2.0 * src * dst / 255.0,
+            BlendMode::SoftLight => {
+                // Pegtop approximation: gentle contrast around mid-gray.
+                let (s, d) = (src / 255.0, dst / 255.0);
+                let out = if s <= 0.5 {
+                    d - (1.0 - 2.0 * s) * d * (1.0 - d)
+                } else {
+                    d + (2.0 * s - 1.0) * (d.sqrt() - d)
+                };
+                out.clamp(0.0, 1.0) * 255.0
+            }
+            BlendMode::HardLight => {
+                // Overlay with source and destination swapped.
+                if src < 128.0 {
                     2.0 * src * dst / 255.0
                 } else {
                     255.0 - 2.0 * (255.0 - src) * (255.0 - dst) / 255.0
@@ -160,15 +205,48 @@ pub struct Layer {
     pub opacity: f32,
     pub blend: BlendMode,
     pub pixels: Vec<u8>,
+    /// Optional grayscale reveal mask (row-major, 255 = fully shown).
+    /// Multiplies the layer's alpha at composite time. Session-painted;
+    /// saved to v5 project files.
+    pub mask: Option<Vec<u8>>,
+    /// Clipping mask: confine this layer to the opaque content beneath it.
+    pub clip: bool,
 }
 
 impl Layer {
     pub fn blank(name: String, w: u32, h: u32) -> Self {
-        Self { name, visible: true, opacity: 1.0, blend: BlendMode::Normal, pixels: vec![0; (w * h * 4) as usize] }
+        Self {
+            name,
+            visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            pixels: vec![0; (w * h * 4) as usize],
+            mask: None,
+            clip: false,
+        }
     }
 
     pub fn clear(&mut self) {
         self.pixels.fill(0);
+    }
+}
+
+/// Freehand painting target: layer color or its reveal mask. On masks the
+/// brush color's luminance is the mask value (dark conceals, white reveals);
+/// the eraser always reveals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PaintTarget {
+    #[default]
+    Color,
+    Mask,
+}
+
+impl PaintTarget {
+    pub fn name(self) -> &'static str {
+        match self {
+            PaintTarget::Color => "Color",
+            PaintTarget::Mask => "Mask",
+        }
     }
 }
 
@@ -191,6 +269,8 @@ pub struct Document {
     pub symmetry: SymmetryMode,
     /// Kaleidoscope reflection axes, 2..=16 (only used in that mode).
     pub symmetry_segments: u8,
+    /// Freehand painting target (layer color or its reveal mask).
+    pub paint_target: PaintTarget,
     dirty: Option<(u32, u32, u32, u32)>,
     undo: Vec<UndoEntry>,
     redo: Vec<UndoEntry>,
@@ -200,6 +280,7 @@ pub struct Document {
 struct UndoEntry {
     layer: usize,
     pixels: Vec<u8>,
+    mask: Option<Vec<u8>>,
 }
 
 impl Document {
@@ -214,6 +295,7 @@ impl Document {
             selection_mask: None,
             symmetry: SymmetryMode::Off,
             symmetry_segments: 6,
+            paint_target: PaintTarget::Color,
             dirty: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -284,9 +366,11 @@ impl Document {
 
     /// Copy of the active layer for the history stacks, if there is one.
     fn snapshot(&self) -> Option<UndoEntry> {
-        self.layers
-            .get(self.active)
-            .map(|layer| UndoEntry { layer: self.active, pixels: layer.pixels.clone() })
+        self.layers.get(self.active).map(|layer| UndoEntry {
+            layer: self.active,
+            pixels: layer.pixels.clone(),
+            mask: layer.mask.clone(),
+        })
     }
 
     /// Restore the most recent snapshot. Returns false when history is empty.
@@ -299,6 +383,7 @@ impl Document {
                 self.redo.push(cur);
                 if let Some(layer) = self.layers.get_mut(entry.layer) {
                     layer.pixels = entry.pixels;
+                    layer.mask = entry.mask;
                     self.active = entry.layer.min(self.layers.len().saturating_sub(1));
                     self.mark_full_dirty();
                     return true;
@@ -318,6 +403,7 @@ impl Document {
                 self.undo.push(cur);
                 if let Some(layer) = self.layers.get_mut(entry.layer) {
                     layer.pixels = entry.pixels;
+                    layer.mask = entry.mask;
                     self.active = entry.layer.min(self.layers.len().saturating_sub(1));
                     self.mark_full_dirty();
                     return true;
@@ -331,11 +417,20 @@ impl Document {
         let (mut r, mut g, mut b) =
             (self.background[0] as f32, self.background[1] as f32, self.background[2] as f32);
         let o = ((y * self.w + x) * 4) as usize;
+        // Opaque content composited so far (layers only, not the page):
+        // clipping masks intersect against it.
+        let mut below_a = 0.0f32;
         for layer in &self.layers {
             if !layer.visible || layer.opacity <= 0.0 || o + 3 >= layer.pixels.len() {
                 continue;
             }
-            let a = layer.pixels[o + 3] as f32 / 255.0 * layer.opacity.clamp(0.0, 1.0);
+            let mut a = layer.pixels[o + 3] as f32 / 255.0 * layer.opacity.clamp(0.0, 1.0);
+            if let Some(m) = layer.mask.as_deref() {
+                a *= m.get((y * self.w + x) as usize).copied().unwrap_or(255) as f32 / 255.0;
+            }
+            if layer.clip {
+                a *= below_a;
+            }
             if a <= 0.0 {
                 continue;
             }
@@ -343,6 +438,7 @@ impl Document {
             r = blend.apply(layer.pixels[o] as f32, r) * a + r * (1.0 - a);
             g = blend.apply(layer.pixels[o + 1] as f32, g) * a + g * (1.0 - a);
             b = blend.apply(layer.pixels[o + 2] as f32, b) * a + b * (1.0 - a);
+            below_a = a + below_a * (1.0 - a);
         }
         [
             r.round().clamp(0.0, 255.0) as u8,
@@ -380,7 +476,8 @@ impl Document {
         out
     }
 
-    /// Shift a layer by whole pixels (clipped, transparent fill).
+    /// Shift a layer by whole pixels (clipped, transparent fill). Masks
+    /// travel with their layer (shifted-in mask reveals, like new canvas).
     /// Caller checkpoints for undo first.
     pub fn translate_layer(&mut self, index: usize, dx: i32, dy: i32) {
         if (dx == 0 && dy == 0) || index >= self.layers.len() {
@@ -400,6 +497,18 @@ impl Document {
             }
         }
         self.layers[index].pixels = next;
+        if let Some(m) = self.layers[index].mask.clone() {
+            let mut nm = vec![255u8; (self.w * self.h) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    let (sx, sy) = (x - dx, y - dy);
+                    if sx >= 0 && sx < w && sy >= 0 && sy < h {
+                        nm[(y * w + x) as usize] = m[(sy * w + sx) as usize];
+                    }
+                }
+            }
+            self.layers[index].mask = Some(nm);
+        }
         self.mark_full_dirty();
     }
 
@@ -428,17 +537,29 @@ impl Document {
     }
 
     /// Scale (about the canvas center) then rotate (degrees clockwise) a
-    /// layer with bilinear sampling. Caller checkpoints for undo first.
+    /// layer with bilinear sampling. Masks travel with their layer.
+    /// Caller checkpoints for undo first.
     pub fn affine_layer(&mut self, index: usize, scale: f32, degrees: f32) {
         if index >= self.layers.len() || (scale - 1.0).abs() < 1e-6 && degrees.abs() < 1e-6 {
             return;
         }
         let (w, h) = (self.w, self.h);
+        let src = self.layers[index].pixels.clone();
+        self.layers[index].pixels = Self::affine_buffer(&src, w, h, scale, degrees);
+        if let Some(m) = self.layers[index].mask.clone() {
+            let rgba: Vec<u8> = m.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
+            let out = Self::affine_buffer(&rgba, w, h, scale, degrees);
+            self.layers[index].mask = Some(out.chunks_exact(4).map(|p| p[0]).collect());
+        }
+        self.mark_full_dirty();
+    }
+
+    /// Shared scale-then-rotate resampler over RGBA bytes.
+    fn affine_buffer(src: &[u8], w: u32, h: u32, scale: f32, degrees: f32) -> Vec<u8> {
         let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
         let theta = degrees.to_radians();
         let (sin, cos) = theta.sin_cos();
         let s = scale.max(0.01);
-        let src = self.layers[index].pixels.clone();
         let mut next = vec![0u8; (w * h * 4) as usize];
         for y in 0..h {
             for x in 0..w {
@@ -449,15 +570,15 @@ impl Document {
                 let sy = (-px * sin + py * cos) / s + cy;
                 let o = ((y * w + x) * 4) as usize;
                 if sx >= 0.0 && sx < w as f32 && sy >= 0.0 && sy < h as f32 {
-                    next[o..o + 4].copy_from_slice(&Self::sample_bilinear(&src, w, h, sx, sy));
+                    next[o..o + 4].copy_from_slice(&Self::sample_bilinear(src, w, h, sx, sy));
                 }
             }
         }
-        self.layers[index].pixels = next;
-        self.mark_full_dirty();
+        next
     }
 
-    /// Mirror a layer left-right in place. Caller checkpoints for undo first.
+    /// Mirror a layer left-right in place. Masks travel with their layer.
+    /// Caller checkpoints for undo first.
     pub fn flip_layer_horizontal(&mut self, index: usize) {
         if index >= self.layers.len() {
             return;
@@ -473,10 +594,20 @@ impl Document {
             }
         }
         self.layers[index].pixels = next;
+        if let Some(m) = self.layers[index].mask.clone() {
+            let mut nm = vec![0u8; (w * h) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    nm[(y * w + x) as usize] = m[(y * w + (w - 1 - x)) as usize];
+                }
+            }
+            self.layers[index].mask = Some(nm);
+        }
         self.mark_full_dirty();
     }
 
-    /// Flip a layer top-bottom in place. Caller checkpoints for undo first.
+    /// Flip a layer top-bottom in place. Masks travel with their layer.
+    /// Caller checkpoints for undo first.
     pub fn flip_layer_vertical(&mut self, index: usize) {
         if index >= self.layers.len() {
             return;
@@ -492,6 +623,15 @@ impl Document {
             }
         }
         self.layers[index].pixels = next;
+        if let Some(m) = self.layers[index].mask.clone() {
+            let mut nm = vec![0u8; (w * h) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    nm[(y * w + x) as usize] = m[((h - 1 - y) * w + x) as usize];
+                }
+            }
+            self.layers[index].mask = Some(nm);
+        }
         self.mark_full_dirty();
     }
 
@@ -510,6 +650,8 @@ impl Document {
 
     /// Composite layer `index` onto the layer below with its blend and
     /// opacity (invisible layers contribute nothing), then remove it.
+    /// The source mask is baked in; a clipped source is intersected with
+    /// the destination layer's own content (its mask included).
     /// Returns false on the bottom layer or a bad index.
     /// Caller checkpoints for undo first.
     pub fn merge_down(&mut self, index: usize) -> bool {
@@ -523,7 +665,15 @@ impl Document {
             if o + 3 >= src.pixels.len() {
                 break;
             }
-            let sa = sa_base * src.pixels[o + 3] as f32 / 255.0;
+            let mut sa = sa_base * src.pixels[o + 3] as f32 / 255.0;
+            if let Some(m) = src.mask.as_deref() {
+                sa *= m.get(o / 4).copied().unwrap_or(255) as f32 / 255.0;
+            }
+            if src.clip {
+                let dst_a = dst.pixels[o + 3] as f32 / 255.0;
+                let dst_m = dst.mask.as_deref().and_then(|m| m.get(o / 4).copied()).unwrap_or(255) as f32 / 255.0;
+                sa *= dst_a * dst_m;
+            }
             let da = dst.pixels[o + 3] as f32 / 255.0;
             let out_a = sa + da * (1.0 - sa);
             if out_a > 0.0 {
@@ -554,6 +704,44 @@ impl Document {
     pub fn clear_selection(&mut self) {
         self.selection = None;
         self.selection_mask = None;
+    }
+
+    /// Attach a fully-revealing (white) mask to a layer. Structural, like
+    /// add/remove layer: not undoable itself, but every mask stroke after
+    /// it is (snapshots carry the mask).
+    pub fn add_mask(&mut self, index: usize) {
+        if index >= self.layers.len() {
+            return;
+        }
+        let n = (self.w * self.h) as usize;
+        let slot = &mut self.layers[index].mask;
+        if slot.as_ref().map(|m| m.len() != n).unwrap_or(true) {
+            *slot = Some(vec![255u8; n]);
+        }
+        self.mark_full_dirty();
+    }
+
+    /// Remove a layer's mask, revealing the whole layer again.
+    pub fn clear_mask(&mut self, index: usize) {
+        if index >= self.layers.len() {
+            return;
+        }
+        self.layers[index].mask = None;
+        self.mark_full_dirty();
+    }
+
+    /// The active layer's mask as opaque grayscale RGBA for the mask viewer.
+    /// `None` when there is no (valid) mask.
+    pub fn mask_view(&self) -> Option<Vec<u8>> {
+        let m = self.layers.get(self.active)?.mask.as_deref()?;
+        if m.len() != (self.w * self.h) as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(m.len() * 4);
+        for &v in m {
+            out.extend_from_slice(&[v, v, v, 255]);
+        }
+        Some(out)
     }
 
     /// True when `(px, py)` is inside the active selection (rectangular
@@ -830,12 +1018,13 @@ impl Document {
 
     /// Save the full project (layers, opacity, blend, background, symmetry)
     /// to a `.procraft` file: magic + little-endian records, zlib-compressed
-    /// pixels. Version 4 adds per-layer deflate (v1-v3 files still open);
-    /// version 3 added symmetry segments, version 2 added the symmetry byte.
+    /// pixels. Version 5 adds per-layer masks, clipping flags and six more
+    /// blend modes (v1-v4 files still open; old app versions cleanly refuse
+    /// v5 files at the magic).
     pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        f.write_all(b"PCRAFT04").map_err(|e| e.to_string())?;
+        f.write_all(b"PCRAFT05").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes()).map_err(|e| e.to_string())?;
         f.write_all(&self.h.to_le_bytes()).map_err(|e| e.to_string())?;
         f.write_all(&self.background).map_err(|e| e.to_string())?;
@@ -861,8 +1050,15 @@ impl Document {
                 BlendMode::Multiply => 1u8,
                 BlendMode::Screen => 2u8,
                 BlendMode::Overlay => 3u8,
+                BlendMode::Darken => 4u8,
+                BlendMode::Lighten => 5u8,
+                BlendMode::Difference => 6u8,
+                BlendMode::Exclusion => 7u8,
+                BlendMode::SoftLight => 8u8,
+                BlendMode::HardLight => 9u8,
             };
             f.write_all(&[blend]).map_err(|e| e.to_string())?;
+            f.write_all(&[u8::from(layer.clip)]).map_err(|e| e.to_string())?;
             let expect = (self.w * self.h * 4) as usize;
             if layer.pixels.len() != expect {
                 return Err("layer has wrong pixel size".to_string());
@@ -872,6 +1068,20 @@ impl Document {
             let packed = enc.finish().map_err(|e| e.to_string())?;
             f.write_all(&(packed.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
             f.write_all(&packed).map_err(|e| e.to_string())?;
+            // Optional reveal mask, zlib-compressed like the pixels.
+            match layer.mask.as_deref() {
+                Some(m) if m.len() == (self.w * self.h) as usize => {
+                    f.write_all(&[1u8]).map_err(|e| e.to_string())?;
+                    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                    enc.write_all(m).map_err(|e| e.to_string())?;
+                    let packed = enc.finish().map_err(|e| e.to_string())?;
+                    f.write_all(&(packed.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+                    f.write_all(&packed).map_err(|e| e.to_string())?;
+                }
+                _ => {
+                    f.write_all(&[0u8]).map_err(|e| e.to_string())?;
+                }
+            }
         }
         Ok(())
     }
@@ -892,7 +1102,8 @@ impl Document {
             Ok(head)
         };
         let magic = take(8)?.to_vec();
-        let v4 = magic == b"PCRAFT04";
+        let v5 = magic == b"PCRAFT05";
+        let v4 = v5 || magic == b"PCRAFT04";
         let v3 = v4 || magic == b"PCRAFT03";
         let v2 = v3 || magic == b"PCRAFT02";
         if magic != b"PCRAFT01" && !v2 {
@@ -939,8 +1150,16 @@ impl Document {
                 1 => BlendMode::Multiply,
                 2 => BlendMode::Screen,
                 3 => BlendMode::Overlay,
+                4 if v5 => BlendMode::Darken,
+                5 if v5 => BlendMode::Lighten,
+                6 if v5 => BlendMode::Difference,
+                7 if v5 => BlendMode::Exclusion,
+                8 if v5 => BlendMode::SoftLight,
+                9 if v5 => BlendMode::HardLight,
                 _ => BlendMode::Normal,
             };
+            // v5 stores the clipping flag right after the blend byte.
+            let clip = if v5 { take(1)?[0] != 0 } else { false };
             let expect = (w * h * 4) as usize;
             let pixels = if v4 {
                 let comp_len = u32::from_le_bytes(
@@ -961,7 +1180,33 @@ impl Document {
             } else {
                 take(expect)?.to_vec()
             };
-            layers.push(Layer { name, visible, opacity, blend, pixels });
+            // v5 appends an optional zlib-compressed reveal mask per layer.
+            let mask = if v5 {
+                let flag = take(1)?[0];
+                if flag == 0 {
+                    None
+                } else {
+                    let want = (w * h) as usize;
+                    let comp_len = u32::from_le_bytes(
+                        take(4)?[..4].try_into().map_err(|_| "bad mask size".to_string())?,
+                    ) as usize;
+                    if comp_len == 0 || comp_len > want.saturating_add(10 * 1024 * 1024) {
+                        return Err("project has bad mask size".to_string());
+                    }
+                    let packed = take(comp_len)?.to_vec();
+                    let mut dec = flate2::read::ZlibDecoder::new(&packed[..]);
+                    let mut raw = Vec::with_capacity(want);
+                    use std::io::Read;
+                    dec.read_to_end(&mut raw).map_err(|_| "project has corrupt mask".to_string())?;
+                    if raw.len() != want {
+                        return Err("project has corrupt mask".to_string());
+                    }
+                    Some(raw)
+                }
+            } else {
+                None
+            };
+            layers.push(Layer { name, visible, opacity, blend, pixels, mask, clip });
         }
         if !cur.is_empty() {
             return Err("project has trailing data".to_string());
@@ -976,6 +1221,7 @@ impl Document {
             selection_mask: None,
             symmetry,
             symmetry_segments,
+            paint_target: PaintTarget::Color,
             dirty: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -1030,6 +1276,185 @@ mod tests {
         // Undo still works after a redo.
         assert!(doc.undo());
         assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn new_blend_modes_do_the_math() {
+        use BlendMode::*;
+        let b = BlendMode::Normal;
+        assert_eq!(b.apply(10.0, 20.0), 10.0);
+        assert_eq!(Darken.apply(10.0, 20.0), 10.0);
+        assert_eq!(Lighten.apply(10.0, 20.0), 20.0);
+        assert_eq!(Difference.apply(10.0, 20.0), 10.0);
+        assert_eq!(Difference.apply(200.0, 50.0), 150.0);
+        // Exclusion of identical mid-grays dips below either input.
+        let e = Exclusion.apply(128.0, 128.0);
+        assert!(e < 128.0 && e > 100.0, "{e}");
+        // Soft light keeps mid-gray near itself, hard light pushes contrast.
+        let s = SoftLight.apply(128.0, 100.0);
+        assert!((s - 100.0).abs() < 12.0, "{s}");
+        assert_eq!(HardLight.apply(0.0, 200.0), 0.0);
+        assert_eq!(HardLight.apply(255.0, 200.0), 255.0);
+        assert_eq!(BlendMode::ALL.len(), 10);
+    }
+
+    #[test]
+    fn mask_multiplies_layer_alpha() {
+        let mut doc = Document::new(4, 1);
+        doc.background = [255, 255, 255, 255];
+        doc.layers[0].pixels = vec![255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255];
+        doc.add_mask(0);
+        // Conceal the left half.
+        if let Some(m) = doc.layers[0].mask.as_mut() {
+            m[0] = 0;
+            m[1] = 0;
+        }
+        let flat = doc.flatten();
+        assert_eq!(&flat[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&flat[8..12], &[255, 0, 0, 255]);
+        // Clearing the mask reveals everything again.
+        doc.clear_mask(0);
+        assert!(doc.layers[0].mask.is_none());
+        let flat = doc.flatten();
+        assert_eq!(&flat[0..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn clip_confines_layer_to_content_below() {
+        let mut doc = Document::new(4, 1);
+        doc.background = [255, 255, 255, 255];
+        // Base: single red dot at x=1.
+        doc.layers[0].pixels[((1 * 4) + 3) as usize] = 255;
+        doc.layers[0].pixels[((1 * 4)) as usize] = 255;
+        doc.add_layer("top".to_string());
+        doc.layers[1].pixels = vec![0, 255, 0, 255].repeat(4);
+        doc.layers[1].clip = true;
+        let flat = doc.flatten();
+        assert_eq!(&flat[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&flat[4..8], &[0, 255, 0, 255]);
+        assert_eq!(&flat[8..12], &[255, 255, 255, 255]);
+        // Unclipped, the green covers everything.
+        doc.layers[1].clip = false;
+        let flat = doc.flatten();
+        assert_eq!(&flat[0..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn mask_painting_uses_luminance_and_undoes() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(16, 16);
+        doc.paint_target = PaintTarget::Mask;
+        let brush = Brush { size: 8.0, softness: 0.0, ..Default::default() };
+        assert!(doc.layers[0].mask.is_none());
+        doc.checkpoint();
+        doc.dab(&brush, Color::rgb(0, 0, 0), 8.0, 8.0);
+        // Black paint concealed the middle; mask auto-materialized.
+        let m = doc.layers[0].mask.as_ref().expect("mask created");
+        assert!(m.iter().any(|&b| b < 255));
+        // Eraser reveals back toward white.
+        let before: Vec<u8> = m.clone();
+        let eraser = Brush { eraser: true, ..brush };
+        doc.dab(&eraser, Color::rgb(0, 0, 0), 8.0, 8.0);
+        let after = doc.layers[0].mask.as_ref().unwrap();
+        assert!(after.iter().zip(before.iter()).all(|(&a, &b)| a >= b));
+        assert!(after.iter().any(|&b| b > 0));
+        // Undo restores the pre-stroke state (no mask at all).
+        assert!(doc.undo());
+        assert!(doc.layers[0].mask.is_none());
+        assert!(doc.redo());
+        assert!(doc.layers[0].mask.is_some());
+    }
+
+    #[test]
+    fn v5_roundtrip_keeps_masks_clips_and_blends() {
+        let mut doc = Document::new(4, 2);
+        doc.layers[0].blend = BlendMode::Difference;
+        doc.layers[0].pixels = vec![200; 4 * 2 * 4];
+        doc.add_mask(0);
+        doc.layers[0].mask.as_mut().unwrap()[3] = 0;
+        doc.add_layer("clipped".to_string());
+        doc.layers[1].blend = BlendMode::SoftLight;
+        doc.layers[1].clip = true;
+        doc.layers[1].pixels = vec![7; 4 * 2 * 4];
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v5.pcraft");
+        doc.save_project(&path).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.layers[0].blend, BlendMode::Difference);
+        assert_eq!(back.layers[0].mask.as_ref().unwrap()[3], 0);
+        assert_eq!(back.layers[1].blend, BlendMode::SoftLight);
+        assert!(back.layers[1].clip);
+        assert_eq!(back.layers[1].pixels, vec![7; 4 * 2 * 4]);
+    }
+
+    #[test]
+    fn v4_files_open_without_masks_or_clips() {
+        // Minimal v4 file: zlib pixels, blend byte, no clip/mask fields.
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v4-nomask.pcraft");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT04");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[0]);
+        buf.extend_from_slice(&[6]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]);
+        let raw = vec![9u8; 2 * 1 * 4];
+        let packed = {
+            use std::io::Write;
+            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(&raw).unwrap();
+            enc.finish().unwrap()
+        };
+        buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&packed);
+        std::fs::write(&path, &buf).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.layers[0].pixels, raw);
+        assert!(back.layers[0].mask.is_none());
+        assert!(!back.layers[0].clip);
+    }
+
+    #[test]
+    fn merge_bakes_mask_and_clip() {
+        let mut doc = Document::new(2, 1);
+        // Below: blue, left pixel only.
+        doc.layers[0].pixels = vec![0, 0, 255, 255, 0, 0, 0, 0];
+        doc.add_layer("top".to_string());
+        doc.layers[1].pixels = vec![255, 0, 0, 255, 255, 0, 0, 255];
+        doc.add_mask(1);
+        // Mask hides the right pixel of the top layer.
+        doc.layers[1].mask.as_mut().unwrap()[1] = 0;
+        doc.layers[1].clip = true;
+        assert!(doc.merge_down(1));
+        // Left: red over blue = red. Right: top hidden by mask AND outside
+        // the blue content, so it stays transparent.
+        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&doc.layers[0].pixels[4..8], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn transforms_carry_the_mask() {
+        let mut doc = Document::new(4, 1);
+        doc.add_mask(0);
+        doc.layers[0].mask.as_mut().unwrap()[0] = 0;
+        doc.translate_layer(0, 1, 0);
+        assert_eq!(doc.layers[0].mask.as_ref().unwrap()[1], 0);
+        doc.flip_layer_horizontal(0);
+        assert_eq!(doc.layers[0].mask.as_ref().unwrap()[2], 0);
+        // Affine keeps dimensions and mask presence.
+        doc.affine_layer(0, 1.0, 90.0);
+        assert!(doc.layers[0].mask.is_some());
+        assert_eq!(doc.layers[0].mask.as_ref().unwrap().len(), 4);
     }
 
     #[test]
@@ -1418,7 +1843,7 @@ mod tests {
         let raw = 128usize * 128 * 4;
         assert!(meta.len() as usize * 4 < raw, "compressed {} vs raw {raw}", meta.len());
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT04");
+        assert_eq!(&head[..8], b"PCRAFT05");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].pixels, doc.layers[0].pixels);

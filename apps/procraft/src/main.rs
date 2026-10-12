@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
 use procraft_engine::{
-    BlendMode, Brush, BrushPreset, Color, Document, SymmetryMode, MAX_LIBRARY_BRUSHES,
+    BlendMode, Brush, BrushPreset, Color, Document, PaintTarget, SymmetryMode, MAX_LIBRARY_BRUSHES,
     export_tip_png, import_brush_file, open_brush_library, save_brush_library,
 };
 
@@ -103,6 +103,7 @@ struct ProCraftApp {
     filt_sharpen: f32,
     renaming: Option<usize>,
     preset_textures: Vec<TextureHandle>,
+    view_mask: bool,
     preview_theme: Option<Theme>,
     custom_brushes: Vec<BrushPreset>,
     new_brush_name: String,
@@ -157,6 +158,7 @@ impl ProCraftApp {
             filt_sharpen: 0.0,
             renaming: None,
             preset_textures: Vec::new(),
+            view_mask: false,
             preview_theme: None,
             custom_brushes: Vec::new(),
             new_brush_name: String::new(),
@@ -181,6 +183,20 @@ impl ProCraftApp {
 
     /// Upload only what changed since the last frame (no-op when clean).
     fn refresh_texture(&mut self, ctx: &egui::Context) {
+        // Mask viewer: grayscale of the active layer's mask, full upload.
+        if self.view_mask {
+            if let Some(mv) = self.doc.mask_view() {
+                let dirty = self.texture.is_none() || self.doc.take_dirty().is_some();
+                if dirty {
+                    let img = ColorImage::from_rgba_unmultiplied(
+                        [self.doc.w as usize, self.doc.h as usize],
+                        &mv,
+                    );
+                    self.texture = Some(ctx.load_texture("canvas", img, TextureOptions::LINEAR));
+                }
+                return;
+            }
+        }
         if self.texture.is_none() {
             let flat = self.doc.flatten();
             let img = ColorImage::from_rgba_unmultiplied(
@@ -744,10 +760,18 @@ impl eframe::App for ProCraftApp {
                     if ui.small_button("del").clicked() {
                         remove = Some(i);
                     }
+                    if layer.mask.is_some() {
+                        ui.label("M");
+                    }
+                    if layer.clip {
+                        ui.label("C");
+                    }
                 });
             }
             if let Some(i) = select {
                 self.doc.active = i;
+                // A fresh full upload (matters for the mask viewer).
+                self.doc.mark_full_dirty();
             }
             if touched {
                 self.doc.mark_full_dirty();
@@ -791,6 +815,41 @@ impl eframe::App for ProCraftApp {
                 if dirty {
                     self.doc.mark_full_dirty();
                 }
+                // Masks, clipping and paint target for the active layer.
+                let has_mask = self.doc.layers[active].mask.is_some();
+                ui.horizontal(|ui| {
+                    if ui.button(if has_mask { "Clear mask" } else { "Add mask" }).clicked() {
+                        if has_mask {
+                            self.doc.clear_mask(active);
+                            self.view_mask = false;
+                            self.status = "Mask cleared.".to_string();
+                        } else {
+                            self.doc.add_mask(active);
+                            self.status = "Mask added (white reveals). Paint on Mask to edit.".to_string();
+                        }
+                    }
+                    if ui.checkbox(&mut self.view_mask, "View").changed() {
+                        self.doc.mark_full_dirty();
+                        self.status = if self.view_mask {
+                            "Mask view: white reveals, black conceals.".to_string()
+                        } else {
+                            "Canvas view.".to_string()
+                        };
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let mut clip = self.doc.layers[active].clip;
+                    if ui.checkbox(&mut clip, "Clip to below").changed() {
+                        self.doc.layers[active].clip = clip;
+                        self.doc.mark_full_dirty();
+                        self.status = if clip { "Layer clips to below.".to_string() } else { "Clip off.".to_string() };
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Paint:");
+                    ui.radio_value(&mut self.doc.paint_target, PaintTarget::Color, "Color");
+                    ui.radio_value(&mut self.doc.paint_target, PaintTarget::Mask, "Mask");
+                });
             }
             ui.separator();
             ui.label(format!(

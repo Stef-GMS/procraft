@@ -70,15 +70,153 @@ impl Document {
     /// Stamp one dab centered at canvas pixel `(x, y)` on the active layer,
     /// mirrored per [`Document::symmetry`].
     /// Pixels outside [`Document::selection`] (when set) are skipped.
+    /// With [`PaintTarget::Mask`] the brush paints the layer's reveal mask
+    /// instead (auto-created white on first stroke; color luminance is the
+    /// mask value, the eraser reveals). Shapes, fills and flood fill always
+    /// paint color.
     pub fn dab(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
         let pts = self.symmetry.mirrored_points(self.w, self.h, self.symmetry_segments, x, y);
         let mut done: Vec<(f32, f32)> = Vec::with_capacity(4);
+        let target = self.paint_target;
         for (mx, my) in pts {
             if done.iter().any(|&(dx, dy)| (dx - mx).abs() < 0.001 && (dy - my).abs() < 0.001) {
                 continue;
             }
             done.push((mx, my));
-            self.dab_one(brush, color, mx, my);
+            match target {
+                super::document::PaintTarget::Color => self.dab_one(brush, color, mx, my),
+                super::document::PaintTarget::Mask => self.dab_mask(brush, color, mx, my),
+            }
+        }
+    }
+
+    /// Mask dab through the parametric falloff or the stamp tip; shared
+    /// selection/symmetry gating comes from [`Document::dab`].
+    fn dab_mask(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
+        if brush.tip.is_some() {
+            return self.dab_mask_stamp(brush, color, x, y);
+        }
+        let (w_u32, h_u32) = (self.w, self.h);
+        let radius = (brush.size * 0.5).max(0.5);
+        let strength = brush.opacity.clamp(0.0, 1.0);
+        if strength <= 0.0 || self.layers.get(self.active).is_none() {
+            return;
+        }
+        // First mask stroke materializes a white mask (covered by the
+        // pre-stroke checkpoint, so undo removes it again).
+        if self.layers[self.active].mask.is_none() {
+            self.add_mask(self.active);
+        }
+        let x0 = (x - radius).floor().max(0.0) as u32;
+        let y0 = (y - radius).floor().max(0.0) as u32;
+        let x1 = (x + radius).ceil().min(w_u32 as f32 - 1.0).max(0.0) as u32;
+        let y1 = (y + radius).ceil().min(h_u32 as f32 - 1.0).max(0.0) as u32;
+        self.mark_dirty(x0, y0, x1, y1);
+        let selection = self.selection;
+        let active = self.active;
+        if active >= self.layers.len() {
+            return;
+        }
+        let sel_mask = self.selection_mask.as_deref();
+        let w = w_u32;
+        let value = if brush.eraser {
+            255.0
+        } else {
+            let c = color.0;
+            (299.0 * c[0] as f32 + 587.0 * c[1] as f32 + 114.0 * c[2] as f32) / 1000.0
+        };
+        let edge = brush.softness.clamp(0.0, 1.0);
+        let Some(layer_mask) = self.layers[active].mask.as_mut() else { return };
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                if let Some((sx0, sy0, sx1, sy1)) = selection {
+                    if px < sx0 || px > sx1 || py < sy0 || py > sy1 {
+                        continue;
+                    }
+                }
+                if let Some(m) = sel_mask {
+                    if m.get((py * w + px) as usize).copied().unwrap_or(0) == 0 {
+                        continue;
+                    }
+                }
+                let d = ((px as f32 + 0.5 - x).hypot(py as f32 + 0.5 - y)) / radius;
+                if d > 1.0 {
+                    continue;
+                }
+                let falloff = if d <= 1.0 - edge { 1.0 } else { 1.0 - (d - (1.0 - edge)) / edge.max(0.001) };
+                let a = (falloff.clamp(0.0, 1.0) * strength).clamp(0.0, 1.0);
+                if a <= 0.0 {
+                    continue;
+                }
+                let o = (py * w + px) as usize;
+                if o >= layer_mask.len() {
+                    continue;
+                }
+                layer_mask[o] = (value * a + layer_mask[o] as f32 * (1.0 - a)).round() as u8;
+            }
+        }
+    }
+
+    /// Mask dab through an imported stamp tip (nearest-neighbor at brush
+    /// size, like [`Document::dab_stamp`] but writing luminance).
+    fn dab_mask_stamp(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
+        let Some(tip) = brush.tip.as_ref() else { return };
+        if tip.w == 0 || tip.h == 0 || tip.mask.len() != (tip.w * tip.h) as usize {
+            return;
+        }
+        let (w_u32, h_u32) = (self.w, self.h);
+        let strength = brush.opacity.clamp(0.0, 1.0);
+        if strength <= 0.0 || brush.size <= 0.0 || self.layers.get(self.active).is_none() {
+            return;
+        }
+        if self.layers[self.active].mask.is_none() {
+            self.add_mask(self.active);
+        }
+        let scale = brush.size / tip.w as f32;
+        let th = (tip.h as f32 * scale).max(1.0);
+        let x0 = (x - brush.size * 0.5).floor().max(0.0) as u32;
+        let y0 = (y - th * 0.5).floor().max(0.0) as u32;
+        let x1 = (x + brush.size * 0.5).ceil().min(w_u32 as f32 - 1.0).max(0.0) as u32;
+        let y1 = (y + th * 0.5).ceil().min(h_u32 as f32 - 1.0).max(0.0) as u32;
+        self.mark_dirty(x0, y0, x1, y1);
+        let selection = self.selection;
+        let active = self.active;
+        if active >= self.layers.len() {
+            return;
+        }
+        let sel_mask = self.selection_mask.as_deref();
+        let w = w_u32;
+        let value = if brush.eraser {
+            255.0
+        } else {
+            let c = color.0;
+            (299.0 * c[0] as f32 + 587.0 * c[1] as f32 + 114.0 * c[2] as f32) / 1000.0
+        };
+        let Some(layer_mask) = self.layers[active].mask.as_mut() else { return };
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                if let Some((sx0, sy0, sx1, sy1)) = selection {
+                    if px < sx0 || px > sx1 || py < sy0 || py > sy1 {
+                        continue;
+                    }
+                }
+                if let Some(m) = sel_mask {
+                    if m.get((py * w + px) as usize).copied().unwrap_or(0) == 0 {
+                        continue;
+                    }
+                }
+                let tx = (((px as f32 + 0.5 - (x - brush.size * 0.5)) / scale) as u32).min(tip.w - 1);
+                let ty = (((py as f32 + 0.5 - (y - th * 0.5)) / scale) as u32).min(tip.h - 1);
+                let a = (tip.mask[(ty * tip.w + tx) as usize] as f32 / 255.0 * strength).clamp(0.0, 1.0);
+                if a <= 0.0 {
+                    continue;
+                }
+                let o = (py * w + px) as usize;
+                if o >= layer_mask.len() {
+                    continue;
+                }
+                layer_mask[o] = (value * a + layer_mask[o] as f32 * (1.0 - a)).round() as u8;
+            }
         }
     }
 

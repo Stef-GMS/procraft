@@ -1,8 +1,11 @@
-//! ProCraft milestone 7: layer filters (tone, blur, sharpen), plus all
-//! earlier features. Original code.
+//! ProCraft milestone 9: brush library (custom brushes + .pcbrush import/export),
+//! plus all earlier features. Original code.
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
-use procraft_engine::{BlendMode, Brush, Color, Document, SymmetryMode};
+use procraft_engine::{
+    BlendMode, Brush, BrushPreset, Color, Document, SymmetryMode, MAX_LIBRARY_BRUSHES,
+    export_tip_png, import_brush_file, open_brush_library, save_brush_library,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
@@ -101,6 +104,8 @@ struct ProCraftApp {
     renaming: Option<usize>,
     preset_textures: Vec<TextureHandle>,
     preview_theme: Option<Theme>,
+    custom_brushes: Vec<BrushPreset>,
+    new_brush_name: String,
     move_from: Option<(f32, f32)>,
     move_acc: (f32, f32),
     shape_anchor: Option<(f32, f32)>,
@@ -153,6 +158,8 @@ impl ProCraftApp {
             renaming: None,
             preset_textures: Vec::new(),
             preview_theme: None,
+            custom_brushes: Vec::new(),
+            new_brush_name: String::new(),
             move_from: None,
             move_acc: (0.0, 0.0),
             shape_anchor: None,
@@ -165,7 +172,7 @@ impl ProCraftApp {
     }
 
     fn base_brush(&self) -> Brush {
-        Brush { eraser: self.tool == Tool::Eraser, ..self.brush }
+        Brush { eraser: self.tool == Tool::Eraser, ..self.brush.clone() }
     }
 
     fn current_color(&self) -> Color {
@@ -202,9 +209,15 @@ impl ProCraftApp {
     /// Honest brush previews: each preset paints a wavy sample stroke through
     /// the real engine into a thumbnail texture (dotted chalk reads dotted).
     /// Ink follows the theme so cards stay crisp on dark and paper alike.
+    /// Built-ins come first, then the user's custom brushes in order.
     fn build_preset_previews(&mut self, ctx: &egui::Context, ink: Color) {
         self.preset_textures.clear();
-        for (idx, (_, preset)) in procraft_engine::presets().into_iter().enumerate() {
+        let brushes: Vec<Brush> = procraft_engine::presets()
+            .into_iter()
+            .map(|(_, b)| b)
+            .chain(self.custom_brushes.iter().map(|p| p.brush.clone()))
+            .collect();
+        for (idx, preset) in brushes.into_iter().enumerate() {
             let mut doc = Document::new(144, 36);
             let brush = Brush { eraser: false, ..preset };
             let mut last = None;
@@ -223,11 +236,31 @@ impl ProCraftApp {
                 &doc.layers[0].pixels.clone(),
             );
             self.preset_textures.push(ctx.load_texture(
-                format!("preset-{idx}"),
+                format!("brush-{idx}"),
                 img,
                 TextureOptions::LINEAR,
             ));
         }
+    }
+
+    /// Total preview cards currently needed (built-ins + customs).
+    fn preview_count(&self) -> usize {
+        procraft_engine::presets().len() + self.custom_brushes.len()
+    }
+
+    /// Unique display name for a new custom brush: "Foo", "Foo (2)", ...
+    fn unique_brush_name(&self, want: &str) -> String {
+        let want = want.trim();
+        if self.custom_brushes.iter().all(|p| p.name != want) {
+            return want.to_string();
+        }
+        for n in 2..=MAX_LIBRARY_BRUSHES + 2 {
+            let cand = format!("{want} ({n})");
+            if self.custom_brushes.iter().all(|p| p.name != cand) {
+                return cand;
+            }
+        }
+        want.to_string()
     }
 }
 
@@ -441,28 +474,168 @@ impl eframe::App for ProCraftApp {
                 _ => Color::rgb(70, 70, 70),
             };
             if self.preview_theme != Some(self.theme)
-                || self.preset_textures.len() != procraft_engine::presets().len()
+                || self.preset_textures.len() != self.preview_count()
             {
                 let ctx = ui.ctx().clone();
                 self.build_preset_previews(&ctx, ink);
                 self.preview_theme = Some(self.theme);
             }
+            let builtin = procraft_engine::presets();
             ui.scope(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(6.0, 3.0);
-                for (idx, (name, preset)) in procraft_engine::presets().into_iter().enumerate() {
+                for (idx, (name, preset)) in builtin.into_iter().enumerate() {
+                    // Name and thumbnail both apply the brush; the active
+                    // brush reads highlighted.
+                    let active = self.brush == preset;
                     ui.horizontal(|ui| {
-                        if ui.add_sized([64.0, 22.0], egui::Button::new(name)).clicked() {
-                            self.brush = preset;
+                        if ui.add_sized([64.0, 22.0], egui::Button::new(name).selected(active)).clicked() {
+                            self.brush = preset.clone();
                             self.tool = Tool::Brush;
                         }
                         egui::Frame::group(ui.style()).show(ui, |ui| {
                             if let Some(tex) = self.preset_textures.get(idx) {
-                                ui.image((tex.id(), Vec2::new(96.0, 24.0)));
+                                let thumb = ui.add(
+                                    egui::Image::new((tex.id(), Vec2::new(96.0, 24.0)))
+                                        .sense(Sense::click()),
+                                );
+                                if thumb.clicked() {
+                                    self.brush = preset.clone();
+                                    self.tool = Tool::Brush;
+                                }
                             }
                         });
                     });
                 }
             });
+            ui.separator();
+            ui.heading("My brushes");
+            ui.horizontal(|ui| {
+                // Fixed widths: a free-size text edit would keep pushing the
+                // whole left panel wider every frame.
+                ui.add_sized(
+                    [110.0, 22.0],
+                    egui::TextEdit::singleline(&mut self.new_brush_name).hint_text("Name"),
+                );
+                if ui.add_sized([90.0, 22.0], egui::Button::new("Add current")).clicked() {
+                    let want = self.new_brush_name.trim().to_string();
+                    if want.is_empty() {
+                        self.status = "Name the brush first.".to_string();
+                    } else if self.custom_brushes.len() >= MAX_LIBRARY_BRUSHES {
+                        self.status = format!("Brush library is full ({MAX_LIBRARY_BRUSHES}).");
+                    } else {
+                        let name = self.unique_brush_name(&want);
+                        let brush = Brush { eraser: false, ..self.brush.clone() };
+                        self.custom_brushes.push(BrushPreset { name: name.clone(), brush });
+                        self.new_brush_name.clear();
+                        self.status = format!("Brush '{name}' added.");
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Import").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Brushes", &[
+                            "pcbrush", "json", "abr", "brush", "brushset",
+                            "kpp", "bundle", "gbr", "png", "jpg", "jpeg", "webp", "bmp",
+                        ])
+                        .pick_file()
+                    {
+                        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+                        let imported: Result<Vec<BrushPreset>, String> = if ext == "pcbrush" || ext == "json" {
+                            open_brush_library(&path).map(|libs| {
+                                libs.into_iter().map(|p| BrushPreset { name: p.name, brush: p.brush }).collect()
+                            })
+                        } else {
+                            import_brush_file(&path).map(|libs| {
+                                libs.into_iter().map(|b| BrushPreset { name: b.name, brush: b.brush }).collect()
+                            })
+                        };
+                        match imported {
+                            Ok(mut libs) => {
+                                let mut added = 0;
+                                for p in libs.drain(..) {
+                                    if self.custom_brushes.len() >= MAX_LIBRARY_BRUSHES {
+                                        break;
+                                    }
+                                    let name = self.unique_brush_name(&p.name);
+                                    self.custom_brushes.push(BrushPreset { name, brush: p.brush });
+                                    added += 1;
+                                }
+                                self.status = format!("Imported {added} brushes from {}.", path.display());
+                            }
+                            Err(e) => self.status = format!("Brush import failed: {e}"),
+                        }
+                    }
+                }
+                if ui.button("Export set").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("ProCraft brushes", &["pcbrush"])
+                        .save_file()
+                    {
+                        let path = ensure_extension(path, "pcbrush");
+                        match save_brush_library(&path, &self.custom_brushes) {
+                            Ok(()) => self.status = format!("Brushes saved {}", path.display()),
+                            Err(e) => self.status = format!("Brush save failed: {e}"),
+                        }
+                    }
+                }
+                if ui.button("Tip PNG").clicked() {
+                    // Grayscale tip of the current brush for Photoshop,
+                    // Procreate, Krita and GIMP.
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("PNG image", &["png"])
+                        .save_file()
+                    {
+                        let path = ensure_extension(path, "png");
+                        let brush = Brush { eraser: false, ..self.brush.clone() };
+                        match export_tip_png(&path, &brush) {
+                            Ok(()) => self.status = format!("Tip saved {}", path.display()),
+                            Err(e) => self.status = format!("Tip save failed: {e}"),
+                        }
+                    }
+                }
+            });
+            let custom_count = self.custom_brushes.len();
+            if custom_count > 0 {
+                let base = procraft_engine::presets().len();
+                let mut remove: Option<usize> = None;
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 3.0);
+                    for idx in 0..custom_count {
+                        let (name, brush) = {
+                            let p = &self.custom_brushes[idx];
+                            (p.name.clone(), p.brush.clone())
+                        };
+                        let active = self.brush == brush;
+                        ui.horizontal(|ui| {
+                            if ui.add_sized([64.0, 22.0], egui::Button::new(&name).selected(active)).clicked() {
+                                self.brush = brush.clone();
+                                self.tool = Tool::Brush;
+                            }
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                if let Some(tex) = self.preset_textures.get(base + idx) {
+                                    let thumb = ui.add(
+                                        egui::Image::new((tex.id(), Vec2::new(96.0, 24.0)))
+                                            .sense(Sense::click()),
+                                    );
+                                    if thumb.clicked() {
+                                        self.brush = brush.clone();
+                                        self.tool = Tool::Brush;
+                                    }
+                                }
+                            });
+                            if ui.small_button("✕").clicked() {
+                                remove = Some(idx);
+                            }
+                        });
+                    }
+                });
+                if let Some(idx) = remove {
+                    let name = self.custom_brushes[idx].name.clone();
+                    self.custom_brushes.remove(idx);
+                    self.status = format!("Brush '{name}' removed.");
+                }
+            }
             ui.separator();
             ui.heading("Color");
             ui.horizontal(|ui| {
@@ -493,7 +666,8 @@ impl eframe::App for ProCraftApp {
             ui.heading("Page");
             ui.horizontal(|ui| {
                 for (name, rgb) in page_presets() {
-                    if ui.button(name).clicked() {
+                    let active = self.doc.background[..3] == rgb;
+                    if ui.add(egui::Button::new(name).selected(active)).clicked() {
                         self.set_page_color(rgb);
                     }
                 }

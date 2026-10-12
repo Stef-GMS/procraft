@@ -12,25 +12,57 @@ impl Color {
     }
 }
 
+/// Grayscale brush tip (stamp) from a third-party brush file: alpha mask,
+/// row-major, white (255) = full ink. Rendered at `Brush::size` wide.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BrushTip {
+    pub w: u32,
+    pub h: u32,
+    pub mask: Vec<u8>,
+}
+
+/// Maximum tip dimension in pixels (larger tips are downscaled on import).
+pub const MAX_TIP_SIDE: u32 = 256;
+
+impl BrushTip {
+    /// Build a tip from a raw mask, validating dimensions and length.
+    pub fn from_mask(w: u32, h: u32, mask: Vec<u8>) -> Result<Self, String> {
+        if w == 0 || h == 0 || w > MAX_TIP_SIDE || h > MAX_TIP_SIDE {
+            return Err("brush tip has bad dimensions".to_string());
+        }
+        if mask.len() != (w * h) as usize {
+            return Err("brush tip has corrupt pixels".to_string());
+        }
+        if mask.iter().all(|&b| b == 0) {
+            return Err("brush tip is fully transparent".to_string());
+        }
+        Ok(Self { w, h, mask })
+    }
+}
+
 /// Brush shape settings. All original math: a radial falloff stamp laid down
-/// along the pointer path at `spacing` intervals.
-#[derive(Clone, Copy, Debug)]
+/// along the pointer path at `spacing` intervals. When `tip` is present the
+/// parametric falloff is replaced by the grayscale stamp (imported brushes).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Brush {
-    /// Dab diameter in canvas pixels.
+    /// Dab diameter in canvas pixels (stamp width when `tip` is present).
     pub size: f32,
     /// Per-dab alpha multiplier, 0.0..=1.0.
     pub opacity: f32,
-    /// Edge softness, 0.0 (hard disc) ..= 1.0 (fully soft).
+    /// Edge softness, 0.0 (hard disc) ..= 1.0 (fully soft). Unused by stamps.
     pub softness: f32,
     /// Dab spacing as a fraction of `size` (0.1 = smooth, 1.0 = dotted).
     pub spacing: f32,
     /// Eraser mode: remove alpha instead of painting color.
     pub eraser: bool,
+    /// Optional imported stamp tip (absent in `.pcbrush` files from v9).
+    #[serde(default)]
+    pub tip: Option<BrushTip>,
 }
 
 impl Default for Brush {
     fn default() -> Self {
-        Self { size: 24.0, opacity: 1.0, softness: 0.6, spacing: 0.15, eraser: false }
+        Self { size: 24.0, opacity: 1.0, softness: 0.6, spacing: 0.15, eraser: false, tip: None }
     }
 }
 
@@ -51,6 +83,9 @@ impl Document {
     }
 
     fn dab_one(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
+        if brush.tip.is_some() {
+            return self.dab_stamp(brush, color, x, y);
+        }
         let (w_u32, h_u32) = (self.w, self.h);
         let (w, h) = (w_u32 as f32, h_u32 as f32);
         let radius = (brush.size * 0.5).max(0.5);
@@ -118,6 +153,77 @@ impl Document {
         }
     }
 
+    /// Stamp a grayscale-tip dab centered at `(x, y)`: the tip is scaled so
+    /// its width spans `brush.size` canvas pixels (nearest-neighbor), and
+    /// each texel contributes `mask * opacity` exactly like falloff alpha.
+    /// Selection, symmetry and eraser handling match [`Document::dab`].
+    fn dab_stamp(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
+        let Some(tip) = brush.tip.as_ref() else { return };
+        if tip.w == 0 || tip.h == 0 || tip.mask.len() != (tip.w * tip.h) as usize {
+            return;
+        }
+        let (w_u32, h_u32) = (self.w, self.h);
+        let (w, h) = (w_u32 as f32, h_u32 as f32);
+        let strength = brush.opacity.clamp(0.0, 1.0);
+        if strength <= 0.0 || brush.size <= 0.0 || self.layers.get(self.active).is_none() {
+            return;
+        }
+        let scale = brush.size / tip.w as f32;
+        let th = (tip.h as f32 * scale).max(1.0);
+        let x0 = (x - brush.size * 0.5).floor().max(0.0) as u32;
+        let y0 = (y - th * 0.5).floor().max(0.0) as u32;
+        let x1 = (x + brush.size * 0.5).ceil().min(w - 1.0).max(0.0) as u32;
+        let y1 = (y + th * 0.5).ceil().min(h - 1.0).max(0.0) as u32;
+        self.mark_dirty(x0, y0, x1, y1);
+        let selection = self.selection;
+        let active = self.active;
+        if active >= self.layers.len() {
+            return;
+        }
+        let mask = self.selection_mask.as_deref();
+        let layer = &mut self.layers[active];
+        let w = w_u32;
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                if let Some((sx0, sy0, sx1, sy1)) = selection {
+                    if px < sx0 || px > sx1 || py < sy0 || py > sy1 {
+                        continue;
+                    }
+                }
+                if let Some(m) = mask {
+                    if m.get((py * w + px) as usize).copied().unwrap_or(0) == 0 {
+                        continue;
+                    }
+                }
+                let tx = (((px as f32 + 0.5 - (x - brush.size * 0.5)) / scale) as u32).min(tip.w - 1);
+                let ty = (((py as f32 + 0.5 - (y - th * 0.5)) / scale) as u32).min(tip.h - 1);
+                let a = (tip.mask[(ty * tip.w + tx) as usize] as f32 / 255.0 * strength * 255.0).round() as u8;
+                if a == 0 {
+                    continue;
+                }
+                let o = ((py * w + px) * 4) as usize;
+                if o + 3 >= layer.pixels.len() {
+                    continue;
+                }
+                if brush.eraser {
+                    let keep = 255u16.saturating_sub(a as u16);
+                    layer.pixels[o + 3] = ((layer.pixels[o + 3] as u16 * keep) / 255) as u8;
+                } else {
+                    let src_a = a as f32 / 255.0;
+                    let dst_a = layer.pixels[o + 3] as f32 / 255.0;
+                    let out_a = src_a + dst_a * (1.0 - src_a);
+                    if out_a > 0.0 {
+                        let c = color.0;
+                        layer.pixels[o] = ((c[0] as f32 * src_a + layer.pixels[o] as f32 * dst_a * (1.0 - src_a)) / out_a).round() as u8;
+                        layer.pixels[o + 1] = ((c[1] as f32 * src_a + layer.pixels[o + 1] as f32 * dst_a * (1.0 - src_a)) / out_a).round() as u8;
+                        layer.pixels[o + 2] = ((c[2] as f32 * src_a + layer.pixels[o + 2] as f32 * dst_a * (1.0 - src_a)) / out_a).round() as u8;
+                        layer.pixels[o + 3] = (out_a * 255.0).round() as u8;
+                    }
+                }
+            }
+        }
+    }
+
     /// Advance a stroke from `from` to `to`, laying dabs every
     /// `spacing * size` pixels. Returns the leftover distance for chaining.
     /// Call [`Document::checkpoint`] once when the stroke starts.
@@ -149,16 +255,93 @@ impl Document {
     }
 }
 
+/// A named brush for a `.pcbrush` library file: display name plus settings.
+/// Library brushes never erase; the Eraser tool covers that.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BrushPreset {
+    pub name: String,
+    pub brush: Brush,
+}
+
+/// Maximum brushes in one library file (keeps imports cheap and bounded).
+pub const MAX_LIBRARY_BRUSHES: usize = 64;
+
+/// Shared validation for one imported brush. Names are trimmed; numeric
+/// ranges match what the desktop sliders can produce and more.
+fn check_preset(name: &str, brush: &Brush) -> Result<String, String> {
+    let clean = name.trim().to_string();
+    if clean.is_empty() {
+        return Err("brush has an empty name".to_string());
+    }
+    if clean.chars().count() > 64 {
+        return Err(format!("brush name too long: {clean}"));
+    }
+    if !(0.0 < brush.size && brush.size <= 400.0) {
+        return Err(format!("brush '{clean}' has a bad size"));
+    }
+    if !(0.0 <= brush.opacity && brush.opacity <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad opacity"));
+    }
+    if !(0.0 <= brush.softness && brush.softness <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad softness"));
+    }
+    if !(0.0 < brush.spacing && brush.spacing <= 2.0) {
+        return Err(format!("brush '{clean}' has a bad spacing"));
+    }
+    if brush.eraser {
+        return Err(format!("brush '{clean}' must not be an eraser"));
+    }
+    Ok(clean)
+}
+
+/// Save brush presets to a `.pcbrush` file (pretty JSON array of
+/// `{name, brush}` records). Eraser flags are forced off on export.
+pub fn save_brush_library(path: &std::path::Path, presets: &[BrushPreset]) -> Result<(), String> {
+    if presets.is_empty() {
+        return Err("nothing to export: the brush library is empty".to_string());
+    }
+    if presets.len() > MAX_LIBRARY_BRUSHES {
+        return Err(format!("too many brushes (max {MAX_LIBRARY_BRUSHES})"));
+    }
+    let mut clean = Vec::with_capacity(presets.len());
+    for p in presets {
+        let forced = Brush { eraser: false, ..p.brush.clone() };
+        let name = check_preset(&p.name, &forced)?;
+        clean.push(BrushPreset { name, brush: forced });
+    }
+    let text = serde_json::to_string_pretty(&clean).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| e.to_string())
+}
+
+/// Load a `.pcbrush` file, validating every record. Malformed JSON,
+/// out-of-range numbers and eraser brushes are all rejected.
+pub fn open_brush_library(path: &std::path::Path) -> Result<Vec<BrushPreset>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let raw: Vec<BrushPreset> = serde_json::from_str(&text).map_err(|_| "not a brush library file".to_string())?;
+    if raw.is_empty() {
+        return Err("brush library is empty".to_string());
+    }
+    if raw.len() > MAX_LIBRARY_BRUSHES {
+        return Err(format!("too many brushes (max {MAX_LIBRARY_BRUSHES})"));
+    }
+    let mut clean = Vec::with_capacity(raw.len());
+    for p in &raw {
+        let name = check_preset(&p.name, &p.brush)?;
+        clean.push(BrushPreset { name, brush: p.brush.clone() });
+    }
+    Ok(clean)
+}
+
 /// Built-in brush presets: name plus settings. Original set, roughly grouped
 /// from hard sketching to soft painting.
 pub fn presets() -> Vec<(&'static str, Brush)> {
     vec![
-        ("Pencil", Brush { size: 3.0, opacity: 1.0, softness: 0.15, spacing: 0.1, eraser: false }),
-        ("Ink Pen", Brush { size: 6.0, opacity: 1.0, softness: 0.3, spacing: 0.1, eraser: false }),
-        ("Round", Brush { size: 24.0, opacity: 1.0, softness: 0.6, spacing: 0.15, eraser: false }),
-        ("Marker", Brush { size: 28.0, opacity: 0.85, softness: 0.5, spacing: 0.12, eraser: false }),
-        ("Airbrush", Brush { size: 64.0, opacity: 0.25, softness: 1.0, spacing: 0.08, eraser: false }),
-        ("Chalk", Brush { size: 18.0, opacity: 0.8, softness: 0.9, spacing: 0.25, eraser: false }),
+        ("Pencil", Brush { size: 3.0, opacity: 1.0, softness: 0.15, spacing: 0.1, eraser: false, tip: None }),
+        ("Ink Pen", Brush { size: 6.0, opacity: 1.0, softness: 0.3, spacing: 0.1, eraser: false, tip: None }),
+        ("Round", Brush { size: 24.0, opacity: 1.0, softness: 0.6, spacing: 0.15, eraser: false, tip: None }),
+        ("Marker", Brush { size: 28.0, opacity: 0.85, softness: 0.5, spacing: 0.12, eraser: false, tip: None }),
+        ("Airbrush", Brush { size: 64.0, opacity: 0.25, softness: 1.0, spacing: 0.08, eraser: false, tip: None }),
+        ("Chalk", Brush { size: 18.0, opacity: 0.8, softness: 0.9, spacing: 0.25, eraser: false, tip: None }),
     ]
 }
 impl Document {
@@ -514,5 +697,75 @@ mod tests {
         // Eraser removes alpha (destination-out); color bytes of fully
         // transparent pixels are intentionally left alone.
         assert!(doc.layers[0].pixels.iter().skip(3).step_by(4).all(|&b| b == 0));
+    }
+
+    fn sample_library() -> Vec<BrushPreset> {
+        presets()
+            .into_iter()
+            .map(|(name, brush)| BrushPreset { name: name.to_string(), brush })
+            .collect()
+    }
+
+    #[test]
+    fn brush_library_roundtrips_builtins() {
+        let libs = sample_library();
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-lib-roundtrip.pcbrush");
+        save_brush_library(&path, &libs).unwrap();
+        let back = open_brush_library(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back, libs);
+    }
+
+    #[test]
+    fn brush_library_export_forces_eraser_off() {
+        let mut libs = sample_library();
+        libs[0].brush.eraser = true;
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-lib-eraser.pcbrush");
+        save_brush_library(&path, &libs).unwrap();
+        let back = open_brush_library(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!back[0].brush.eraser);
+    }
+
+    #[test]
+    fn brush_library_rejects_garbage() {
+        let dir = std::env::temp_dir();
+        // Empty export.
+        let path = dir.join("procraft-lib-empty.pcbrush");
+        assert!(save_brush_library(&path, &[]).is_err());
+        // Not JSON at all.
+        std::fs::write(&path, "this is not json").unwrap();
+        assert!(open_brush_library(&path).is_err());
+        // Empty JSON array.
+        std::fs::write(&path, "[]").unwrap();
+        assert!(open_brush_library(&path).is_err());
+        // Empty name.
+        let bad = vec![BrushPreset { name: "   ".to_string(), brush: Brush::default() }];
+        std::fs::write(&path, serde_json::to_string(&bad).unwrap()).unwrap();
+        assert!(open_brush_library(&path).is_err());
+        // Out-of-range size.
+        let bad = vec![BrushPreset {
+            name: "Big".to_string(),
+            brush: Brush { size: 9999.0, ..Brush::default() },
+        }];
+        std::fs::write(&path, serde_json::to_string(&bad).unwrap()).unwrap();
+        assert!(open_brush_library(&path).is_err());
+        // Eraser brush.
+        let bad = vec![BrushPreset {
+            name: "Eraser".to_string(),
+            brush: Brush { eraser: true, ..Brush::default() },
+        }];
+        std::fs::write(&path, serde_json::to_string(&bad).unwrap()).unwrap();
+        assert!(open_brush_library(&path).is_err());
+        // Too many brushes.
+        let many: Vec<BrushPreset> = (0..MAX_LIBRARY_BRUSHES + 1)
+            .map(|i| BrushPreset { name: format!("b{i}"), brush: Brush::default() })
+            .collect();
+        assert!(save_brush_library(&path, &many).is_err());
+        std::fs::write(&path, serde_json::to_string(&many).unwrap()).unwrap();
+        assert!(open_brush_library(&path).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }

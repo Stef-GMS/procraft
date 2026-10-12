@@ -1,3 +1,6 @@
+//! ProCraft by surfrpt1 (https://github.com/surfrpt1).
+//! Original clean-room code, MIT licensed.
+//!
 //! ProCraft milestone 9: brush library (custom brushes + .pcbrush import/export),
 //! plus all earlier features. Original code.
 
@@ -145,6 +148,7 @@ struct ProCraftApp {
     show_tools: bool,
     show_layers: bool,
     narrow_setup_done: bool,
+    show_about: bool,
     #[cfg(target_os = "ios")]
     pending_open: Option<PendingOpen>,
     preview_theme: Option<Theme>,
@@ -207,6 +211,7 @@ impl ProCraftApp {
             show_tools: true,
             show_layers: true,
             narrow_setup_done: false,
+            show_about: false,
             #[cfg(target_os = "ios")]
             pending_open: None,
             preview_theme: None,
@@ -675,8 +680,36 @@ impl eframe::App for ProCraftApp {
                 if ui.button("Fit").clicked() {
                     self.zoom = 0.0; // recomputed in the canvas view
                 }
+                if ui.button("ⓘ About").clicked() {
+                    self.show_about = !self.show_about;
+                }
             });
         });
+
+        // About box: version, builder, home page, updates. Version comes
+        // from the workspace Cargo.toml at compile time, so release bumps
+        // show up here with no code changes.
+        if self.show_about {
+            egui::Window::new("About ProCraft")
+                .open(&mut self.show_about)
+                .resizable(false)
+                .collapsible(false)
+                .show(ui.ctx(), |ui| {
+                    ui.heading("ProCraft");
+                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                    ui.label("Painting studio by surfrpt1.");
+                    ui.hyperlink_to(
+                        "github.com/surfrpt1/procraft",
+                        "https://github.com/surfrpt1/procraft",
+                    );
+                    ui.separator();
+                    ui.hyperlink_to(
+                        "Check for updates",
+                        "https://github.com/surfrpt1/procraft/releases",
+                    );
+                    ui.label("Original code, MIT licensed.");
+                });
+        }
 
         // Fresh id (not "tools"): eframe persists panel widths to disk, and the
         // old narrow width would otherwise override `default_size` forever.

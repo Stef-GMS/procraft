@@ -1,5 +1,6 @@
-//! ProCraft engine: layered raster documents, a soft-round brush, undo and
-//! PNG import/export. Original code; no GUI types in this crate.
+//! ProCraft engine by surfrpt1 (https://github.com/surfrpt1).
+//! Layered raster documents, a soft-round brush, undo and PNG import/export.
+//! Original clean-room code, MIT licensed; no GUI types in this crate.
 
 mod brush;
 mod document;

@@ -1,5 +1,7 @@
 # ProCraft
 
+By [surfrpt1](https://github.com/surfrpt1).
+
 An open-source, clean-room raster painting studio in pure Rust: layered
 painting, a soft-round brush engine, and PNG import/export. Inspired by
 professional painting workflows; every line of code and every asset here is

@@ -7,3 +7,4 @@ description = "Layered raster document model and brush engine for ProCraft (no G
 
 [dependencies]
 image = "0.25"
+flate2 = "1"

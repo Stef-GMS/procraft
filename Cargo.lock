@@ -2841,6 +2841,7 @@ dependencies = [
 name = "procraft-engine"
 version = "0.2.0"
 dependencies = [
+ "flate2",
  "image",
 ]
 

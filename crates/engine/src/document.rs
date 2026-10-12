@@ -829,14 +829,13 @@ impl Document {
     }
 
     /// Save the full project (layers, opacity, blend, background, symmetry)
-    /// to a `.procraft` file: magic + little-endian records, raw pixels.
-    /// Version 3 adds the symmetry mode, kaleidoscope segments, and keeps
-    /// everything else; version 2 files (one symmetry byte, no segments)
-    /// open with 6 segments, and version 1 files open with symmetry off.
+    /// to a `.procraft` file: magic + little-endian records, zlib-compressed
+    /// pixels. Version 4 adds per-layer deflate (v1-v3 files still open);
+    /// version 3 added symmetry segments, version 2 added the symmetry byte.
     pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        f.write_all(b"PCRAFT03").map_err(|e| e.to_string())?;
+        f.write_all(b"PCRAFT04").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes()).map_err(|e| e.to_string())?;
         f.write_all(&self.h.to_le_bytes()).map_err(|e| e.to_string())?;
         f.write_all(&self.background).map_err(|e| e.to_string())?;
@@ -868,7 +867,11 @@ impl Document {
             if layer.pixels.len() != expect {
                 return Err("layer has wrong pixel size".to_string());
             }
-            f.write_all(&layer.pixels).map_err(|e| e.to_string())?;
+            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(&layer.pixels).map_err(|e| e.to_string())?;
+            let packed = enc.finish().map_err(|e| e.to_string())?;
+            f.write_all(&(packed.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+            f.write_all(&packed).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -889,7 +892,8 @@ impl Document {
             Ok(head)
         };
         let magic = take(8)?.to_vec();
-        let v3 = magic == b"PCRAFT03";
+        let v4 = magic == b"PCRAFT04";
+        let v3 = v4 || magic == b"PCRAFT03";
         let v2 = v3 || magic == b"PCRAFT02";
         if magic != b"PCRAFT01" && !v2 {
             return Err("not a ProCraft project file".to_string());
@@ -938,7 +942,25 @@ impl Document {
                 _ => BlendMode::Normal,
             };
             let expect = (w * h * 4) as usize;
-            let pixels = take(expect)?.to_vec();
+            let pixels = if v4 {
+                let comp_len = u32::from_le_bytes(
+                    take(4)?[..4].try_into().map_err(|_| "bad compressed size".to_string())?,
+                ) as usize;
+                if comp_len == 0 || comp_len > expect.saturating_add(10 * 1024 * 1024) {
+                    return Err("project has bad compressed size".to_string());
+                }
+                let packed = take(comp_len)?.to_vec();
+                let mut dec = flate2::read::ZlibDecoder::new(&packed[..]);
+                let mut raw = Vec::with_capacity(expect);
+                use std::io::Read;
+                dec.read_to_end(&mut raw).map_err(|_| "project has corrupt pixels".to_string())?;
+                if raw.len() != expect {
+                    return Err("project has corrupt pixels".to_string());
+                }
+                raw
+            } else {
+                take(expect)?.to_vec()
+            };
             layers.push(Layer { name, visible, opacity, blend, pixels });
         }
         if !cur.is_empty() {
@@ -1355,5 +1377,85 @@ mod tests {
         assert_eq!(doc.layers[0].pixels[0..4], vec![0, 0, 0, 0]);
         let o = ((3 * 10 + 3) * 4) as usize;
         assert_eq!(doc.layers[0].pixels[o + 3], 255);
+    }
+
+    #[test]
+    fn v3_project_still_opens_raw() {
+        // Hand-build a minimal version-3 file (raw pixels, symmetry + segments).
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v3-compat.pcraft");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT03");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[1, 2, 3, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[3]); // Both.
+        buf.extend_from_slice(&[9]); // Segments.
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]);
+        buf.extend_from_slice(&vec![6u8; 2 * 1 * 4]);
+        std::fs::write(&path, &buf).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.symmetry, SymmetryMode::Both);
+        assert_eq!(back.symmetry_segments, 9);
+        assert_eq!(back.layers[0].pixels, vec![6u8; 8]);
+    }
+
+    #[test]
+    fn v4_roundtrip_compresses_sparse_canvas() {
+        // Mostly-transparent canvas must shrink far below raw size.
+        let doc = Document::new(128, 128);
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v4-size.pcraft");
+        doc.save_project(&path).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let raw = 128usize * 128 * 4;
+        assert!(meta.len() as usize * 4 < raw, "compressed {} vs raw {raw}", meta.len());
+        let head = std::fs::read(&path).unwrap();
+        assert_eq!(&head[..8], b"PCRAFT04");
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.layers[0].pixels, doc.layers[0].pixels);
+    }
+
+    #[test]
+    fn v4_noisy_pixels_still_roundtrip() {
+        // Incompressible noise must survive the zlib round trip exactly.
+        let mut doc = Document::new(32, 32);
+        let mut x: u32 = 0x12345678;
+        for b in doc.layers[0].pixels.iter_mut() {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (x >> 24) as u8;
+        }
+        let want = doc.layers[0].pixels.clone();
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v4-noise.pcraft");
+        doc.save_project(&path).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.layers[0].pixels, want);
+    }
+
+    #[test]
+    fn v4_corrupt_pixels_rejected() {
+        let doc = Document::new(8, 8);
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v4-corrupt.pcraft");
+        doc.save_project(&path).unwrap();
+        let mut buf = std::fs::read(&path).unwrap();
+        // Flip bytes inside the compressed payload (last 8 bytes).
+        let n = buf.len();
+        for b in buf[n - 8..].iter_mut() {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&path, &buf).unwrap();
+        assert!(Document::open_project(&path).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }

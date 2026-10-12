@@ -9,12 +9,12 @@ original.
 > Interactive. ProCraft is an independent project with its own name, branding
 > and code, and is not affiliated with or endorsed by any other vendor.
 
-## Status: milestone 7
+## Status: milestone 8
 
 - [x] Layered document model (add / hide / reorder / opacity / blend)
 - [x] Soft-round brush + eraser with spacing, dynamics and undo
 - [x] egui desktop app: paint, layers panel, color/size sliders, PNG export
-- [x] Project files (`.procraft` v2 keeps every layer + symmetry; v1 still opens), zoom, themes, page colors
+- [x] Project files (`.procraft` v4 with per-layer zlib compression; v1-v3 still open), zoom, themes, page colors
 - [x] Rectangular + freehand lasso selections constraining paint
 - [x] Flood fill bucket with tolerance (selection-aware, symmetry-mirrored)
 - [x] Move tool (drag active layer), shape tools (line/rect/ellipse + fill)
@@ -22,6 +22,7 @@ original.
 - [x] Mirror symmetry painting (horizontal / vertical / both + axis overlay)
 - [x] Layer filters: brightness/contrast, box blur, unsharp sharpen (selection-masked)
 - [x] Kaleidoscope symmetry (2-16 segments), layer rename/duplicate/merge, eyedropper, honest brush previews
+- [x] Compressed project files (PCRAFT04 zlib per layer; verified 12MB → 107KB on a 3-layer painting, corrupt payloads rejected)
 - [ ] Brush library file format (import/export sets)
 - [ ] Native iOS build (same playbook as our PdfCraft iOS spike)
 

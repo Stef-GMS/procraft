@@ -40,6 +40,16 @@ impl BrushTip {
     }
 }
 
+/// Polygonal shape families for the shape tools (outline + fill share
+/// the same vertices).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapePoly {
+    Triangle,
+    Diamond,
+    Star,
+    Polygon,
+}
+
 /// Brush shape settings. All original math: a radial falloff stamp laid down
 /// along the pointer path at `spacing` intervals. When `tip` is present the
 /// parametric falloff is replaced by the grayscale stamp (imported brushes).
@@ -100,6 +110,10 @@ impl Document {
         let radius = (brush.size * 0.5).max(0.5);
         let strength = brush.opacity.clamp(0.0, 1.0);
         if strength <= 0.0 || self.layers.get(self.active).is_none() {
+            return;
+        }
+        // Fully outside: a complete no-op (no mask, no dirty rect).
+        if x + radius < 0.0 || y + radius < 0.0 || x - radius >= w_u32 as f32 || y - radius >= h_u32 as f32 {
             return;
         }
         // First mask stroke materializes a white mask (covered by the
@@ -169,11 +183,19 @@ impl Document {
         if strength <= 0.0 || brush.size <= 0.0 || self.layers.get(self.active).is_none() {
             return;
         }
+        let scale = brush.size / tip.w as f32;
+        let th = (tip.h as f32 * scale).max(1.0);
+        // Fully outside: a complete no-op (no mask, no dirty rect).
+        if x + brush.size * 0.5 < 0.0
+            || y + th * 0.5 < 0.0
+            || x - brush.size * 0.5 >= w_u32 as f32
+            || y - th * 0.5 >= h_u32 as f32
+        {
+            return;
+        }
         if self.layers[self.active].mask.is_none() {
             self.add_mask(self.active);
         }
-        let scale = brush.size / tip.w as f32;
-        let th = (tip.h as f32 * scale).max(1.0);
         let x0 = (x - brush.size * 0.5).floor().max(0.0) as u32;
         let y0 = (y - th * 0.5).floor().max(0.0) as u32;
         let x1 = (x + brush.size * 0.5).ceil().min(w_u32 as f32 - 1.0).max(0.0) as u32;
@@ -606,6 +628,145 @@ impl Document {
         }
     }
 
+    /// Closed vertex loop (last == first) for a polygonal shape in the box.
+    /// Triangle/diamond/star are fixed; `polygon` is the regular N-gon
+    /// (`sides` clamped 3..=12, first vertex on top).
+    fn poly_vertices(kind: ShapePoly, x0: f32, y0: f32, x1: f32, y1: f32, sides: u8) -> Vec<(f32, f32)> {
+        let (lo_x, hi_x) = (x0.min(x1), x0.max(x1));
+        let (lo_y, hi_y) = (y0.min(y1), y0.max(y1));
+        let (cx, cy) = ((lo_x + hi_x) * 0.5, (lo_y + hi_y) * 0.5);
+        let close = |mut v: Vec<(f32, f32)>| {
+            if let Some(&first) = v.first() {
+                v.push(first);
+            }
+            v
+        };
+        match kind {
+            ShapePoly::Triangle => close(vec![(cx, lo_y), (hi_x, hi_y), (lo_x, hi_y)]),
+            ShapePoly::Diamond => close(vec![(cx, lo_y), (hi_x, cy), (cx, hi_y), (lo_x, cy)]),
+            ShapePoly::Star => {
+                let r = ((hi_x - lo_x).min(hi_y - lo_y)) * 0.5;
+                let mut v = Vec::with_capacity(11);
+                for i in 0..10 {
+                    let rr = if i % 2 == 0 { r } else { r * 0.382 };
+                    let t = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+                    v.push((cx + rr * t.cos(), cy + rr * t.sin()));
+                }
+                close(v)
+            }
+            ShapePoly::Polygon => {
+                let n = sides.clamp(3, 12) as usize;
+                let (rx, ry) = ((hi_x - lo_x) * 0.5, (hi_y - lo_y) * 0.5);
+                let mut v = Vec::with_capacity(n + 1);
+                for i in 0..n {
+                    let t = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::TAU / n as f32;
+                    v.push((cx + rx * t.cos(), cy + ry * t.sin()));
+                }
+                close(v)
+            }
+        }
+    }
+
+    /// Open stroke path for an arrow along the drag direction: shaft plus
+    /// two head wings (backtracked, like a hand stroke). Caller checkpoints.
+    fn arrow_path(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<(f32, f32)> {
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 2.0 {
+            return vec![(x0, y0), (x1, y1)];
+        }
+        let (ux, uy) = (dx / len, dy / len);
+        let (tip_x, tip_y) = (x1, y1);
+        let head_len = (len * 0.28).min(48.0).max(6.0);
+        let head_w = (len * 0.16).min(32.0).max(4.0);
+        // Perpendicular for the wing spread.
+        let (px, py) = (-uy, ux);
+        let b = (tip_x - ux * head_len, tip_y - uy * head_len);
+        vec![
+            (x0, y0),
+            (tip_x, tip_y),
+            (b.0 + px * head_w, b.1 + py * head_w),
+            (tip_x, tip_y),
+            (b.0 - px * head_w, b.1 - py * head_w),
+        ]
+    }
+
+    /// Outline of a polygonal shape through dab segments. Caller checkpoints.
+    pub fn shape_poly(
+        &mut self,
+        brush: &Brush,
+        color: Color,
+        kind: ShapePoly,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        sides: u8,
+    ) {
+        let pts = Self::poly_vertices(kind, x0, y0, x1, y1, sides);
+        let mut last = None;
+        let mut left = 0.0;
+        for &p in &pts {
+            let r = self.stroke_to(brush, color, last, p, left);
+            last = r.0;
+            left = r.1;
+        }
+    }
+
+    /// Arrow outline (shaft + head). Caller checkpoints first.
+    pub fn shape_arrow(&mut self, brush: &Brush, color: Color, x0: f32, y0: f32, x1: f32, y1: f32) {
+        let pts = Self::arrow_path(x0, y0, x1, y1);
+        let mut last = None;
+        let mut left = 0.0;
+        for &p in &pts {
+            let r = self.stroke_to(brush, color, last, p, left);
+            last = r.0;
+            left = r.1;
+        }
+    }
+
+    /// Solid even-odd fill of a polygonal shape. Caller checkpoints first.
+    pub fn fill_poly(
+        &mut self,
+        brush: &Brush,
+        color: Color,
+        kind: ShapePoly,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        sides: u8,
+    ) {
+        let pts = Self::poly_vertices(kind, x0, y0, x1, y1, sides);
+        if pts.len() < 4 {
+            return;
+        }
+        let (ix0, iy0) = (x0.min(x1).floor().max(0.0) as u32, y0.min(y1).floor().max(0.0) as u32);
+        let (ix1, iy1) = (x0.max(x1).ceil() as u32, y0.max(y1).ceil() as u32);
+        for y in iy0..=iy1.min(self.h.saturating_sub(1)) {
+            for x in ix0..=ix1.min(self.w.saturating_sub(1)) {
+                // Even-odd ray cast from the pixel center.
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let mut inside = false;
+                let mut j = pts.len() - 1;
+                for i in 0..pts.len() {
+                    let (xi, yi) = pts[i];
+                    let (xj, yj) = pts[j];
+                    if (yi > py) != (yj > py) {
+                        let at = xi + (py - yi) / (yj - yi) * (xj - xi);
+                        if px < at {
+                            inside = !inside;
+                        }
+                    }
+                    j = i;
+                }
+                if inside {
+                    self.put(brush, color, x, y);
+                }
+            }
+        }
+    }
+
     /// Flood-fill the contiguous region containing `(x, y)` on the active
     /// layer with `color` at brush opacity. A pixel belongs to the region
     /// when every channel is within `tolerance` of the seed pixel. Honors
@@ -815,6 +976,36 @@ mod tests {
         let mut doc4 = Document::new(32, 32);
         doc4.fill_ellipse(&brush, Color::rgb(1, 2, 3), 2.0, 2.0, 10.0, 10.0);
         assert!(doc4.layers[0].pixels.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn poly_shapes_outline_and_fill() {
+        use ShapePoly::*;
+        let brush = Brush { size: 3.0, ..Default::default() };
+        for kind in [Triangle, Diamond, Star, Polygon] {
+            // Outline paints.
+            let mut doc = Document::new(48, 48);
+            doc.shape_poly(&brush, Color::rgb(255, 0, 0), kind, 6.0, 6.0, 42.0, 42.0, 6);
+            assert!(doc.layers[0].pixels.iter().any(|&b| b != 0), "{kind:?} outline");
+            // Fill covers the middle but not the far corner.
+            let mut doc = Document::new(48, 48);
+            doc.fill_poly(&brush, Color::rgb(0, 255, 0), kind, 6.0, 6.0, 42.0, 42.0, 6);
+            let mid = ((24 * 48 + 24) * 4) as usize;
+            assert_eq!(doc.layers[0].pixels[mid + 3], 255, "{kind:?} fill middle");
+            let corner = ((2 * 48 + 2) * 4) as usize;
+            assert_eq!(doc.layers[0].pixels[corner + 3], 0, "{kind:?} fill corner");
+        }
+        // Polygon sides clamp: 2 behaves like a triangle, 99 like 12.
+        let mut doc = Document::new(48, 48);
+        doc.fill_poly(&brush, Color::rgb(1, 1, 1), Polygon, 6.0, 6.0, 42.0, 42.0, 2);
+        let mid = ((30 * 48 + 24) * 4) as usize;
+        assert_eq!(doc.layers[0].pixels[mid + 3], 255);
+        // Arrow paints along its drag direction.
+        let mut doc = Document::new(48, 48);
+        doc.shape_arrow(&brush, Color::rgb(0, 0, 255), 4.0, 24.0, 44.0, 24.0);
+        assert!(doc.layers[0].pixels.iter().any(|&b| b != 0));
+        let tip = ((24 * 48 + 43) * 4) as usize;
+        assert!(doc.layers[0].pixels[tip + 3] > 0, "arrowhead lands at the tip");
     }
 
     #[test]

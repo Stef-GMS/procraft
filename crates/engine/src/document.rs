@@ -336,7 +336,18 @@ impl Document {
     }
 
     pub(crate) fn mark_dirty(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) {
-        let r = (x0, y0, x1, y1);
+        // Dabs fully outside the canvas invert the rect (x0 > x1): they
+        // paint nothing, so record nothing instead of poisoning consumers
+        // with an underflowing region.
+        if x0 > x1 || y0 > y1 {
+            return;
+        }
+        let r = (
+            x0.min(self.w.saturating_sub(1)),
+            y0.min(self.h.saturating_sub(1)),
+            x1.min(self.w.saturating_sub(1)),
+            y1.min(self.h.saturating_sub(1)),
+        );
         self.dirty = Some(match self.dirty {
             Some((a, b, c, d)) => (a.min(r.0), b.min(r.1), c.max(r.2), d.max(r.3)),
             None => r,
@@ -1902,5 +1913,42 @@ mod tests {
         std::fs::write(&path, &buf).unwrap();
         assert!(Document::open_project(&path).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn strokes_fully_outside_canvas_are_safe() {
+        use crate::brush::{Brush, BrushTip, Color};
+        // Regression: a dab fully right/below the canvas used to record an
+        // inverted dirty rect, and the texture upload's `x1 - x0 + 1` then
+        // underflowed and quit the app.
+        let mut doc = Document::new(32, 32);
+        let brush = Brush { size: 8.0, ..Default::default() };
+        let clean = doc.layers[0].pixels.clone();
+        for (from, to) in [
+            (Some((100.0, 100.0)), (400.0, 400.0)), // right-bottom
+            (Some((-400.0, 100.0)), (-100.0, 100.0)), // left
+            (Some((100.0, -400.0)), (100.0, -100.0)), // above
+            (None, (1000.0, 1000.0)), // single dab far outside
+        ] {
+            doc.stroke_to(&brush, Color::rgb(255, 0, 0), from, to, 0.0);
+        }
+        assert_eq!(doc.layers[0].pixels, clean);
+        // No poisoned region may survive: consumers subtract safely.
+        if let Some((x0, y0, x1, y1)) = doc.take_dirty() {
+            assert!(x0 <= x1 && y0 <= y1);
+            let bytes = doc.flatten_region(x0, y0, x1, y1);
+            let w = (x1 - x0 + 1) as usize;
+            let h = (y1 - y0 + 1) as usize;
+            assert_eq!(bytes.len(), w * h * 4);
+        }
+        // Same for stamp tips and mask painting.
+        let tip = BrushTip::from_mask(2, 2, vec![255; 4]).unwrap();
+        let stamp = Brush { size: 16.0, tip: Some(tip), ..Brush::default() };
+        doc.stroke_to(&stamp, Color::rgb(1, 2, 3), Some((200.0, 200.0)), (500.0, 500.0), 0.0);
+        assert_eq!(doc.layers[0].pixels, clean);
+        doc.paint_target = PaintTarget::Mask;
+        doc.stroke_to(&brush, Color::rgb(0, 0, 0), Some((200.0, 200.0)), (500.0, 500.0), 0.0);
+        assert!(doc.layers[0].mask.is_none());
+        doc.paint_target = PaintTarget::Color;
     }
 }

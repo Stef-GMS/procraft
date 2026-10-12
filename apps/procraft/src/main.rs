@@ -6,7 +6,7 @@ use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptio
 #[cfg(target_os = "ios")]
 use rfd_shim as rfd;
 use procraft_engine::{
-    BlendMode, Brush, BrushPreset, Color, Document, PaintTarget, SymmetryMode, MAX_LIBRARY_BRUSHES,
+    BlendMode, Brush, BrushPreset, Color, Document, PaintTarget, ShapePoly, SymmetryMode, MAX_LIBRARY_BRUSHES,
     export_tip_png, import_brush_file, open_brush_library, open_psd, save_brush_library, save_psd,
 };
 
@@ -26,17 +26,41 @@ enum ShapeKind {
     Line,
     Rect,
     Ellipse,
+    Triangle,
+    Diamond,
+    Star,
+    Arrow,
+    Polygon,
 }
 
 impl ShapeKind {
-    const ALL: [ShapeKind; 3] = [ShapeKind::Line, ShapeKind::Rect, ShapeKind::Ellipse];
+    const ALL: [ShapeKind; 8] = [
+        ShapeKind::Line,
+        ShapeKind::Rect,
+        ShapeKind::Ellipse,
+        ShapeKind::Triangle,
+        ShapeKind::Diamond,
+        ShapeKind::Star,
+        ShapeKind::Arrow,
+        ShapeKind::Polygon,
+    ];
 
     fn name(self) -> &'static str {
         match self {
             ShapeKind::Line => "Line",
             ShapeKind::Rect => "Rect",
             ShapeKind::Ellipse => "Ellipse",
+            ShapeKind::Triangle => "Triangle",
+            ShapeKind::Diamond => "Diamond",
+            ShapeKind::Star => "Star",
+            ShapeKind::Arrow => "Arrow",
+            ShapeKind::Polygon => "Polygon",
         }
+    }
+
+    /// Closed shapes honor the Fill toggle (arrow/line are strokes only).
+    fn fillable(self) -> bool {
+        !matches!(self, ShapeKind::Line | ShapeKind::Arrow)
     }
 }
 
@@ -107,6 +131,9 @@ struct ProCraftApp {
     renaming: Option<usize>,
     preset_textures: Vec<TextureHandle>,
     view_mask: bool,
+    show_tools: bool,
+    show_layers: bool,
+    narrow_setup_done: bool,
     preview_theme: Option<Theme>,
     custom_brushes: Vec<BrushPreset>,
     new_brush_name: String,
@@ -116,6 +143,7 @@ struct ProCraftApp {
     shape_current: Option<(f32, f32)>,
     shape_kind: ShapeKind,
     shape_fill: bool,
+    shape_sides: u8,
     zoom: f32,
     status: String,
 }
@@ -162,6 +190,9 @@ impl ProCraftApp {
             renaming: None,
             preset_textures: Vec::new(),
             view_mask: false,
+            show_tools: true,
+            show_layers: true,
+            narrow_setup_done: false,
             preview_theme: None,
             custom_brushes: Vec::new(),
             new_brush_name: String::new(),
@@ -171,6 +202,7 @@ impl ProCraftApp {
             shape_current: None,
             shape_kind: ShapeKind::Rect,
             shape_fill: false,
+            shape_sides: 6,
             zoom: 1.0,
             status: "Drag on the canvas to paint. Ctrl+Z undoes, Ctrl+Y redoes, Esc clears selection.".to_string(),
         }
@@ -370,8 +402,19 @@ impl eframe::App for ProCraftApp {
             ui.ctx().request_repaint();
         }
 
+        // One-time narrow-screen setup: portrait phones/tablets start
+        // with both sidebars hidden so the canvas owns the screen.
+        if !self.narrow_setup_done {
+            self.narrow_setup_done = true;
+            if ui.ctx().viewport_rect().width() < 900.0 {
+                self.show_tools = false;
+                self.show_layers = false;
+            }
+        }
+
         egui::Panel::top("menu").show(ui, |ui| {
-            ui.horizontal(|ui| {
+            // Wrapped rows: one row on desktop, two on narrow screens.
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Save PNG").clicked() {
                     if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).save_file() {
                         match self.doc.save_png(&path) {
@@ -488,9 +531,17 @@ impl eframe::App for ProCraftApp {
 
         // Fresh id (not "tools"): eframe persists panel widths to disk, and the
         // old narrow width would otherwise override `default_size` forever.
+        if self.show_tools {
         egui::Panel::left("tools-wide").default_size(300.0).show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("Tool");
+            ui.horizontal(|ui| {
+                ui.heading("Tool");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_sized([40.0, 24.0], egui::Button::new("◀")).clicked() {
+                        self.show_tools = false;
+                    }
+                });
+            });
             ui.radio_value(&mut self.tool, Tool::Brush, "✏ Brush");
             ui.radio_value(&mut self.tool, Tool::Eraser, "⌫ Eraser");
             ui.radio_value(&mut self.tool, Tool::Select, "⬚ Select");
@@ -502,12 +553,17 @@ impl eframe::App for ProCraftApp {
                 ui.add(egui::Slider::new(&mut self.fill_tolerance, 0..=255).text("Tolerance"));
             }
             if self.tool == Tool::Shapes {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for k in ShapeKind::ALL {
                         ui.radio_value(&mut self.shape_kind, k, k.name());
                     }
                 });
-                ui.checkbox(&mut self.shape_fill, "Fill");
+                if self.shape_kind.fillable() {
+                    ui.checkbox(&mut self.shape_fill, "Fill");
+                }
+                if self.shape_kind == ShapeKind::Polygon {
+                    ui.add(egui::Slider::new(&mut self.shape_sides, 3..=12).text("Sides"));
+                }
             }
             if ui.button("Clear selection").clicked() {
                 self.doc.clear_selection();
@@ -732,12 +788,21 @@ impl eframe::App for ProCraftApp {
             }
             });
         });
+        } // end show_tools
 
         // Fresh id (not "layers"): eframe persists panel widths to disk, and the
         // old narrow width would otherwise override `default_size` forever.
+        if self.show_layers {
         egui::Panel::right("layers-wide").default_size(280.0).show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("Layers");
+            ui.horizontal(|ui| {
+                ui.heading("Layers");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_sized([40.0, 24.0], egui::Button::new("▶")).clicked() {
+                        self.show_layers = false;
+                    }
+                });
+            });
             ui.horizontal(|ui| {
                 if ui.button("Add layer").clicked() {
                     self.doc.add_layer(format!("Layer {}", self.doc.layers.len() + 1));
@@ -963,6 +1028,27 @@ impl eframe::App for ProCraftApp {
             }
         });
         });
+        } // end show_layers
+
+        // Floating edge buttons reopen hidden sidebars (touch-sized).
+        if !self.show_tools {
+            egui::Area::new(egui::Id::new("tools-fab"))
+                .anchor(egui::Align2::LEFT_CENTER, [8.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    if ui.add_sized([44.0, 44.0], egui::Button::new("▶")).clicked() {
+                        self.show_tools = true;
+                    }
+                });
+        }
+        if !self.show_layers {
+            egui::Area::new(egui::Id::new("layers-fab"))
+                .anchor(egui::Align2::RIGHT_CENTER, [-8.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    if ui.add_sized([44.0, 44.0], egui::Button::new("◀")).clicked() {
+                        self.show_layers = true;
+                    }
+                });
+        }
 
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.label(&self.status);
@@ -1273,6 +1359,37 @@ impl eframe::App for ProCraftApp {
                                         self.doc.shape_ellipse(&brush, color, ax, ay, bx, by);
                                     }
                                 }
+                                ShapeKind::Triangle => {
+                                    if self.shape_fill {
+                                        self.doc.fill_poly(&brush, color, ShapePoly::Triangle, ax, ay, bx, by, self.shape_sides);
+                                    } else {
+                                        self.doc.shape_poly(&brush, color, ShapePoly::Triangle, ax, ay, bx, by, self.shape_sides);
+                                    }
+                                }
+                                ShapeKind::Diamond => {
+                                    if self.shape_fill {
+                                        self.doc.fill_poly(&brush, color, ShapePoly::Diamond, ax, ay, bx, by, self.shape_sides);
+                                    } else {
+                                        self.doc.shape_poly(&brush, color, ShapePoly::Diamond, ax, ay, bx, by, self.shape_sides);
+                                    }
+                                }
+                                ShapeKind::Star => {
+                                    if self.shape_fill {
+                                        self.doc.fill_poly(&brush, color, ShapePoly::Star, ax, ay, bx, by, self.shape_sides);
+                                    } else {
+                                        self.doc.shape_poly(&brush, color, ShapePoly::Star, ax, ay, bx, by, self.shape_sides);
+                                    }
+                                }
+                                ShapeKind::Arrow => {
+                                    self.doc.shape_arrow(&brush, color, ax, ay, bx, by);
+                                }
+                                ShapeKind::Polygon => {
+                                    if self.shape_fill {
+                                        self.doc.fill_poly(&brush, color, ShapePoly::Polygon, ax, ay, bx, by, self.shape_sides);
+                                    } else {
+                                        self.doc.shape_poly(&brush, color, ShapePoly::Polygon, ax, ay, bx, by, self.shape_sides);
+                                    }
+                                }
                             }
                             self.status = format!("{} drawn.", self.shape_kind.name());
                         }
@@ -1294,6 +1411,10 @@ impl eframe::App for ProCraftApp {
                 if self.painting && resp.dragged() {
                     if let Some(pos) = resp.hover_pos() {
                         let (x, y) = to_canvas(pos);
+                        // Clamp: off-page drags paint nothing instead of
+                        // streaking the canvas edge (and poisoning the
+                        // dirty rect, which used to quit the app).
+                        let (x, y) = clamp_pt(x, y);
                         let now = ctx.input(|i| i.time);
                         let dt = (now - self.last_t).max(1.0 / 240.0) as f32;
                         self.last_t = now;

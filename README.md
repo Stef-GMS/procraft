@@ -17,7 +17,7 @@ original.
 - [x] Project files (`.procraft` v5 with masks, clipping + 10 blends; v1-v4 still open), zoom, themes, page colors with active-preset highlight
 - [x] Rectangular + freehand lasso selections constraining paint
 - [x] Flood fill bucket with tolerance (selection-aware, symmetry-mirrored)
-- [x] Move tool (drag active layer), shape tools (line/rect/ellipse + fill)
+- [x] Move tool (drag active layer), shape tools (line/rect/ellipse/triangle/diamond/star/arrow/polygon + fill)
 - [x] Layer transforms (scale, rotate, flip H/V with bilinear sampling)
 - [x] Mirror symmetry painting (horizontal / vertical / both + axis overlay)
 - [x] Layer filters: brightness/contrast, box blur, unsharp sharpen (selection-masked)

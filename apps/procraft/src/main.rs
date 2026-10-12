@@ -129,6 +129,7 @@ struct ProCraftApp {
     filt_blur: i32,
     filt_sharpen: f32,
     renaming: Option<usize>,
+    renaming_text: String,
     preset_textures: Vec<TextureHandle>,
     view_mask: bool,
     show_tools: bool,
@@ -188,6 +189,7 @@ impl ProCraftApp {
             filt_blur: 0,
             filt_sharpen: 0.0,
             renaming: None,
+            renaming_text: String::new(),
             preset_textures: Vec::new(),
             view_mask: false,
             show_tools: true,
@@ -418,7 +420,11 @@ impl eframe::App for ProCraftApp {
                 if ui.button("Save PNG").clicked() {
                     if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).save_file() {
                         match self.doc.save_png(&path) {
-                            Ok(()) => self.status = format!("Saved {}", path.display()),
+                            Ok(()) => {
+                                self.status = format!("Saved {}", path.display());
+                                #[cfg(target_os = "ios")]
+                                rfd::ios_share_file(&path);
+                            }
                             Err(e) => self.status = format!("Save failed: {e}"),
                         }
                     }
@@ -446,7 +452,11 @@ impl eframe::App for ProCraftApp {
                     {
                         let path = ensure_extension(path, "procraft");
                         match self.doc.save_project(&path) {
-                            Ok(()) => self.status = format!("Project saved {}", path.display()),
+                            Ok(()) => {
+                                self.status = format!("Project saved {}", path.display());
+                                #[cfg(target_os = "ios")]
+                                rfd::ios_share_file(&path);
+                            }
                             Err(e) => self.status = format!("Project save failed: {e}"),
                         }
                     }
@@ -475,7 +485,11 @@ impl eframe::App for ProCraftApp {
                     {
                         let path = ensure_extension(path, "psd");
                         match save_psd(&path, &self.doc) {
-                            Ok(()) => self.status = format!("PSD saved {} (masks do not round-trip)", path.display()),
+                            Ok(()) => {
+                                self.status = format!("PSD saved {} (masks do not round-trip)", path.display());
+                                #[cfg(target_os = "ios")]
+                                rfd::ios_share_file(&path);
+                            }
                             Err(e) => self.status = format!("PSD save failed: {e}"),
                         }
                     }
@@ -678,7 +692,11 @@ impl eframe::App for ProCraftApp {
                     {
                         let path = ensure_extension(path, "pcbrush");
                         match save_brush_library(&path, &self.custom_brushes) {
-                            Ok(()) => self.status = format!("Brushes saved {}", path.display()),
+                            Ok(()) => {
+                                self.status = format!("Brushes saved {}", path.display());
+                                #[cfg(target_os = "ios")]
+                                rfd::ios_share_file(&path);
+                            }
                             Err(e) => self.status = format!("Brush save failed: {e}"),
                         }
                     }
@@ -693,7 +711,11 @@ impl eframe::App for ProCraftApp {
                         let path = ensure_extension(path, "png");
                         let brush = Brush { eraser: false, ..self.brush.clone() };
                         match export_tip_png(&path, &brush) {
-                            Ok(()) => self.status = format!("Tip saved {}", path.display()),
+                            Ok(()) => {
+                                self.status = format!("Tip saved {}", path.display());
+                                #[cfg(target_os = "ios")]
+                                rfd::ios_share_file(&path);
+                            }
                             Err(e) => self.status = format!("Tip save failed: {e}"),
                         }
                     }
@@ -832,17 +854,32 @@ impl eframe::App for ProCraftApp {
                     }
                     let selected = self.doc.active == i;
                     if Some(i) == self.renaming {
-                        // Double-clicked: edit the name in place.
-                        let resp = ui.text_edit_singleline(&mut layer.name);
+                        // Double-clicked: edit the name in a staged buffer so
+                        // Cancel can discard it. Commits via Save, Enter, or
+                        // focus loss (touch keyboards often send neither, so
+                        // the buttons are the reliable path on iPad).
+                        let resp = ui.text_edit_singleline(&mut self.renaming_text);
                         if !resp.has_focus() {
                             resp.request_focus();
                         }
                         let enter = ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
-                        if resp.lost_focus() || enter {
-                            if layer.name.trim().is_empty() {
-                                layer.name = format!("Layer {}", i + 1);
+                        let mut commit = resp.lost_focus() || enter;
+                        let mut cancel = false;
+                        if ui.add_sized([36.0, 22.0], egui::Button::new("✓")).clicked() {
+                            commit = true;
+                        }
+                        if ui.add_sized([36.0, 22.0], egui::Button::new("✕")).clicked() {
+                            cancel = true;
+                        }
+                        if commit && !cancel {
+                            if self.renaming_text.trim().is_empty() {
+                                self.renaming_text = format!("Layer {}", i + 1);
                             }
+                            layer.name = std::mem::take(&mut self.renaming_text);
+                        }
+                        if commit || cancel {
                             self.renaming = None;
+                            self.renaming_text.clear();
                         }
                     } else {
                         let resp = ui.selectable_label(selected, &layer.name);
@@ -852,6 +889,7 @@ impl eframe::App for ProCraftApp {
                         if resp.double_clicked() {
                             select = Some(i);
                             self.renaming = Some(i);
+                            self.renaming_text = layer.name.clone();
                         }
                     }
                     if ui.small_button("del").clicked() {

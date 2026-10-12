@@ -1,6 +1,28 @@
 [package]
 name = "rfd-shim"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "iOS file-dialog shim: ProCraft's rfd call shape, every dialog declined (native pickers are a later milestone)"
+description = "ProCraft file dialogs: real rfd call shape everywhere; on iOS a UIDocumentPicker bridge (Import mode) plus Documents-based save with share sheet"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSArray",
+    "NSURL",
+    "NSObject",
+    "NSObjCRuntime",
+    "NSRunLoop",
+    "NSDate",
+] }
+objc2-ui-kit = { version = "0.3", features = [
+    "UIDocumentPickerViewController",
+    "UIApplication",
+    "UIViewController",
+    "UIView",
+    "UIWindow",
+    "UIActivityViewController",
+    "UIActivity",
+    "UIPopoverPresentationController",
+] }

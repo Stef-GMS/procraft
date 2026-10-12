@@ -39,7 +39,7 @@ impl Document {
     /// mirrored per [`Document::symmetry`].
     /// Pixels outside [`Document::selection`] (when set) are skipped.
     pub fn dab(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
-        let pts = self.symmetry.mirrored_points(self.w, self.h, x, y);
+        let pts = self.symmetry.mirrored_points(self.w, self.h, self.symmetry_segments, x, y);
         let mut done: Vec<(f32, f32)> = Vec::with_capacity(4);
         for (mx, my) in pts {
             if done.iter().any(|&(dx, dy)| (dx - mx).abs() < 0.001 && (dy - my).abs() < 0.001) {
@@ -165,7 +165,7 @@ impl Document {
     /// Paint one pixel with source-over at brush opacity, honoring selection
     /// and mirroring per [`Document::symmetry`].
     fn put(&mut self, brush: &Brush, color: Color, px: u32, py: u32) {
-        let pts = self.symmetry.mirrored_pixels(self.w, self.h, px, py);
+        let pts = self.symmetry.mirrored_pixels(self.w, self.h, self.symmetry_segments, px, py);
         let mut done: Vec<(u32, u32)> = Vec::with_capacity(4);
         for (mx, my) in pts {
             if done.contains(&(mx, my)) {
@@ -313,7 +313,7 @@ impl Document {
         };
         // Mirror the seed across symmetry axes (deduped).
         let mut seeds = Vec::with_capacity(4);
-        for (sx, sy) in self.symmetry.mirrored_pixels(w, h, x, y) {
+        for (sx, sy) in self.symmetry.mirrored_pixels(w, h, self.symmetry_segments, x, y) {
             if sx < w && sy < h && self.pixel_selected(sx, sy) && !seeds.contains(&(sx, sy)) {
                 seeds.push((sx, sy));
             }

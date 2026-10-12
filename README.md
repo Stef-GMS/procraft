@@ -21,6 +21,7 @@ original.
 - [x] Layer transforms (scale, rotate, flip H/V with bilinear sampling)
 - [x] Mirror symmetry painting (horizontal / vertical / both + axis overlay)
 - [x] Layer filters: brightness/contrast, box blur, unsharp sharpen (selection-masked)
+- [x] Kaleidoscope symmetry (2-16 segments), layer rename/duplicate/merge, eyedropper, honest brush previews
 - [ ] Brush library file format (import/export sets)
 - [ ] Native iOS build (same playbook as our PdfCraft iOS spike)
 

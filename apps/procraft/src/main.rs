@@ -98,6 +98,8 @@ struct ProCraftApp {
     filt_contrast: f32,
     filt_blur: i32,
     filt_sharpen: f32,
+    renaming: Option<usize>,
+    preset_textures: Vec<TextureHandle>,
     move_from: Option<(f32, f32)>,
     move_acc: (f32, f32),
     shape_anchor: Option<(f32, f32)>,
@@ -147,6 +149,8 @@ impl ProCraftApp {
             filt_contrast: 100.0,
             filt_blur: 0,
             filt_sharpen: 0.0,
+            renaming: None,
+            preset_textures: Vec::new(),
             move_from: None,
             move_acc: (0.0, 0.0),
             shape_anchor: None,
@@ -191,6 +195,37 @@ impl ProCraftApp {
     fn set_page_color(&mut self, rgb: [u8; 3]) {
         self.doc.background = [rgb[0], rgb[1], rgb[2], 255];
         self.doc.mark_full_dirty();
+    }
+
+    /// Honest brush previews: each preset paints a wavy sample stroke through
+    /// the real engine into a thumbnail texture (dotted chalk reads dotted).
+    fn build_preset_previews(&mut self, ctx: &egui::Context) {
+        self.preset_textures.clear();
+        for (idx, (_, preset)) in procraft_engine::presets().into_iter().enumerate() {
+            let mut doc = Document::new(144, 36);
+            let brush = Brush { eraser: false, ..preset };
+            let color = Color::rgb(150, 150, 150);
+            let mut last = None;
+            let mut left = 0.0;
+            let mut x = 8.0;
+            while x <= 136.0 {
+                let y = 18.0
+                    + 8.0 * ((x - 8.0) / 128.0 * std::f32::consts::PI * 2.0).sin();
+                let (l, lo) = doc.stroke_to(&brush, color, last, (x, y), left);
+                last = l;
+                left = lo;
+                x += 2.0;
+            }
+            let img = ColorImage::from_rgba_unmultiplied(
+                [144, 36],
+                &doc.layers[0].pixels.clone(),
+            );
+            self.preset_textures.push(ctx.load_texture(
+                format!("preset-{idx}"),
+                img,
+                TextureOptions::LINEAR,
+            ));
+        }
     }
 }
 
@@ -398,11 +433,15 @@ impl eframe::App for ProCraftApp {
             }
             ui.separator();
             ui.heading("Brushes");
-            for (name, preset) in procraft_engine::presets() {
+            if self.preset_textures.len() != procraft_engine::presets().len() {
+                let ctx = ui.ctx().clone();
+                self.build_preset_previews(&ctx);
+            }
+            for (idx, (name, preset)) in procraft_engine::presets().into_iter().enumerate() {
                 ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-                    let r = (preset.size * 0.5).clamp(2.0, 10.0);
-                    ui.painter().circle_filled(rect.center(), r, Color32::from_gray(200));
+                    if let Some(tex) = self.preset_textures.get(idx) {
+                        ui.image((tex.id(), Vec2::new(120.0, 30.0)));
+                    }
                     if ui.button(name).clicked() {
                         self.brush = preset;
                         self.tool = Tool::Brush;
@@ -462,9 +501,23 @@ impl eframe::App for ProCraftApp {
         egui::Panel::right("layers-wide").default_size(280.0).show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Layers");
-            if ui.button("Add layer").clicked() {
-                self.doc.add_layer(format!("Layer {}", self.doc.layers.len() + 1));
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Add layer").clicked() {
+                    self.doc.add_layer(format!("Layer {}", self.doc.layers.len() + 1));
+                }
+                if ui.button("Duplicate").clicked() {
+                    let active = self.doc.active;
+                    self.doc.duplicate_layer(active);
+                    self.status = "Layer duplicated.".to_string();
+                }
+                let can_merge = self.doc.active > 0 && self.doc.layers.len() > 1;
+                if ui.add_enabled(can_merge, egui::Button::new("Merge down")).clicked() {
+                    let active = self.doc.active;
+                    if self.doc.merge_down(active) {
+                        self.status = "Merged down.".to_string();
+                    }
+                }
+            });
             let mut remove = None;
             let mut select = None;
             let mut touched = false;
@@ -476,8 +529,28 @@ impl eframe::App for ProCraftApp {
                         touched = true;
                     }
                     let selected = self.doc.active == i;
-                    if ui.selectable_label(selected, &layer.name).clicked() {
-                        select = Some(i);
+                    if Some(i) == self.renaming {
+                        // Double-clicked: edit the name in place.
+                        let resp = ui.text_edit_singleline(&mut layer.name);
+                        if !resp.has_focus() {
+                            resp.request_focus();
+                        }
+                        let enter = ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
+                        if resp.lost_focus() || enter {
+                            if layer.name.trim().is_empty() {
+                                layer.name = format!("Layer {}", i + 1);
+                            }
+                            self.renaming = None;
+                        }
+                    } else {
+                        let resp = ui.selectable_label(selected, &layer.name);
+                        if resp.clicked() {
+                            select = Some(i);
+                        }
+                        if resp.double_clicked() {
+                            select = Some(i);
+                            self.renaming = Some(i);
+                        }
                     }
                     if ui.small_button("del").clicked() {
                         remove = Some(i);
@@ -577,6 +650,11 @@ impl eframe::App for ProCraftApp {
                     self.status = format!("Symmetry: {}.", m.name());
                 }
             }
+            if self.doc.symmetry == SymmetryMode::Kaleidoscope {
+                ui.add(
+                    egui::Slider::new(&mut self.doc.symmetry_segments, 2..=16).text("Segments"),
+                );
+            }
             ui.separator();
             ui.heading("Filters");
             ui.label("Active layer. Selections mask filters.");
@@ -636,25 +714,39 @@ impl eframe::App for ProCraftApp {
                 };
                 // Mirror axis overlay so the symmetry center is visible.
                 let axis_color = Color32::from_rgba_unmultiplied(220, 40, 40, 180);
+                let axis = |a: egui::Pos2, b: egui::Pos2| {
+                    ui.painter().line_segment([a, b], (1.0, axis_color));
+                };
+                let center = egui::Pos2::new(rect.min.x + w * z * 0.5, rect.min.y + h * z * 0.5);
+                let vline = || {
+                    axis(
+                        egui::Pos2::new(center.x, rect.min.y),
+                        egui::Pos2::new(center.x, rect.max.y),
+                    )
+                };
+                let hline = || {
+                    axis(
+                        egui::Pos2::new(rect.min.x, center.y),
+                        egui::Pos2::new(rect.max.x, center.y),
+                    )
+                };
                 match self.doc.symmetry {
-                    SymmetryMode::Horizontal | SymmetryMode::Both => {
-                        let cx = rect.min.x + w * z * 0.5;
-                        ui.painter().line_segment(
-                            [egui::Pos2::new(cx, rect.min.y), egui::Pos2::new(cx, rect.max.y)],
-                            (1.0, axis_color),
-                        );
+                    SymmetryMode::Off => {}
+                    SymmetryMode::Horizontal => vline(),
+                    SymmetryMode::Vertical => hline(),
+                    SymmetryMode::Both => {
+                        vline();
+                        hline();
                     }
-                    _ => {}
-                }
-                match self.doc.symmetry {
-                    SymmetryMode::Vertical | SymmetryMode::Both => {
-                        let cy = rect.min.y + h * z * 0.5;
-                        ui.painter().line_segment(
-                            [egui::Pos2::new(rect.min.x, cy), egui::Pos2::new(rect.max.x, cy)],
-                            (1.0, axis_color),
-                        );
+                    SymmetryMode::Kaleidoscope => {
+                        let n = self.doc.symmetry_segments.clamp(2, 16) as usize;
+                        let reach = (rect.width().powi(2) + rect.height().powi(2)).sqrt() * 0.5;
+                        for k in 0..n {
+                            let (s, c) = (k as f32 * std::f32::consts::PI / n as f32).sin_cos();
+                            let dir = egui::Vec2::new(c * reach, s * reach);
+                            axis(center - dir, center + dir);
+                        }
                     }
-                    _ => {}
                 }
                 // Committed lasso outline stays visible on every tool (it is
                 // skipped while a new loop is being dragged: the Lasso branch
@@ -666,6 +758,27 @@ impl eframe::App for ProCraftApp {
                         .map(|&(x, y)| egui::Pos2::new(rect.min.x + x * z, rect.min.y + y * z))
                         .collect();
                     paint_path(ui.painter(), &pts, true);
+                }
+
+                // Eyedropper: Alt-click samples the composited canvas color
+                // into the brush on any tool (Alt held blocks painting).
+                if ctx.input(|i| i.modifiers.alt) {
+                    if resp.drag_started() || resp.clicked() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            let (cx, cy) = clamp_pt(x, y);
+                            if let Some(rgb) = self.doc.sample(cx as u32, cy as u32) {
+                                self.color = rgb;
+                                self.status = format!(
+                                    "Picked #{:02X}{:02X}{:02X}.",
+                                    rgb[0], rgb[1], rgb[2]
+                                );
+                            }
+                        }
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
                 }
 
                 if self.tool == Tool::Select {

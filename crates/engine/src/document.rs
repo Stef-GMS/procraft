@@ -39,7 +39,9 @@ impl BlendMode {
 }
 
 /// Mirror painting mode: strokes are stamped on both sides of the canvas
-/// center line(s). Horizontal mirrors left-right, Vertical mirrors top-bottom.
+/// center line(s). Horizontal mirrors left-right, Vertical mirrors top-bottom,
+/// Both mirrors on both axes, Kaleidoscope reflects around N axes through
+/// the canvas center (Segments slider, 2..=16).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SymmetryMode {
     #[default]
@@ -47,11 +49,17 @@ pub enum SymmetryMode {
     Horizontal,
     Vertical,
     Both,
+    Kaleidoscope,
 }
 
 impl SymmetryMode {
-    pub const ALL: [SymmetryMode; 4] =
-        [SymmetryMode::Off, SymmetryMode::Horizontal, SymmetryMode::Vertical, SymmetryMode::Both];
+    pub const ALL: [SymmetryMode; 5] = [
+        SymmetryMode::Off,
+        SymmetryMode::Horizontal,
+        SymmetryMode::Vertical,
+        SymmetryMode::Both,
+        SymmetryMode::Kaleidoscope,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -59,28 +67,86 @@ impl SymmetryMode {
             SymmetryMode::Horizontal => "Horizontal",
             SymmetryMode::Vertical => "Vertical",
             SymmetryMode::Both => "Both",
+            SymmetryMode::Kaleidoscope => "Kaleidoscope",
         }
     }
 
-    pub(crate) fn mirrored_points(self, w: u32, h: u32, x: f32, y: f32) -> [(f32, f32); 4] {
+    pub(crate) fn mirrored_points(
+        self,
+        w: u32,
+        h: u32,
+        segments: u8,
+        x: f32,
+        y: f32,
+    ) -> Vec<(f32, f32)> {
         let mx = w as f32 - 1.0 - x;
         let my = h as f32 - 1.0 - y;
         match self {
-            SymmetryMode::Off => [(x, y), (x, y), (x, y), (x, y)],
-            SymmetryMode::Horizontal => [(x, y), (mx, y), (x, y), (x, y)],
-            SymmetryMode::Vertical => [(x, y), (x, my), (x, y), (x, y)],
-            SymmetryMode::Both => [(x, y), (mx, y), (x, my), (mx, my)],
+            SymmetryMode::Off => vec![(x, y)],
+            SymmetryMode::Horizontal => vec![(x, y), (mx, y)],
+            SymmetryMode::Vertical => vec![(x, y), (x, my)],
+            SymmetryMode::Both => vec![(x, y), (mx, y), (x, my), (mx, my)],
+            SymmetryMode::Kaleidoscope => {
+                // Dihedral symmetry: rotate by k*step, mirroring on odd k.
+                let n = segments.clamp(2, 16) as usize;
+                let (cx, cy) = ((w as f32 - 1.0) * 0.5, (h as f32 - 1.0) * 0.5);
+                let (dx, dy) = (x - cx, y - cy);
+                let step = std::f32::consts::TAU / n as f32;
+                (0..n)
+                    .map(|k| {
+                        let (px, mut py) = (dx, dy);
+                        if k % 2 == 1 {
+                            py = -py;
+                        }
+                        let (s, c) = (k as f32 * step).sin_cos();
+                        (cx + px * c - py * s, cy + px * s + py * c)
+                    })
+                    .collect()
+            }
         }
     }
 
-    pub(crate) fn mirrored_pixels(self, w: u32, h: u32, px: u32, py: u32) -> [(u32, u32); 4] {
-        let mx = w.saturating_sub(1).saturating_sub(px);
-        let my = h.saturating_sub(1).saturating_sub(py);
+    pub(crate) fn mirrored_pixels(
+        self,
+        w: u32,
+        h: u32,
+        segments: u8,
+        px: u32,
+        py: u32,
+    ) -> Vec<(u32, u32)> {
         match self {
-            SymmetryMode::Off => [(px, py), (px, py), (px, py), (px, py)],
-            SymmetryMode::Horizontal => [(px, py), (mx, py), (px, py), (px, py)],
-            SymmetryMode::Vertical => [(px, py), (px, my), (px, py), (px, py)],
-            SymmetryMode::Both => [(px, py), (mx, py), (px, my), (mx, my)],
+            SymmetryMode::Kaleidoscope => {
+                let n = segments.clamp(2, 16) as usize;
+                let (cx, cy) = ((w as f32 - 1.0) * 0.5, (h as f32 - 1.0) * 0.5);
+                let (dx, dy) = (px as f32 - cx, py as f32 - cy);
+                let step = std::f32::consts::TAU / n as f32;
+                (0..n)
+                    .map(|k| {
+                        let (qx, mut qy) = (dx, dy);
+                        if k % 2 == 1 {
+                            qy = -qy;
+                        }
+                        let (s, c) = (k as f32 * step).sin_cos();
+                        let fx = cx + qx * c - qy * s;
+                        let fy = cy + qx * s + qy * c;
+                        (
+                            fx.round().clamp(0.0, w as f32 - 1.0) as u32,
+                            fy.round().clamp(0.0, h as f32 - 1.0) as u32,
+                        )
+                    })
+                    .collect()
+            }
+            _ => {
+                let mx = w.saturating_sub(1).saturating_sub(px);
+                let my = h.saturating_sub(1).saturating_sub(py);
+                match self {
+                    SymmetryMode::Off => vec![(px, py)],
+                    SymmetryMode::Horizontal => vec![(px, py), (mx, py)],
+                    SymmetryMode::Vertical => vec![(px, py), (px, my)],
+                    SymmetryMode::Both => vec![(px, py), (mx, py), (px, my), (mx, my)],
+                    SymmetryMode::Kaleidoscope => unreachable!(),
+                }
+            }
         }
     }
 }
@@ -123,6 +189,8 @@ pub struct Document {
     pub selection_mask: Option<Vec<u8>>,
     /// Mirror painting mode (not all versions of the file format store it).
     pub symmetry: SymmetryMode,
+    /// Kaleidoscope reflection axes, 2..=16 (only used in that mode).
+    pub symmetry_segments: u8,
     dirty: Option<(u32, u32, u32, u32)>,
     undo: Vec<UndoEntry>,
     redo: Vec<UndoEntry>,
@@ -145,6 +213,7 @@ impl Document {
             selection: None,
             selection_mask: None,
             symmetry: SymmetryMode::Off,
+            symmetry_segments: 6,
             dirty: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -424,6 +493,61 @@ impl Document {
         }
         self.layers[index].pixels = next;
         self.mark_full_dirty();
+    }
+
+    /// Copy the active layer's sibling: insert a clone right above `index`
+    /// and make it active. Caller checkpoints for undo first.
+    pub fn duplicate_layer(&mut self, index: usize) {
+        if index >= self.layers.len() {
+            return;
+        }
+        let mut copy = self.layers[index].clone();
+        copy.name = format!("{} copy", copy.name);
+        self.layers.insert(index + 1, copy);
+        self.active = index + 1;
+        self.mark_full_dirty();
+    }
+
+    /// Composite layer `index` onto the layer below with its blend and
+    /// opacity (invisible layers contribute nothing), then remove it.
+    /// Returns false on the bottom layer or a bad index.
+    /// Caller checkpoints for undo first.
+    pub fn merge_down(&mut self, index: usize) -> bool {
+        if index == 0 || index >= self.layers.len() {
+            return false;
+        }
+        let src = self.layers[index].clone();
+        let sa_base = if src.visible { src.opacity.clamp(0.0, 1.0) } else { 0.0 };
+        let dst = &mut self.layers[index - 1];
+        for o in (0..dst.pixels.len()).step_by(4) {
+            if o + 3 >= src.pixels.len() {
+                break;
+            }
+            let sa = sa_base * src.pixels[o + 3] as f32 / 255.0;
+            let da = dst.pixels[o + 3] as f32 / 255.0;
+            let out_a = sa + da * (1.0 - sa);
+            if out_a > 0.0 {
+                for ch in 0..3 {
+                    let blended = src.blend.apply(src.pixels[o + ch] as f32, dst.pixels[o + ch] as f32);
+                    dst.pixels[o + ch] =
+                        ((blended * sa + dst.pixels[o + ch] as f32 * da * (1.0 - sa)) / out_a).round() as u8;
+                }
+                dst.pixels[o + 3] = (out_a * 255.0).round() as u8;
+            }
+        }
+        self.layers.remove(index);
+        self.active = index - 1;
+        self.mark_full_dirty();
+        true
+    }
+
+    /// Composited RGB at `(x, y)` for the eyedropper, if inside the canvas.
+    pub fn sample(&self, x: u32, y: u32) -> Option<[u8; 3]> {
+        if x >= self.w || y >= self.h {
+            return None;
+        }
+        let px = self.composite_pixel(x, y);
+        Some([px[0], px[1], px[2]])
     }
 
     /// Clear both the rectangular selection and the lasso mask.
@@ -706,12 +830,13 @@ impl Document {
 
     /// Save the full project (layers, opacity, blend, background, symmetry)
     /// to a `.procraft` file: magic + little-endian records, raw pixels.
-    /// Version 2 adds one symmetry byte after the active layer; version 1
-    /// files (magic `PCRAFT01`, no symmetry byte) still open with symmetry off.
+    /// Version 3 adds the symmetry mode, kaleidoscope segments, and keeps
+    /// everything else; version 2 files (one symmetry byte, no segments)
+    /// open with 6 segments, and version 1 files open with symmetry off.
     pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        f.write_all(b"PCRAFT02").map_err(|e| e.to_string())?;
+        f.write_all(b"PCRAFT03").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes()).map_err(|e| e.to_string())?;
         f.write_all(&self.h.to_le_bytes()).map_err(|e| e.to_string())?;
         f.write_all(&self.background).map_err(|e| e.to_string())?;
@@ -722,8 +847,10 @@ impl Document {
             SymmetryMode::Horizontal => 1u8,
             SymmetryMode::Vertical => 2u8,
             SymmetryMode::Both => 3u8,
+            SymmetryMode::Kaleidoscope => 4u8,
         };
         f.write_all(&[symmetry]).map_err(|e| e.to_string())?;
+        f.write_all(&[self.symmetry_segments.clamp(2, 16)]).map_err(|e| e.to_string())?;
         for layer in &self.layers {
             let name = layer.name.as_bytes();
             f.write_all(&(name.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
@@ -762,7 +889,8 @@ impl Document {
             Ok(head)
         };
         let magic = take(8)?.to_vec();
-        let v2 = magic == b"PCRAFT02";
+        let v3 = magic == b"PCRAFT03";
+        let v2 = v3 || magic == b"PCRAFT02";
         if magic != b"PCRAFT01" && !v2 {
             return Err("not a ProCraft project file".to_string());
         }
@@ -782,10 +910,17 @@ impl Document {
                 1 => SymmetryMode::Horizontal,
                 2 => SymmetryMode::Vertical,
                 3 => SymmetryMode::Both,
+                4 if v3 => SymmetryMode::Kaleidoscope,
                 _ => SymmetryMode::Off,
             }
         } else {
             SymmetryMode::Off
+        };
+        let symmetry_segments = if v3 {
+            let s = take(1)?[0];
+            if (2..=16).contains(&s) { s } else { 6 }
+        } else {
+            6
         };
         let mut layers = Vec::new();
         for _ in 0..count {
@@ -818,6 +953,7 @@ impl Document {
             selection: None,
             selection_mask: None,
             symmetry,
+            symmetry_segments,
             dirty: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -1076,6 +1212,112 @@ mod tests {
         assert_eq!(doc.layers[0].pixels[o], 255);
         doc.clear_selection();
         assert!(doc.selection.is_none() && doc.selection_mask.is_none());
+    }
+
+    #[test]
+    fn kaleidoscope_segments_clamp() {
+        let at = |m: SymmetryMode, seg: u8| m.mirrored_pixels(21, 21, seg, 5, 5).len();
+        assert_eq!(at(SymmetryMode::Kaleidoscope, 6), 6);
+        assert_eq!(at(SymmetryMode::Kaleidoscope, 1), 2);
+        assert_eq!(at(SymmetryMode::Kaleidoscope, 99), 16);
+        assert_eq!(at(SymmetryMode::Both, 9), 4);
+    }
+
+    #[test]
+    fn kaleidoscope_paints_n_copies() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(21, 21);
+        doc.symmetry = SymmetryMode::Kaleidoscope;
+        doc.symmetry_segments = 4;
+        let brush = Brush { size: 3.0, softness: 0.0, opacity: 1.0, ..Default::default() };
+        doc.dab(&brush, Color::rgb(255, 0, 0), 14.5, 10.5);
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 21 + x) * 4 + 3) as usize];
+        for (x, y) in [(14, 10), (10, 14), (6, 10), (10, 6)] {
+            assert!(at(&doc, x, y) > 0, "missing dab at {x},{y}");
+        }
+        assert_eq!(at(&doc, 0, 0), 0);
+    }
+
+    #[test]
+    fn roundtrip_keeps_kaleidoscope() {
+        let mut doc = Document::new(4, 3);
+        doc.symmetry = SymmetryMode::Kaleidoscope;
+        doc.symmetry_segments = 9;
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-kaleido.pcraft");
+        doc.save_project(&path).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.symmetry, SymmetryMode::Kaleidoscope);
+        assert_eq!(back.symmetry_segments, 9);
+    }
+
+    #[test]
+    fn v2_project_opens_with_default_segments() {
+        // Minimal version-2 file: one symmetry byte, no segments byte.
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v2-compat.pcraft");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT02");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[1]); // Horizontal.
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]);
+        buf.extend_from_slice(&vec![5u8; 2 * 1 * 4]);
+        std::fs::write(&path, &buf).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.symmetry, SymmetryMode::Horizontal);
+        assert_eq!(back.symmetry_segments, 6);
+    }
+
+    #[test]
+    fn merge_down_composites_and_removes() {
+        let mut doc = Document::new(2, 1);
+        doc.layers[0].pixels = vec![0, 0, 255, 255, 0, 0, 255, 255];
+        doc.add_layer("top".to_string());
+        doc.layers[1].pixels = vec![255, 0, 0, 255, 0, 0, 0, 0];
+        assert!(doc.merge_down(1));
+        assert_eq!(doc.layers.len(), 1);
+        assert_eq!(doc.active, 0);
+        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&doc.layers[0].pixels[4..8], &[0, 0, 255, 255]);
+        // Bottom layer refuses.
+        assert!(!doc.merge_down(0));
+        // Invisible top contributes nothing but still merges away.
+        doc.add_layer("ghost".to_string());
+        doc.layers[1].visible = false;
+        doc.layers[1].pixels = vec![0, 255, 0, 255, 0, 255, 0, 255];
+        assert!(doc.merge_down(1));
+        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn duplicate_copies_layer() {
+        let mut doc = Document::new(2, 1);
+        doc.layers[0].pixels = vec![7; 8];
+        doc.duplicate_layer(0);
+        assert_eq!(doc.layers.len(), 2);
+        assert_eq!(doc.active, 1);
+        assert_eq!(doc.layers[1].name, "Layer 1 copy");
+        assert_eq!(doc.layers[1].pixels, vec![7; 8]);
+        doc.duplicate_layer(9);
+        assert_eq!(doc.layers.len(), 2);
+    }
+
+    #[test]
+    fn sample_reads_composite() {
+        let mut doc = Document::new(2, 1);
+        doc.layers[0].pixels = vec![10, 20, 30, 255, 0, 0, 0, 0];
+        assert_eq!(doc.sample(0, 0), Some([10, 20, 30]));
+        assert_eq!(doc.sample(9, 9), None);
     }
 
     #[test]

@@ -4,11 +4,11 @@
 //! - iOS: `rfd` has no backend, so this crate backs the same calls with a
 //!   `UIDocumentPickerViewController` bridge. Opens use Import mode (single
 //!   tap picks; the system copies into the sandbox, so no access claims are
-//!   needed). Saves resolve into the sandboxed Documents folder and the app
+//!   needed) and resolve ASYNCHRONOUSLY: `pick_file` presents and returns
+//!   immediately, the app polls [`poll_pick`] each frame. Blocking the main
+//!   thread for the result is deliberately avoided (watchdog kills a wedged
+//!   UI). Saves resolve into the sandboxed Documents folder and the app
 //!   presents the share sheet afterwards for the real destination.
-//!
-//! The Objective-C mechanics (window fallback, delegate retention, iPad
-//! popover anchor) follow the battle-tested PdfCraft iOS bridge.
 
 use std::path::{Path, PathBuf};
 
@@ -30,13 +30,14 @@ impl FileDialog {
         self
     }
 
-    /// Open dialog. Presents the picker and blocks (pumping the runloop)
-    /// until the user picks or cancels. `None` on cancel or when there is
-    /// no window to present from.
+    /// Open dialog. Presents the picker and returns immediately (`None`);
+    /// the result arrives via [`poll_pick`]. Presenting twice while one is
+    /// pending keeps the first request.
     pub fn pick_file(self) -> Option<PathBuf> {
         #[cfg(target_os = "ios")]
         {
-            ios_bridge::pick_import(&self.filters)
+            ios_bridge::present_import(&self.filters);
+            None
         }
         #[cfg(not(target_os = "ios"))]
         {
@@ -57,6 +58,31 @@ impl FileDialog {
         {
             None
         }
+    }
+}
+
+/// Asynchronous pick state for [`poll_pick`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PickPoll {
+    /// No request in flight.
+    NoRequest,
+    /// Picker on screen, waiting for the user.
+    Waiting,
+    /// User picked a file (sandboxed, readable).
+    Picked(PathBuf),
+    /// User cancelled, presentation failed, or the wait timed out.
+    Cancelled,
+}
+
+/// Check a pending pick. Call once per frame after `pick_file`.
+pub fn poll_pick() -> PickPoll {
+    #[cfg(target_os = "ios")]
+    {
+        ios_bridge::poll()
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        PickPoll::NoRequest
     }
 }
 

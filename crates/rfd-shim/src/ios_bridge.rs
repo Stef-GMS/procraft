@@ -2,13 +2,19 @@
 //!
 //! Opens use Import mode (single tap picks; the system copies the file into
 //! the sandbox, so no security-scoped access claims are needed). The picker
-//! is presented eagerly on the calling (UI) thread; the synchronous API then
-//! pumps the main runloop until the delegate resolves or cancels.
+//! is presented eagerly on the calling (UI) thread and the result is polled
+//! via [`poll`] — the caller never blocks, so the watchdog stays happy.
 //!
 //! The delegate class carries no state: pending picks live in a global map
 //! keyed by delegate address (plain `usize`, so the map stays `Send`), and
 //! the delegate itself is retained manually with `into_raw` / `from_raw`
 //! because `setDelegate` is weak.
+//!
+//! Lint notes: `deprecated` (type-based picker init + UIWindow access work
+//! on the deployment target; replacements need newer API) and
+//! `non_snake_case` (ObjC delegate selectors must keep exact names) are
+//! allowed for this bridge module.
+#![allow(deprecated, non_snake_case)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -34,6 +40,25 @@ static PENDING: OnceLock<Mutex<HashMap<usize, SharedCell>>> = OnceLock::new();
 fn pending() -> &'static Mutex<HashMap<usize, SharedCell>> {
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+/// At most one pick in flight (a second tap while the picker is up keeps
+/// the first request instead of orphaning delegates).
+static SLOT: OnceLock<Mutex<Option<Slot>>> = OnceLock::new();
+
+fn slot() -> &'static Mutex<Option<Slot>> {
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+struct Slot {
+    shared: SharedCell,
+    /// Presentation failure reason (resolves immediately at next poll).
+    error: Option<&'static str>,
+    presented_at: std::time::Instant,
+}
+
+/// Seconds before a pick with no delegate callback resolves as cancelled
+/// (e.g. the picker landed on a hidden window).
+const PICK_TIMEOUT_SECS: u64 = 60;
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -138,7 +163,7 @@ fn find_root() -> Result<Retained<UIViewController>, &'static str> {
 }
 
 /// Present an Import-mode picker for `doc_types` (UTIs). Runs on the calling
-/// (UI) thread. Returns the shared cell the caller pumps until resolved.
+/// (UI) thread.
 fn present(doc_types: &[String], shared: &SharedCell) -> Result<(), &'static str> {
     let Some(mtm) = MainThreadMarker::new() else {
         return Err("no-main-thread");
@@ -166,31 +191,55 @@ fn new_shared() -> SharedCell {
     std::sync::Arc::new(Mutex::new(Shared { done: None }))
 }
 
-/// Pump the main runloop in short slices until the delegate resolves the
-/// pick. The delegate callback needs the runloop, so a plain thread-park
-/// here would deadlock.
-fn pump_until_done(shared: &SharedCell) {
-    use objc2_foundation::{NSDate, NSRunLoop};
-    loop {
-        if shared.lock().unwrap().done.is_some() {
-            break;
+/// Called on the UI thread. Presents the picker now and stashes the
+/// pending pick for [`poll`]. A second call while one is in flight keeps
+/// the first request. Presentation failures stash an error that resolves
+/// at the next poll instead of failing silently.
+pub(super) fn present_import(filters: &[String]) {
+    let mut slot = slot().lock().unwrap();
+    if slot.is_some() {
+        return;
+    }
+    let shared = new_shared();
+    match present(&utis_for_filters(filters), &shared) {
+        Ok(()) => {
+            *slot = Some(Slot { shared, error: None, presented_at: std::time::Instant::now() });
         }
-        let runloop = NSRunLoop::currentRunLoop();
-        let date = NSDate::dateWithTimeIntervalSinceNow(0.05);
-        runloop.runUntilDate(&date);
+        Err(reason) => {
+            *slot = Some(Slot { shared, error: Some(reason), presented_at: std::time::Instant::now() });
+        }
     }
 }
 
-/// Synchronous Import-mode pick. Presents now (UI thread) and pumps until
-/// the user picks or cancels.
-pub(super) fn pick_import(filters: &[String]) -> Option<PathBuf> {
-    let shared = new_shared();
-    if present(&utis_for_filters(filters), &shared).is_err() {
-        return None;
+/// Poll a pending pick: waiting, picked, or cancelled (user cancel,
+/// presentation failure, or 60s without a delegate callback).
+pub(super) fn poll() -> super::PickPoll {
+    let mut slot = slot().lock().unwrap();
+    let Some(inner) = slot.as_ref() else {
+        return super::PickPoll::NoRequest;
+    };
+    if inner.error.is_some() {
+        *slot = None;
+        return super::PickPoll::Cancelled;
     }
-    pump_until_done(&shared);
-    let mut s = shared.lock().unwrap();
-    s.done.take().and_then(|mut v| v.pop())
+    let done = inner.shared.lock().unwrap().done.take();
+    match done {
+        Some(mut paths) => {
+            *slot = None;
+            match paths.pop() {
+                Some(p) => super::PickPoll::Picked(p),
+                None => super::PickPoll::Cancelled,
+            }
+        }
+        None => {
+            if inner.presented_at.elapsed().as_secs() >= PICK_TIMEOUT_SECS {
+                *slot = None;
+                super::PickPoll::Cancelled
+            } else {
+                super::PickPoll::Waiting
+            }
+        }
+    }
 }
 
 /// App sandbox Documents directory (visible in Files with

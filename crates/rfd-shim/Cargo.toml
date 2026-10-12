@@ -13,8 +13,6 @@ objc2-foundation = { version = "0.3", features = [
     "NSURL",
     "NSObject",
     "NSObjCRuntime",
-    "NSRunLoop",
-    "NSDate",
 ] }
 objc2-ui-kit = { version = "0.3", features = [
     "UIDocumentPickerViewController",

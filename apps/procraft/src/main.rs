@@ -71,6 +71,16 @@ enum Theme {
     Paper,
 }
 
+/// iOS asynchronous open: what to load once the picker resolves.
+#[cfg(target_os = "ios")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingOpen {
+    Image,
+    Project,
+    Psd,
+    Brushes,
+}
+
 impl Theme {
     fn visuals(self) -> egui::Visuals {
         match self {
@@ -135,6 +145,8 @@ struct ProCraftApp {
     show_tools: bool,
     show_layers: bool,
     narrow_setup_done: bool,
+    #[cfg(target_os = "ios")]
+    pending_open: Option<PendingOpen>,
     preview_theme: Option<Theme>,
     custom_brushes: Vec<BrushPreset>,
     new_brush_name: String,
@@ -195,6 +207,8 @@ impl ProCraftApp {
             show_tools: true,
             show_layers: true,
             narrow_setup_done: false,
+            #[cfg(target_os = "ios")]
+            pending_open: None,
             preview_theme: None,
             custom_brushes: Vec::new(),
             new_brush_name: String::new(),
@@ -259,6 +273,49 @@ impl ProCraftApp {
         self.doc.mark_full_dirty();
     }
 
+    /// iOS: load a file the document picker resolved. Mirrors the desktop
+    /// open arms (kept inline there so desktop behavior never changes).
+    #[cfg(target_os = "ios")]
+    fn open_picked(&mut self, kind: PendingOpen, path: std::path::PathBuf) {
+        match kind {
+            PendingOpen::Image => match self.doc.load_background(&path) {
+                Ok(()) => {
+                    self.texture = None;
+                    self.lasso_points.clear();
+                    self.lasso_poly.clear();
+                    self.status = format!("Opened {}", path.display());
+                }
+                Err(e) => self.status = format!("Open failed: {e}"),
+            },
+            PendingOpen::Project => match Document::open_project(&path) {
+                Ok(doc) => {
+                    self.doc = doc;
+                    self.texture = None;
+                    self.lasso_points.clear();
+                    self.lasso_poly.clear();
+                    self.status = format!("Project opened {}", path.display());
+                }
+                Err(e) => self.status = format!("Project open failed: {e}"),
+            },
+            PendingOpen::Psd => match open_psd(&path) {
+                Ok(doc) => {
+                    self.doc = doc;
+                    self.texture = None;
+                    self.lasso_points.clear();
+                    self.lasso_poly.clear();
+                    self.status = format!("PSD opened {} (masks do not import)", path.display());
+                }
+                Err(e) => self.status = format!("PSD open failed: {e}"),
+            },
+            PendingOpen::Brushes => {
+                match load_brush_file(&path) {
+                    Ok(libs) => self.status = self.absorb_brushes(libs, &path),
+                    Err(e) => self.status = format!("Brush import failed: {e}"),
+                }
+            }
+        }
+    }
+
     /// Honest brush previews: each preset paints a wavy sample stroke through
     /// the real engine into a thumbnail texture (dotted chalk reads dotted).
     /// Ink follows the theme so cards stay crisp on dark and paper alike.
@@ -300,7 +357,24 @@ impl ProCraftApp {
     fn preview_count(&self) -> usize {
         procraft_engine::presets().len() + self.custom_brushes.len()
     }
+}
 
+/// Dispatch a brush file by extension into presets (shared by the desktop
+/// Import arm and the iOS picker resolve path).
+fn load_brush_file(path: &std::path::Path) -> Result<Vec<BrushPreset>, String> {
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+    if ext == "pcbrush" || ext == "json" {
+        open_brush_library(path).map(|libs| {
+            libs.into_iter().map(|p| BrushPreset { name: p.name, brush: p.brush }).collect()
+        })
+    } else {
+        import_brush_file(path).map(|libs| {
+            libs.into_iter().map(|b| BrushPreset { name: b.name, brush: b.brush }).collect()
+        })
+    }
+}
+
+impl ProCraftApp {
     /// Unique display name for a new custom brush: "Foo", "Foo (2)", ...
     fn unique_brush_name(&self, want: &str) -> String {
         let want = want.trim();
@@ -314,6 +388,21 @@ impl ProCraftApp {
             }
         }
         want.to_string()
+    }
+
+    /// Append imported presets with dedup names (shared by desktop Import
+    /// and the iOS picker resolve path). Returns the status message.
+    fn absorb_brushes(&mut self, libs: Vec<BrushPreset>, path: &std::path::Path) -> String {
+        let mut added = 0;
+        for p in libs {
+            if self.custom_brushes.len() >= MAX_LIBRARY_BRUSHES {
+                break;
+            }
+            let name = self.unique_brush_name(&p.name);
+            self.custom_brushes.push(BrushPreset { name, brush: p.brush });
+            added += 1;
+        }
+        format!("Imported {added} brushes from {}.", path.display())
     }
 }
 
@@ -414,11 +503,29 @@ impl eframe::App for ProCraftApp {
             }
         }
 
+        // iOS asynchronous opens: the picker was presented at tap time;
+        // each frame checks whether it resolved.
+        #[cfg(target_os = "ios")]
+        if let Some(kind) = self.pending_open.take() {
+            match rfd::poll_pick() {
+                rfd::PickPoll::NoRequest | rfd::PickPoll::Waiting => {
+                    self.pending_open = Some(kind);
+                }
+                rfd::PickPoll::Picked(path) => self.open_picked(kind, path),
+                rfd::PickPoll::Cancelled => {
+                    self.status = "Pick cancelled.".to_string();
+                }
+            }
+        }
+
         egui::Panel::top("menu").show(ui, |ui| {
             // Wrapped rows: one row on desktop, two on narrow screens.
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Save PNG").clicked() {
                     if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).save_file() {
+                        // The dialog may return an extensionless path (always
+                        // on iOS); the encoder needs the suffix to pick PNG.
+                        let path = ensure_extension(path, "png");
                         match self.doc.save_png(&path) {
                             Ok(()) => {
                                 self.status = format!("Saved {}", path.display());
@@ -430,6 +537,7 @@ impl eframe::App for ProCraftApp {
                     }
                 }
                 if ui.button("Open image").clicked() {
+                    #[cfg(not(target_os = "ios"))]
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"])
                         .pick_file()
@@ -443,6 +551,15 @@ impl eframe::App for ProCraftApp {
                             }
                             Err(e) => self.status = format!("Open failed: {e}"),
                         }
+                    }
+                    // iOS: presents the picker; open_picked() loads on resolve.
+                    #[cfg(target_os = "ios")]
+                    {
+                        let _ = rfd::FileDialog::new()
+                            .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"])
+                            .pick_file();
+                        self.pending_open = Some(PendingOpen::Image);
+                        self.status = "Pick an image…".to_string();
                     }
                 }
                 if ui.button("Save project").clicked() {
@@ -462,6 +579,7 @@ impl eframe::App for ProCraftApp {
                     }
                 }
                 if ui.button("Open project").clicked() {
+                    #[cfg(not(target_os = "ios"))]
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("ProCraft project", &["procraft"])
                         .pick_file()
@@ -476,6 +594,14 @@ impl eframe::App for ProCraftApp {
                             }
                             Err(e) => self.status = format!("Project open failed: {e}"),
                         }
+                    }
+                    #[cfg(target_os = "ios")]
+                    {
+                        let _ = rfd::FileDialog::new()
+                            .add_filter("ProCraft project", &["procraft"])
+                            .pick_file();
+                        self.pending_open = Some(PendingOpen::Project);
+                        self.status = "Pick a project…".to_string();
                     }
                 }
                 if ui.button("PSD export").clicked() {
@@ -495,6 +621,7 @@ impl eframe::App for ProCraftApp {
                     }
                 }
                 if ui.button("Open PSD").clicked() {
+                    #[cfg(not(target_os = "ios"))]
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Photoshop document", &["psd"])
                         .pick_file()
@@ -509,6 +636,14 @@ impl eframe::App for ProCraftApp {
                             }
                             Err(e) => self.status = format!("PSD open failed: {e}"),
                         }
+                    }
+                    #[cfg(target_os = "ios")]
+                    {
+                        let _ = rfd::FileDialog::new()
+                            .add_filter("Photoshop document", &["psd"])
+                            .pick_file();
+                        self.pending_open = Some(PendingOpen::Psd);
+                        self.status = "Pick a PSD…".to_string();
                     }
                 }
                 if ui.button("Clear layer").clicked() {
@@ -651,6 +786,7 @@ impl eframe::App for ProCraftApp {
             });
             ui.horizontal(|ui| {
                 if ui.button("Import").clicked() {
+                    #[cfg(not(target_os = "ios"))]
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Brushes", &[
                             "pcbrush", "json", "abr", "brush", "brushset",
@@ -658,31 +794,21 @@ impl eframe::App for ProCraftApp {
                         ])
                         .pick_file()
                     {
-                        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
-                        let imported: Result<Vec<BrushPreset>, String> = if ext == "pcbrush" || ext == "json" {
-                            open_brush_library(&path).map(|libs| {
-                                libs.into_iter().map(|p| BrushPreset { name: p.name, brush: p.brush }).collect()
-                            })
-                        } else {
-                            import_brush_file(&path).map(|libs| {
-                                libs.into_iter().map(|b| BrushPreset { name: b.name, brush: b.brush }).collect()
-                            })
-                        };
-                        match imported {
-                            Ok(mut libs) => {
-                                let mut added = 0;
-                                for p in libs.drain(..) {
-                                    if self.custom_brushes.len() >= MAX_LIBRARY_BRUSHES {
-                                        break;
-                                    }
-                                    let name = self.unique_brush_name(&p.name);
-                                    self.custom_brushes.push(BrushPreset { name, brush: p.brush });
-                                    added += 1;
-                                }
-                                self.status = format!("Imported {added} brushes from {}.", path.display());
-                            }
+                        match load_brush_file(&path) {
+                            Ok(libs) => self.status = self.absorb_brushes(libs, &path),
                             Err(e) => self.status = format!("Brush import failed: {e}"),
                         }
+                    }
+                    #[cfg(target_os = "ios")]
+                    {
+                        let _ = rfd::FileDialog::new()
+                            .add_filter("Brushes", &[
+                                "pcbrush", "json", "abr", "brush", "brushset",
+                                "kpp", "bundle", "gbr", "png", "jpg", "jpeg", "webp", "bmp",
+                            ])
+                            .pick_file();
+                        self.pending_open = Some(PendingOpen::Brushes);
+                        self.status = "Pick brushes…".to_string();
                     }
                 }
                 if ui.button("Export set").clicked() {

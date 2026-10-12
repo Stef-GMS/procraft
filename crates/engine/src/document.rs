@@ -125,6 +125,7 @@ pub struct Document {
     pub symmetry: SymmetryMode,
     dirty: Option<(u32, u32, u32, u32)>,
     undo: Vec<UndoEntry>,
+    redo: Vec<UndoEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +147,7 @@ impl Document {
             symmetry: SymmetryMode::Off,
             dirty: None,
             undo: Vec::new(),
+            redo: Vec::new(),
         }
     }
 
@@ -200,23 +202,57 @@ impl Document {
     }
 
     /// Snapshot the active layer for one undo step (call when a stroke starts).
+    /// A new checkpoint discards the redo history.
     pub fn checkpoint(&mut self) {
-        if let Some(layer) = self.layers.get(self.active) {
+        if let Some(entry) = self.snapshot() {
             if self.undo.len() >= 32 {
                 self.undo.remove(0);
             }
-            self.undo.push(UndoEntry { layer: self.active, pixels: layer.pixels.clone() });
+            self.undo.push(entry);
+            self.redo.clear();
         }
+    }
+
+    /// Copy of the active layer for the history stacks, if there is one.
+    fn snapshot(&self) -> Option<UndoEntry> {
+        self.layers
+            .get(self.active)
+            .map(|layer| UndoEntry { layer: self.active, pixels: layer.pixels.clone() })
     }
 
     /// Restore the most recent snapshot. Returns false when history is empty.
     pub fn undo(&mut self) -> bool {
         if let Some(entry) = self.undo.pop() {
-            if let Some(layer) = self.layers.get_mut(entry.layer) {
-                layer.pixels = entry.pixels;
-                self.active = entry.layer.min(self.layers.len().saturating_sub(1));
-                self.mark_full_dirty();
-                return true;
+            if let Some(cur) = self.snapshot() {
+                if self.redo.len() >= 32 {
+                    self.redo.remove(0);
+                }
+                self.redo.push(cur);
+                if let Some(layer) = self.layers.get_mut(entry.layer) {
+                    layer.pixels = entry.pixels;
+                    self.active = entry.layer.min(self.layers.len().saturating_sub(1));
+                    self.mark_full_dirty();
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Re-apply the most recently undone snapshot. Returns false when empty.
+    pub fn redo(&mut self) -> bool {
+        if let Some(entry) = self.redo.pop() {
+            if let Some(cur) = self.snapshot() {
+                if self.undo.len() >= 32 {
+                    self.undo.remove(0);
+                }
+                self.undo.push(cur);
+                if let Some(layer) = self.layers.get_mut(entry.layer) {
+                    layer.pixels = entry.pixels;
+                    self.active = entry.layer.min(self.layers.len().saturating_sub(1));
+                    self.mark_full_dirty();
+                    return true;
+                }
             }
         }
         false
@@ -664,6 +700,7 @@ impl Document {
         self.selection = None;
         self.selection_mask = None;
         self.undo.clear();
+        self.redo.clear();
         Ok(())
     }
 
@@ -783,6 +820,7 @@ impl Document {
             symmetry,
             dirty: None,
             undo: Vec::new(),
+            redo: Vec::new(),
         })
     }
 }
@@ -818,6 +856,33 @@ mod tests {
         assert!(doc.undo());
         assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
         assert!(!doc.undo());
+    }
+
+    #[test]
+    fn redo_restores_undone_work() {
+        let mut doc = Document::new(1, 1);
+        assert!(!doc.redo());
+        doc.checkpoint();
+        doc.layers[0].pixels = vec![9, 9, 9, 9];
+        assert!(doc.undo());
+        assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
+        assert!(doc.redo());
+        assert_eq!(doc.layers[0].pixels, vec![9, 9, 9, 9]);
+        assert!(!doc.redo());
+        // Undo still works after a redo.
+        assert!(doc.undo());
+        assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn new_stroke_clears_redo() {
+        let mut doc = Document::new(1, 1);
+        doc.checkpoint();
+        doc.layers[0].pixels = vec![1, 1, 1, 1];
+        assert!(doc.undo());
+        doc.checkpoint();
+        doc.layers[0].pixels = vec![2, 2, 2, 2];
+        assert!(!doc.redo());
     }
 
     #[test]

@@ -70,7 +70,7 @@ fn page_presets() -> Vec<(&'static str, [u8; 3])> {    vec![
         ("Black", [0, 0, 0]),
         ("Gray", [128, 128, 128]),
         ("Warm", [240, 230, 210]),
-        ("Blue", [30, 40, 60]),
+        ("Blue", [52, 120, 200]),
     ]
 }
 
@@ -154,7 +154,7 @@ impl ProCraftApp {
             shape_kind: ShapeKind::Rect,
             shape_fill: false,
             zoom: 1.0,
-            status: "Drag on the canvas to paint. Ctrl+Z undoes, Esc clears selection.".to_string(),
+            status: "Drag on the canvas to paint. Ctrl+Z undoes, Ctrl+Y redoes, Esc clears selection.".to_string(),
         }
     }
 
@@ -246,10 +246,20 @@ impl eframe::App for ProCraftApp {
             ui.ctx().set_visuals(self.theme.visuals());
             self.theme_applied = Some(self.theme);
         }
-        // Ctrl+Z undo, Esc clears selection.
+        // Ctrl+Z undo, Ctrl+Y / Ctrl+Shift+Z redo, Esc clears selection.
         if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z)) && self.doc.undo()
         {
             self.status = "Undone.".to_string();
+        }
+        if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Y)) && self.doc.redo()
+        {
+            self.status = "Redone.".to_string();
+        }
+        if ui.ctx().input_mut(|i| {
+            i.consume_key(egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT), egui::Key::Z)
+        }) && self.doc.redo()
+        {
+            self.status = "Redone.".to_string();
         }
         if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             self.doc.clear_selection();
@@ -336,6 +346,9 @@ impl eframe::App for ProCraftApp {
                 if ui.button("Undo").clicked() && self.doc.undo() {
                     self.status = "Undone.".to_string();
                 }
+                if ui.button("Redo").clicked() && self.doc.redo() {
+                    self.status = "Redone.".to_string();
+                }
                 ui.separator();
                 ui.label("Theme:");
                 ui.radio_value(&mut self.theme, Theme::Dark, "Dark");
@@ -382,73 +395,6 @@ impl eframe::App for ProCraftApp {
                 self.doc.clear_selection();
                 self.lasso_poly.clear();
                 self.status = "Selection cleared.".to_string();
-            }
-            ui.separator();
-            ui.heading("Transform layer");
-            ui.horizontal(|ui| {
-                if ui.button("Scale +").clicked() {
-                    self.doc.checkpoint();
-                    self.doc.affine_layer(self.doc.active, 1.25, 0.0);
-                }
-                if ui.button("Scale −").clicked() {
-                    self.doc.checkpoint();
-                    self.doc.affine_layer(self.doc.active, 1.0 / 1.25, 0.0);
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("⟲ −15°").clicked() {
-                    self.doc.checkpoint();
-                    self.doc.affine_layer(self.doc.active, 1.0, -15.0);
-                }
-                if ui.button("⟳ +15°").clicked() {
-                    self.doc.checkpoint();
-                    self.doc.affine_layer(self.doc.active, 1.0, 15.0);
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("⇄ Flip H").clicked() {
-                    self.doc.checkpoint();
-                    self.doc.flip_layer_horizontal(self.doc.active);
-                    self.status = "Layer flipped horizontally.".to_string();
-                }
-                if ui.button("⇅ Flip V").clicked() {
-                    self.doc.checkpoint();
-                    self.doc.flip_layer_vertical(self.doc.active);
-                    self.status = "Layer flipped vertically.".to_string();
-                }
-            });
-            ui.separator();
-            ui.heading("Symmetry");
-            for m in SymmetryMode::ALL {
-                if ui.radio_value(&mut self.doc.symmetry, m, m.name()).changed() {
-                    self.status = format!("Symmetry: {}.", m.name());
-                }
-            }
-            ui.separator();
-            ui.heading("Filters");
-            ui.label("Active layer. Selections mask filters.");
-            ui.add(egui::Slider::new(&mut self.filt_brightness, -100..=100).text("Brightness"));
-            ui.add(egui::Slider::new(&mut self.filt_contrast, 0.0..=200.0).text("Contrast %"));
-            if ui.button("Apply tone").clicked() {
-                self.doc.checkpoint();
-                self.doc.adjust_tone(
-                    self.doc.active,
-                    (self.filt_brightness as f32 * 2.55).round() as i32,
-                    self.filt_contrast / 100.0,
-                );
-                self.status = "Tone applied.".to_string();
-            }
-            ui.add(egui::Slider::new(&mut self.filt_blur, 0..=25).text("Blur"));
-            if ui.button("Apply blur").clicked() {
-                self.doc.checkpoint();
-                self.doc.blur_layer(self.doc.active, self.filt_blur.max(0) as u32);
-                self.status = "Blur applied.".to_string();
-            }
-            ui.add(egui::Slider::new(&mut self.filt_sharpen, 0.0..=200.0).text("Sharpen %"));
-            if ui.button("Apply sharpen").clicked() {
-                self.doc.checkpoint();
-                self.doc.sharpen_layer(self.doc.active, self.filt_sharpen / 100.0);
-                self.status = "Sharpen applied.".to_string();
             }
             ui.separator();
             ui.heading("Brushes");
@@ -511,7 +457,10 @@ impl eframe::App for ProCraftApp {
             });
         });
 
-        egui::Panel::right("layers").show(ui, |ui| {
+        // Fresh id (not "layers"): eframe persists panel widths to disk, and the
+        // old narrow width would otherwise override `default_size` forever.
+        egui::Panel::right("layers-wide").default_size(280.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Layers");
             if ui.button("Add layer").clicked() {
                 self.doc.add_layer(format!("Layer {}", self.doc.layers.len() + 1));
@@ -587,6 +536,74 @@ impl eframe::App for ProCraftApp {
                 self.doc.layers.len(),
                 self.doc.layers.get(self.doc.active).map(|l| l.name.as_str()).unwrap_or("-")
             ));
+            ui.separator();
+            ui.heading("Transform layer");
+            ui.horizontal(|ui| {
+                if ui.button("Scale +").clicked() {
+                    self.doc.checkpoint();
+                    self.doc.affine_layer(self.doc.active, 1.25, 0.0);
+                }
+                if ui.button("Scale −").clicked() {
+                    self.doc.checkpoint();
+                    self.doc.affine_layer(self.doc.active, 1.0 / 1.25, 0.0);
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("⟲ −15°").clicked() {
+                    self.doc.checkpoint();
+                    self.doc.affine_layer(self.doc.active, 1.0, -15.0);
+                }
+                if ui.button("⟳ +15°").clicked() {
+                    self.doc.checkpoint();
+                    self.doc.affine_layer(self.doc.active, 1.0, 15.0);
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("⇄ Flip H").clicked() {
+                    self.doc.checkpoint();
+                    self.doc.flip_layer_horizontal(self.doc.active);
+                    self.status = "Layer flipped horizontally.".to_string();
+                }
+                if ui.button("⇅ Flip V").clicked() {
+                    self.doc.checkpoint();
+                    self.doc.flip_layer_vertical(self.doc.active);
+                    self.status = "Layer flipped vertically.".to_string();
+                }
+            });
+            ui.separator();
+            ui.heading("Symmetry");
+            for m in SymmetryMode::ALL {
+                if ui.radio_value(&mut self.doc.symmetry, m, m.name()).changed() {
+                    self.status = format!("Symmetry: {}.", m.name());
+                }
+            }
+            ui.separator();
+            ui.heading("Filters");
+            ui.label("Active layer. Selections mask filters.");
+            ui.add(egui::Slider::new(&mut self.filt_brightness, -100..=100).text("Brightness"));
+            ui.add(egui::Slider::new(&mut self.filt_contrast, 0.0..=200.0).text("Contrast %"));
+            if ui.button("Apply tone").clicked() {
+                self.doc.checkpoint();
+                self.doc.adjust_tone(
+                    self.doc.active,
+                    (self.filt_brightness as f32 * 2.55).round() as i32,
+                    self.filt_contrast / 100.0,
+                );
+                self.status = "Tone applied.".to_string();
+            }
+            ui.add(egui::Slider::new(&mut self.filt_blur, 0..=25).text("Blur"));
+            if ui.button("Apply blur").clicked() {
+                self.doc.checkpoint();
+                self.doc.blur_layer(self.doc.active, self.filt_blur.max(0) as u32);
+                self.status = "Blur applied.".to_string();
+            }
+            ui.add(egui::Slider::new(&mut self.filt_sharpen, 0.0..=200.0).text("Sharpen %"));
+            if ui.button("Apply sharpen").clicked() {
+                self.doc.checkpoint();
+                self.doc.sharpen_layer(self.doc.active, self.filt_sharpen / 100.0);
+                self.status = "Sharpen applied.".to_string();
+            }
+        });
         });
 
         egui::Panel::bottom("status").show(ui, |ui| {

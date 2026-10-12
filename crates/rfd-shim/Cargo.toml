@@ -1,0 +1,6 @@
+[package]
+name = "rfd-shim"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "iOS file-dialog shim: ProCraft's rfd call shape, every dialog declined (native pickers are a later milestone)"

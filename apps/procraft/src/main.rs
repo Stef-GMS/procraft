@@ -2,6 +2,9 @@
 //! plus all earlier features. Original code.
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
+// iOS has no rfd backend: same call shape, every dialog declined.
+#[cfg(target_os = "ios")]
+use rfd_shim as rfd;
 use procraft_engine::{
     BlendMode, Brush, BrushPreset, Color, Document, PaintTarget, SymmetryMode, MAX_LIBRARY_BRUSHES,
     export_tip_png, import_brush_file, open_brush_library, open_psd, save_brush_library, save_psd,
@@ -1321,7 +1324,7 @@ impl eframe::App for ProCraftApp {
     }
 }
 
-/// Window icon: original peacock-feather art drawn in VectorCraft
+/// Window icon: original layer-stack mark drawn in VectorCraft
 /// (see `assets/icon-generator.py`, rendered to `assets/icon-48.png`).
 fn app_icon() -> Option<egui::IconData> {
     let bytes = include_bytes!("../../../assets/icon-48.png");

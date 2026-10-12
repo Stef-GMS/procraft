@@ -1,0 +1,107 @@
+name: ios-ipa
+on:
+  workflow_dispatch: {}
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+      - name: Check iOS target compiles
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: '17.0'
+        run: cargo check -p procraft --target aarch64-apple-ios
+      - name: Build procraft for iOS (debug)
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: '17.0'
+          RUSTFLAGS: -C link-arg=-miphoneos-version-min=17.0
+        run: cargo build -p procraft --target aarch64-apple-ios
+      - name: Package unsigned IPA
+        run: |
+          set -euxo pipefail
+          BIN=target/aarch64-apple-ios/debug/procraft
+          test -f "$BIN"
+          file "$BIN"
+          rm -rf ipa-staging ProCraft-ios-v1.ipa
+          mkdir -p ipa-staging/Payload/ProCraft.app
+          cp "$BIN" ipa-staging/Payload/ProCraft.app/ProCraft
+          SRC=assets/icon-1024.png
+          APP=ipa-staging/Payload/ProCraft.app
+          sips -z 120 120 "$SRC" --out "$APP/AppIcon60x60@2x.png"
+          sips -z 180 180 "$SRC" --out "$APP/AppIcon60x60@3x.png"
+          sips -z 152 152 "$SRC" --out "$APP/AppIcon76x76@2x~ipad.png"
+          sips -z 167 167 "$SRC" --out "$APP/AppIcon83.5x83.5@2x~ipad.png"
+          cp "$SRC" "$APP/AppIcon-1024.png"
+          VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          cat > ipa-staging/Payload/ProCraft.app/Info.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleIdentifier</key>
+            <string>com.surfrpt1.procraft</string>
+            <key>CFBundleExecutable</key>
+            <string>ProCraft</string>
+            <key>CFBundleName</key>
+            <string>ProCraft</string>
+            <key>CFBundleDisplayName</key>
+            <string>ProCraft</string>
+            <key>CFBundleVersion</key>
+            <string>__VER__</string>
+            <key>CFBundleShortVersionString</key>
+            <string>__VER__</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>MinimumOSVersion</key>
+            <string>17.0</string>
+            <key>UIDeviceFamily</key>
+            <array>
+              <integer>1</integer>
+              <integer>2</integer>
+            </array>
+            <key>UIRequiredDeviceCapabilities</key>
+            <array>
+              <string>arm64</string>
+              <string>metal</string>
+            </array>
+            <key>UISupportedInterfaceOrientations</key>
+            <array>
+              <string>UIInterfaceOrientationPortrait</string>
+              <string>UIInterfaceOrientationLandscapeLeft</string>
+              <string>UIInterfaceOrientationLandscapeRight</string>
+              <string>UIInterfaceOrientationPortraitUpsideDown</string>
+            </array>
+            <key>UILaunchScreen</key>
+            <dict/>
+            <key>UIFileSharingEnabled</key>
+            <true/>
+            <key>LSSupportsOpeningDocumentsInPlace</key>
+            <true/>
+            <key>CFBundleIcons</key>
+            <dict>
+              <key>CFBundlePrimaryIcon</key>
+              <dict>
+                <key>CFBundleIconFiles</key>
+                <array>
+                  <string>AppIcon60x60</string>
+                  <string>AppIcon76x76</string>
+                  <string>AppIcon83.5x83.5</string>
+                </array>
+              </dict>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+          sed -i '' "s/__VER__/$VER/g" ipa-staging/Payload/ProCraft.app/Info.plist
+          grep -A1 CFBundleShortVersionString ipa-staging/Payload/ProCraft.app/Info.plist
+          codesign --force --sign - ipa-staging/Payload/ProCraft.app/ProCraft || true
+          (cd ipa-staging && zip -qry ../ProCraft-ios-v1.ipa Payload)
+          ls -la ProCraft-ios-v1.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ProCraft-ios-v1.ipa
+          path: ProCraft-ios-v1.ipa

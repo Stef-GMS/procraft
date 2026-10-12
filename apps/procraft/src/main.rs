@@ -4,7 +4,7 @@
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
 use procraft_engine::{
     BlendMode, Brush, BrushPreset, Color, Document, PaintTarget, SymmetryMode, MAX_LIBRARY_BRUSHES,
-    export_tip_png, import_brush_file, open_brush_library, save_brush_library,
+    export_tip_png, import_brush_file, open_brush_library, open_psd, save_brush_library, save_psd,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -419,6 +419,35 @@ impl eframe::App for ProCraftApp {
                                 self.status = format!("Project opened {}", path.display());
                             }
                             Err(e) => self.status = format!("Project open failed: {e}"),
+                        }
+                    }
+                }
+                if ui.button("PSD export").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Photoshop document", &["psd"])
+                        .save_file()
+                    {
+                        let path = ensure_extension(path, "psd");
+                        match save_psd(&path, &self.doc) {
+                            Ok(()) => self.status = format!("PSD saved {} (masks do not round-trip)", path.display()),
+                            Err(e) => self.status = format!("PSD save failed: {e}"),
+                        }
+                    }
+                }
+                if ui.button("Open PSD").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Photoshop document", &["psd"])
+                        .pick_file()
+                    {
+                        match open_psd(&path) {
+                            Ok(doc) => {
+                                self.doc = doc;
+                                self.texture = None;
+                                self.lasso_points.clear();
+                                self.lasso_poly.clear();
+                                self.status = format!("PSD opened {} (masks do not import)", path.display());
+                            }
+                            Err(e) => self.status = format!("PSD open failed: {e}"),
                         }
                     }
                 }

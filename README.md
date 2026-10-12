@@ -9,7 +9,7 @@ original.
 > Interactive. ProCraft is an independent project with its own name, branding
 > and code, and is not affiliated with or endorsed by any other vendor.
 
-## Status: milestone 11
+## Status: milestone 12
 
 - [x] Layered document model (add / hide / reorder / opacity / blend)
 - [x] Soft-round brush + eraser with spacing, dynamics and undo
@@ -23,6 +23,7 @@ original.
 - [x] Layer filters: brightness/contrast, box blur, unsharp sharpen (selection-masked)
 - [x] Kaleidoscope symmetry (2-16 segments), layer rename/duplicate/merge, eyedropper, honest brush previews
 - [x] Non-destructive layers: reveal masks (paint luminance, eraser reveals, mask viewer), clipping masks, 10 blend modes (masks travel with transforms, merge bakes them)
+- [x] Layered PSD interchange: export keeps names/opacity/blends/clipping/transparency/masks for Photoshop/Procreate/Krita/GIMP; import restores structure (masks and exotic blends documented gaps)
 - [x] Compressed project files (PCRAFT04 zlib per layer; verified 12MB → 107KB on a 3-layer painting, corrupt payloads rejected)
 - [x] Brush library: named custom brushes with honest clickable previews + active highlight, `.pcbrush` set import/export (validated, max 64)
 - [x] Pro brush interop: import Photoshop `.abr` (v6-v10 sampled tips + names/spacing via UUID linkage, verified on real Photoshop 2026 files), Procreate `.brush`/`.brushset` (Shape tips), Krita `.kpp`/`.bundle` (verified on Krita repo presets: MaskGenerator diameter, Opacity x Flow, embedded tips), GIMP `.gbr`, tip images; export grayscale tip PNGs for other software

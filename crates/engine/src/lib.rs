@@ -4,7 +4,9 @@
 mod brush;
 mod document;
 mod probrush;
+mod psd;
 
 pub use brush::{open_brush_library, presets, save_brush_library, Brush, BrushPreset, BrushTip, Color, Stroke, MAX_LIBRARY_BRUSHES, MAX_TIP_SIDE};
 pub use document::{BlendMode, Document, Layer, PaintTarget, SymmetryMode};
 pub use probrush::{export_tip_png, import_brush_file, ImportedBrush};
+pub use psd::{open_psd, save_psd};

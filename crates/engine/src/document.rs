@@ -302,6 +302,26 @@ impl Document {
         }
     }
 
+    /// Assemble a document from imported layers (white page, given active
+    /// layer, no selection or history). For format importers in this crate.
+    pub(crate) fn from_layers(w: u32, h: u32, layers: Vec<Layer>, active: usize) -> Self {
+        let active = active.min(layers.len().saturating_sub(1).max(0));
+        Self {
+            w,
+            h,
+            layers,
+            active,
+            background: [255, 255, 255, 255],
+            selection: None,
+            selection_mask: None,
+            symmetry: SymmetryMode::Off,
+            symmetry_segments: 6,
+            paint_target: PaintTarget::Color,
+            dirty: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
+    }
     /// Take and clear the dirty region (inclusive bounds) for partial
     /// texture uploads. `None` means nothing changed: skip the upload.
     pub fn take_dirty(&mut self) -> Option<(u32, u32, u32, u32)> {

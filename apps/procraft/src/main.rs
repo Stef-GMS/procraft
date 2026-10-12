@@ -9,9 +9,32 @@ use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptio
 #[cfg(target_os = "ios")]
 use rfd_shim as rfd;
 use procraft_engine::{
-    BlendMode, Brush, BrushPreset, Color, Document, PaintTarget, ShapePoly, SymmetryMode, MAX_LIBRARY_BRUSHES,
-    export_tip_png, import_brush_file, open_brush_library, open_psd, save_brush_library, save_psd,
+    BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides, PaintTarget, Palette,
+    ShapePoly, SymmetryMode, MAX_LIBRARY_BRUSHES, MAX_PALETTE_COLORS, analogous, complementary,
+    export_tip_png, import_brush_file, import_gpl_file, open_brush_library, open_palette, open_psd,
+    save_brush_library, save_palette, save_psd, starter_palette, triadic,
 };
+
+/// Latest Apple Pencil / touch pressure (0.0..=1.0) seen in this frame's
+/// input events, if the backend forwarded any. egui 0.36 exposes pressure
+/// only on `Event::Touch.force` — desktop mice always yield `None`, and
+/// tilt is not exposed at all (documented M14 limitation).
+fn latest_touch_force(ctx: &egui::Context) -> Option<f32> {
+    ctx.input(|i| {
+        let mut force = None;
+        for e in &i.events {
+            if let egui::Event::Touch { force: f, phase, .. } = e {
+                if *phase == egui::TouchPhase::End || *phase == egui::TouchPhase::Cancel {
+                    continue;
+                }
+                if let Some(v) = f {
+                    force = Some(v.clamp(0.0, 1.0));
+                }
+            }
+        }
+        force
+    })
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
@@ -82,6 +105,7 @@ enum PendingOpen {
     Project,
     Psd,
     Brushes,
+    Palette,
 }
 
 impl Theme {
@@ -125,13 +149,17 @@ struct ProCraftApp {
     theme: Theme,
     theme_applied: Option<Theme>,
     page_custom: [u8; 3],
-    dynamics: f32,
     picker_size: f32,
     texture: Option<TextureHandle>,
     painting: bool,
     last: Option<(f32, f32)>,
+    last_dyn: DabDynamics,
     last_t: f64,
     leftover: f32,
+    // Stabilizer state: exponentially smoothed pointer + pressure. Reset
+    // on every stroke start so strokes never inherit the last line's tail.
+    smooth_pt: Option<(f32, f32)>,
+    smooth_pressure: f32,
     sel_anchor: Option<(f32, f32)>,
     sel_current: Option<(f32, f32)>,
     lasso_points: Vec<(f32, f32)>,
@@ -154,6 +182,8 @@ struct ProCraftApp {
     preview_theme: Option<Theme>,
     custom_brushes: Vec<BrushPreset>,
     new_brush_name: String,
+    custom_colors: Vec<[u8; 3]>,
+    guides: Guides,
     move_from: Option<(f32, f32)>,
     move_acc: (f32, f32),
     shape_anchor: Option<(f32, f32)>,
@@ -188,13 +218,15 @@ impl ProCraftApp {
             theme: Theme::Paper,
             theme_applied: None,
             page_custom: [255, 255, 255],
-            dynamics: 0.6,
             picker_size: 165.0,
             texture: None,
             painting: false,
             last: None,
+            last_dyn: DabDynamics::default(),
             last_t: 0.0,
             leftover: 0.0,
+            smooth_pt: None,
+            smooth_pressure: 1.0,
             sel_anchor: None,
             sel_current: None,
             lasso_points: Vec::new(),
@@ -217,6 +249,8 @@ impl ProCraftApp {
             preview_theme: None,
             custom_brushes: Vec::new(),
             new_brush_name: String::new(),
+            custom_colors: Vec::new(),
+            guides: Guides::default(),
             move_from: None,
             move_acc: (0.0, 0.0),
             shape_anchor: None,
@@ -318,6 +352,10 @@ impl ProCraftApp {
                     Err(e) => self.status = format!("Brush import failed: {e}"),
                 }
             }
+            PendingOpen::Palette => match load_palette_file(&path) {
+                Ok(pal) => self.status = self.absorb_colors(pal, &path),
+                Err(e) => self.status = format!("Palette import failed: {e}"),
+            },
         }
     }
 
@@ -364,6 +402,16 @@ impl ProCraftApp {
     }
 }
 
+/// Dispatch a palette file by extension (shared by the desktop Import arm
+/// and the iOS picker resolve path): `.pcpalette`/`.json` or GIMP `.gpl`.
+fn load_palette_file(path: &std::path::Path) -> Result<Palette, String> {
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+    if ext == "gpl" {
+        import_gpl_file(path)
+    } else {
+        open_palette(path)
+    }
+}
 /// Dispatch a brush file by extension into presets (shared by the desktop
 /// Import arm and the iOS picker resolve path).
 fn load_brush_file(path: &std::path::Path) -> Result<Vec<BrushPreset>, String> {
@@ -409,6 +457,34 @@ impl ProCraftApp {
         }
         format!("Imported {added} brushes from {}.", path.display())
     }
+
+    /// Append an imported palette's swatches, skipping exact duplicates
+    /// (shared by desktop Import and the iOS picker resolve path).
+    fn absorb_colors(&mut self, pal: Palette, path: &std::path::Path) -> String {
+        let mut added = 0;
+        for c in pal.colors {
+            if self.custom_colors.len() >= MAX_PALETTE_COLORS {
+                break;
+            }
+            if !self.custom_colors.contains(&c) {
+                self.custom_colors.push(c);
+                added += 1;
+            }
+        }
+        format!("Imported {added} swatches from {}.", path.display())
+    }
+}
+
+/// One clickable swatch: applies the color. Returns the response for
+/// right-click-to-remove handling by the caller.
+fn swatch_button(ui: &mut egui::Ui, rgb: [u8; 3], selected: bool) -> egui::Response {
+    let (r, g, b) = (rgb[0], rgb[1], rgb[2]);
+    ui.add_sized(
+        [24.0, 24.0],
+        egui::Button::new("")
+            .fill(Color32::from_rgb(r, g, b))
+            .selected(selected),
+    )
 }
 
 /// Marching-ants rectangle: dark base line plus moving light dashes.
@@ -516,7 +592,14 @@ impl eframe::App for ProCraftApp {
                 rfd::PickPoll::NoRequest | rfd::PickPoll::Waiting => {
                     self.pending_open = Some(kind);
                 }
-                rfd::PickPoll::Picked(path) => self.open_picked(kind, path),
+                rfd::PickPoll::Picked(path) => {
+                    self.open_picked(kind, path);
+                    // Deferred v4 bug: the foreground frame after the
+                    // picker dismisses can drop before the rebuilt texture
+                    // shows (content invisible until first tap). Force one
+                    // more frame so opens appear at once.
+                    ui.ctx().request_repaint();
+                }
                 rfd::PickPoll::Cancelled => {
                     self.status = "Pick cancelled.".to_string();
                 }
@@ -942,11 +1025,131 @@ impl eframe::App for ProCraftApp {
                 }
             });
             ui.separator();
+            ui.heading("Swatches");
+            ui.label("Starter (click applies):");
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                for rgb in starter_palette().colors {
+                    let resp = swatch_button(ui, rgb, self.color == rgb);
+                    if resp.clicked() {
+                        self.color = rgb;
+                    }
+                }
+            });
+            ui.label("My colors (click applies, right-click removes):");
+            if self.custom_colors.is_empty() {
+                ui.label("Empty — store the current color with +.");
+            } else {
+                let mut remove = None;
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                    for (idx, rgb) in self.custom_colors.iter().enumerate() {
+                        let resp = swatch_button(ui, *rgb, self.color == *rgb);
+                        if resp.clicked() {
+                            self.color = *rgb;
+                        }
+                        if resp.secondary_clicked() {
+                            remove = Some(idx);
+                        }
+                    }
+                });
+                if let Some(idx) = remove {
+                    self.custom_colors.remove(idx);
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui.button("+ Current").clicked() {
+                    if self.custom_colors.contains(&self.color) {
+                        self.status = "That color is already stored.".to_string();
+                    } else if self.custom_colors.len() >= MAX_PALETTE_COLORS {
+                        self.status = format!("Swatch set is full ({MAX_PALETTE_COLORS}).");
+                    } else {
+                        self.custom_colors.push(self.color);
+                        self.status = "Color stored.".to_string();
+                    }
+                }
+                if ui.button("Import").clicked() {
+                    #[cfg(not(target_os = "ios"))]
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Palettes", &["pcpalette", "json", "gpl"])
+                        .pick_file()
+                    {
+                        match load_palette_file(&path) {
+                            Ok(pal) => self.status = self.absorb_colors(pal, &path),
+                            Err(e) => self.status = format!("Palette import failed: {e}"),
+                        }
+                    }
+                    #[cfg(target_os = "ios")]
+                    {
+                        let _ = rfd::FileDialog::new()
+                            .add_filter("Palettes", &["pcpalette", "json", "gpl"])
+                            .pick_file();
+                        self.pending_open = Some(PendingOpen::Palette);
+                        self.status = "Pick palette…".to_string();
+                    }
+                }
+                if ui.button("Export").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("ProCraft palette", &["pcpalette"])
+                        .save_file()
+                    {
+                        let path = ensure_extension(path, "pcpalette");
+                        let pal = Palette { name: "My colors".to_string(), colors: self.custom_colors.clone() };
+                        match save_palette(&path, &pal) {
+                            Ok(()) => {
+                                self.status = format!("Palette saved {}", path.display());
+                                #[cfg(target_os = "ios")]
+                                rfd::ios_share_file(&path);
+                            }
+                            Err(e) => self.status = format!("Palette save failed: {e}"),
+                        }
+                    }
+                }
+                if ui.button("Clear").clicked() {
+                    self.custom_colors.clear();
+                    self.status = "Swatch set cleared.".to_string();
+                }
+            });
+            ui.label("Harmony of the current color (click applies):");
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                let cur = self.color;
+                let mut harmonies = vec![complementary(cur)];
+                harmonies.extend(triadic(cur));
+                harmonies.extend(analogous(cur));
+                for rgb in harmonies {
+                    if swatch_button(ui, rgb, self.color == rgb).clicked() {
+                        self.color = rgb;
+                    }
+                }
+            });
+            ui.separator();
             ui.add(egui::Slider::new(&mut self.brush.size, 1.0..=200.0).text("Size"));
             ui.add(egui::Slider::new(&mut self.brush.opacity, 0.05..=1.0).text("Opacity"));
             ui.add(egui::Slider::new(&mut self.brush.softness, 0.0..=1.0).text("Softness"));
             ui.add(egui::Slider::new(&mut self.brush.spacing, 0.05..=1.0).text("Spacing"));
-            ui.add(egui::Slider::new(&mut self.dynamics, 0.0..=1.0).text("Dynamics"));
+            ui.collapsing("Pressure (touch / Pencil)", |ui| {
+                ui.add(egui::Slider::new(&mut self.brush.pressure_size, 0.0..=1.0).text("Size"));
+                ui.add(egui::Slider::new(&mut self.brush.pressure_opacity, 0.0..=1.0).text("Opacity"));
+                ui.label("Mouse has no pressure sensor: it paints at full pressure.");
+            });
+            ui.collapsing("Velocity", |ui| {
+                ui.add(egui::Slider::new(&mut self.brush.velocity_size, 0.0..=1.0).text("Thin"));
+                ui.add(egui::Slider::new(&mut self.brush.velocity_opacity, 0.0..=1.0).text("Fade"));
+                ui.label("Fast moves thin and fade (this is the old Dynamics, split).");
+            });
+            ui.collapsing("Texture", |ui| {
+                ui.add(egui::Slider::new(&mut self.brush.grain, 0.0..=1.0).text("Grain"));
+                ui.add(egui::Slider::new(&mut self.brush.grain_scale, 0.25..=4.0).text("Grain size"));
+            });
+            ui.collapsing("Dab shape", |ui| {
+                ui.add(egui::Slider::new(&mut self.brush.roundness, 0.1..=1.0).text("Roundness"));
+                ui.checkbox(&mut self.brush.angle_follow, "Follow direction");
+                ui.add(egui::Slider::new(&mut self.brush.scatter, 0.0..=1.0).text("Scatter"));
+            });
+            ui.collapsing("Smoothing", |ui| {
+                ui.add(egui::Slider::new(&mut self.brush.stabilizer, 0.0..=1.0).text("Stabilizer"));
+            });
             ui.separator();
             ui.heading("Page");
             ui.horizontal(|ui| {
@@ -959,6 +1162,29 @@ impl eframe::App for ProCraftApp {
             });
             if egui::color_picker::color_edit_button_srgb(ui, &mut self.page_custom).changed() {
                 self.set_page_color(self.page_custom);
+            }
+            ui.separator();
+            ui.heading("Guides");
+            ui.horizontal_wrapped(|ui| {
+                for k in GuideKind::ALL {
+                    ui.radio_value(&mut self.guides.kind, k, k.name());
+                }
+            });
+            if self.guides.kind != GuideKind::Off {
+                match self.guides.kind {
+                    GuideKind::Square | GuideKind::Isometric => {
+                        ui.add(egui::Slider::new(&mut self.guides.spacing, 8.0..=256.0).text("Spacing"));
+                    }
+                    GuideKind::OnePoint | GuideKind::TwoPoint => {
+                        ui.label("Vanishing points are fixed in this version.");
+                    }
+                    GuideKind::Off => {}
+                }
+                ui.checkbox(&mut self.guides.snap, "Snap while painting");
+                if self.guides.snap {
+                    ui.add(egui::Slider::new(&mut self.guides.snap_px, 2.0..=32.0).text("Snap dist"));
+                }
+                ui.add(egui::Slider::new(&mut self.guides.opacity, 0.05..=1.0).text("Opacity"));
             }
             if self.doc.selection_mask.is_some() {
                 ui.separator();
@@ -1311,6 +1537,20 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                 }
+                // Drawing guides overlay: view-assist only, never baked in.
+                if self.guides.kind != GuideKind::Off {
+                    let alpha = (self.guides.opacity.clamp(0.05, 1.0) * 255.0).round() as u8;
+                    let gc = Color32::from_rgba_unmultiplied(70, 130, 200, alpha);
+                    for [x0, y0, x1, y1] in self.guides.overlay_lines(w, h) {
+                        ui.painter().line_segment(
+                            [
+                                egui::Pos2::new(rect.min.x + x0 * z, rect.min.y + y0 * z),
+                                egui::Pos2::new(rect.min.x + x1 * z, rect.min.y + y1 * z),
+                            ],
+                            (1.0, gc),
+                        );
+                    }
+                }
                 // Committed lasso outline stays visible on every tool (it is
                 // skipped while a new loop is being dragged: the Lasso branch
                 // below draws the live path instead).
@@ -1602,7 +1842,10 @@ impl eframe::App for ProCraftApp {
                     self.doc.checkpoint();
                     self.painting = true;
                     self.last = None;
+                    self.last_dyn = DabDynamics::default();
                     self.leftover = 0.0;
+                    self.smooth_pt = None;
+                    self.smooth_pressure = 1.0;
                     self.last_t = ctx.input(|i| i.time);
                 }
                 if self.painting && resp.dragged() {
@@ -1615,27 +1858,62 @@ impl eframe::App for ProCraftApp {
                         let now = ctx.input(|i| i.time);
                         let dt = (now - self.last_t).max(1.0 / 240.0) as f32;
                         self.last_t = now;
-                        // Velocity dynamics: fast moves paint thinner/lighter.
-                        let mut brush = self.base_brush();
-                        if self.dynamics > 0.0 {
-                            if let Some((lx, ly)) = self.last {
-                                let dist = ((x - lx).powi(2) + (y - ly).powi(2)).sqrt();
-                                let speed = dist / dt;
-                                let k = (speed / 3500.0).clamp(0.0, 1.0) * self.dynamics;
-                                brush.size *= 1.0 - 0.6 * k;
-                                brush.opacity *= 1.0 - 0.4 * k;
+                        let brush = self.base_brush();
+                        // Pressure: Pencil/touch force when the backend
+                        // forwards it, else full pressure (mice have no
+                        // sensor; velocity taper below still applies).
+                        let pressure = latest_touch_force(&ctx).unwrap_or(1.0);
+                        // Stabilizer: exponential smoothing toward the raw
+                        // pointer; 0 keeps the raw point bit-for-bit.
+                        let a = brush.stabilizer.clamp(0.0, 1.0) * 0.85;
+                        let (sx, sy) = match self.smooth_pt {
+                            Some((px, py)) => (px + (x - px) * (1.0 - a), py + (y - py) * (1.0 - a)),
+                            None => (x, y),
+                        };
+                        self.smooth_pt = Some((sx, sy));
+                        // Drawing assist: snap the smoothed point to the
+                        // guides before speed + stroke (shapes stay free).
+                        let (sx, sy) = self.guides.snap_point(w, h, sx, sy);
+                        self.smooth_pressure += (pressure - self.smooth_pressure) * (1.0 - a);
+                        // Speed + direction from the smoothed trail.
+                        let (speed_norm, angle) = match self.last {
+                            Some((lx, ly)) => {
+                                let dist = ((sx - lx).powi(2) + (sy - ly).powi(2)).sqrt();
+                                let n = (dist / dt / 3500.0).clamp(0.0, 1.0);
+                                let ang = if dist > 0.001 {
+                                    (sy - ly).atan2(sx - lx)
+                                } else {
+                                    self.last_dyn.angle
+                                };
+                                (n, ang)
                             }
-                        }
+                            None => (0.0, self.last_dyn.angle),
+                        };
+                        let from_dyn = if self.last.is_some() { self.last_dyn } else { DabDynamics::default() };
+                        let to_dyn = DabDynamics {
+                            pressure: self.smooth_pressure,
+                            speed_norm,
+                            angle,
+                        };
                         let color = self.current_color();
-                        let (last, leftover) =
-                            self.doc.stroke_to(&brush, color, self.last, (x, y), self.leftover);
+                        let (last, leftover) = self.doc.stroke_to_dyn(
+                            &brush,
+                            color,
+                            self.last,
+                            from_dyn,
+                            (sx, sy),
+                            to_dyn,
+                            self.leftover,
+                        );
                         self.last = last;
+                        self.last_dyn = to_dyn;
                         self.leftover = leftover;
                     }
                 }
                 if resp.drag_stopped() {
                     self.painting = false;
                     self.last = None;
+                    self.smooth_pt = None;
                 }
             });
         });

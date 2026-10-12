@@ -87,6 +87,7 @@ fn stamp_brush(name: String, w: u32, h: u32, mask: Vec<u8>, spacing: f32) -> Res
             spacing: clamp_spacing(spacing, 0.2),
             eraser: false,
             tip: Some(tip),
+            ..Brush::default()
         },
     })
 }
@@ -668,7 +669,7 @@ fn import_kpp_bytes(bytes: &[u8], fallback: &str, dir: Option<&std::path::Path>)
     // are intentionally not transferred.
     cap_list(vec![ImportedBrush {
         name,
-        brush: Brush { size, opacity: (opacity * flow).clamp(0.0, 1.0), softness: 0.5, spacing, eraser: false, tip: None },
+        brush: Brush { size, opacity: (opacity * flow).clamp(0.0, 1.0), softness: 0.5, spacing, eraser: false, tip: None, ..Brush::default() },
     }])
 }
 
@@ -995,6 +996,7 @@ fn import_abr(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
                 spacing: spacings[i].unwrap_or(0.25),
                 eraser: false,
                 tip: Some(tip),
+                ..Brush::default()
             },
         });
     }

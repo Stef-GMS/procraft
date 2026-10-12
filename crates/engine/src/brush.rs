@@ -50,9 +50,92 @@ pub enum ShapePoly {
     Polygon,
 }
 
+/// Per-dab dynamics sample for [`Document::stroke_to_dyn`]: pen pressure,
+/// normalized pointer speed and stroke direction at one stroke endpoint.
+/// The engine interpolates these per dab, so a single pointer segment can
+/// taper, fade and turn across its dabs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DabDynamics {
+    /// Pen pressure, 0.0..=1.0 (1.0 = full pressure / mouse).
+    pub pressure: f32,
+    /// Pointer speed normalized by 3500 px/s, 0.0..=1.0.
+    pub speed_norm: f32,
+    /// Stroke direction in radians (`atan2(dy, dx)`).
+    pub angle: f32,
+}
+
+impl Default for DabDynamics {
+    fn default() -> Self {
+        Self { pressure: 1.0, speed_norm: 0.0, angle: 0.0 }
+    }
+}
+
+fn clamp01(v: f32) -> f32 {
+    v.clamp(0.0, 1.0)
+}
+
+// serde defaults for the fields added in M14: old `.pcbrush` files without
+// these keys load with the same values as `Brush::default()`.
+fn def_pressure_size() -> f32 {
+    0.7
+}
+fn def_pressure_opacity() -> f32 {
+    0.6
+}
+fn def_velocity_size() -> f32 {
+    0.6
+}
+fn def_velocity_opacity() -> f32 {
+    0.6
+}
+fn def_grain() -> f32 {
+    0.0
+}
+fn def_grain_scale() -> f32 {
+    1.0
+}
+fn def_roundness() -> f32 {
+    1.0
+}
+fn def_angle_follow() -> bool {
+    false
+}
+fn def_scatter() -> f32 {
+    0.0
+}
+fn def_stabilizer() -> f32 {
+    0.35
+}
+
+/// Deterministic 0.0..=1.0 hash for scatter offsets and grain. Position
+/// based (not counter based) so strokes replay identically across
+/// undo/redo, thumbnails and file round-trips. Original integer-mix math.
+fn hash01(x: i32, y: i32) -> f32 {
+    let mut h = (x as u32)
+        .wrapping_mul(374761393)
+        .wrapping_add((y as u32).wrapping_mul(668265263));
+    h ^= h >> 13;
+    h = h.wrapping_mul(1274126177);
+    h ^= h >> 16;
+    (h >> 8) as f32 / 16_777_215.0
+}
+
+/// Procedural grain sample 0.0..=1.0: one value-noise texel per `cell`
+/// pixel block (`cell` grows with `scale`). No assets, clean-room.
+fn grain_at(px: u32, py: u32, scale: f32) -> f32 {
+    let cell = ((3.0 * scale.clamp(0.25, 4.0)).round() as u32).max(1);
+    hash01((px / cell) as i32, (py / cell) as i32)
+}
+
 /// Brush shape settings. All original math: a radial falloff stamp laid down
 /// along the pointer path at `spacing` intervals. When `tip` is present the
 /// parametric falloff is replaced by the grayscale stamp (imported brushes).
+/// M14 adds per-dab dynamics: pressure and pointer speed scale size/opacity
+/// through [`Brush::resolve_size`]/[`Brush::resolve_opacity`], `grain`
+/// breaks the alpha with procedural noise, `roundness` + `angle_follow`
+/// squeeze and steer dabs along the stroke, and `scatter` offsets dabs.
+/// `stabilizer` is applied app-side (pointer smoothing) and stored here so
+/// it travels with the brush preset.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Brush {
     /// Dab diameter in canvas pixels (stamp width when `tip` is present).
@@ -68,11 +151,79 @@ pub struct Brush {
     /// Optional imported stamp tip (absent in `.pcbrush` files from v9).
     #[serde(default)]
     pub tip: Option<BrushTip>,
+    /// How much light pressure shrinks the dab, 0.0 (no-op) ..= 1.0 (full).
+    /// Effective size scales as `size * (1 - pressure_size * (1 - p))`.
+    #[serde(default = "def_pressure_size")]
+    pub pressure_size: f32,
+    /// How much light pressure fades the dab, 0.0..=1.0 (same curve).
+    #[serde(default = "def_pressure_opacity")]
+    pub pressure_opacity: f32,
+    /// How much speed thins the dab, 0.0..=1.0 (weight 0.6, as M7 dynamics).
+    #[serde(default = "def_velocity_size")]
+    pub velocity_size: f32,
+    /// How much speed fades the dab, 0.0..=1.0 (weight 0.4, as M7 dynamics).
+    #[serde(default = "def_velocity_opacity")]
+    pub velocity_opacity: f32,
+    /// Procedural grain strength, 0.0 (off) ..= 1.0 (heavy chalk).
+    #[serde(default = "def_grain")]
+    pub grain: f32,
+    /// Grain cell scale, 0.25 (fine) ..= 4.0 (coarse).
+    #[serde(default = "def_grain_scale")]
+    pub grain_scale: f32,
+    /// Dab roundness, 0.1 (flat calligraphy) ..= 1.0 (circle).
+    #[serde(default = "def_roundness")]
+    pub roundness: f32,
+    /// Steer the dab's long axis along the stroke direction.
+    #[serde(default = "def_angle_follow")]
+    pub angle_follow: bool,
+    /// Random dab offset as a fraction of `size`, 0.0 (off) ..= 1.0.
+    #[serde(default = "def_scatter")]
+    pub scatter: f32,
+    /// Pointer smoothing amount, 0.0 (raw) ..= 1.0 (heavy streamline).
+    #[serde(default = "def_stabilizer")]
+    pub stabilizer: f32,
 }
 
 impl Default for Brush {
     fn default() -> Self {
-        Self { size: 24.0, opacity: 1.0, softness: 0.6, spacing: 0.15, eraser: false, tip: None }
+        Self {
+            size: 24.0,
+            opacity: 1.0,
+            softness: 0.6,
+            spacing: 0.15,
+            eraser: false,
+            tip: None,
+            pressure_size: def_pressure_size(),
+            pressure_opacity: def_pressure_opacity(),
+            velocity_size: def_velocity_size(),
+            velocity_opacity: def_velocity_opacity(),
+            grain: def_grain(),
+            grain_scale: def_grain_scale(),
+            roundness: def_roundness(),
+            angle_follow: def_angle_follow(),
+            scatter: def_scatter(),
+            stabilizer: def_stabilizer(),
+        }
+    }
+}
+
+impl Brush {
+    /// Effective dab diameter for a pressure/speed sample. At full pressure
+    /// and zero speed this returns exactly `size` (old behavior preserved).
+    pub fn resolve_size(&self, pressure: f32, speed_norm: f32) -> f32 {
+        let p = clamp01(self.pressure_size);
+        let v = clamp01(self.velocity_size);
+        let sized = self.size * (1.0 - p * (1.0 - clamp01(pressure)));
+        (sized * (1.0 - 0.6 * clamp01(speed_norm) * v)).max(0.0)
+    }
+
+    /// Effective per-dab opacity for a pressure/speed sample. At full
+    /// pressure and zero speed this returns exactly `opacity`.
+    pub fn resolve_opacity(&self, pressure: f32, speed_norm: f32) -> f32 {
+        let p = clamp01(self.pressure_opacity);
+        let v = clamp01(self.velocity_opacity);
+        let op = self.opacity * (1.0 - p * (1.0 - clamp01(pressure)));
+        (op * (1.0 - 0.4 * clamp01(speed_norm) * v)).clamp(0.0, 1.0)
     }
 }
 
@@ -85,6 +236,28 @@ impl Document {
     /// mask value, the eraser reveals). Shapes, fills and flood fill always
     /// paint color.
     pub fn dab(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
+        // Single dabs (stroke starts, shape taps) paint at full pressure:
+        // resolve(1, 0) returns exactly size/opacity, angle 0 keeps the
+        // dab round unless the preset squeezes it.
+        let size = brush.resolve_size(1.0, 0.0);
+        let opacity = brush.resolve_opacity(1.0, 0.0);
+        self.dab_dyn(brush, color, x, y, size, opacity, 0.0);
+    }
+
+    /// Stamp one dab with pre-resolved size/opacity/angle, mirrored per
+    /// [`Document::symmetry`]. The [`Document::stroke_to_dyn`] walker
+    /// resolves dynamics per dab and calls this; [`Document::dab`] is the
+    /// full-pressure shorthand above.
+    fn dab_dyn(
+        &mut self,
+        brush: &Brush,
+        color: Color,
+        x: f32,
+        y: f32,
+        size: f32,
+        opacity: f32,
+        angle: f32,
+    ) {
         let pts = self.symmetry.mirrored_points(self.w, self.h, self.symmetry_segments, x, y);
         let mut done: Vec<(f32, f32)> = Vec::with_capacity(4);
         let target = self.paint_target;
@@ -94,21 +267,34 @@ impl Document {
             }
             done.push((mx, my));
             match target {
-                super::document::PaintTarget::Color => self.dab_one(brush, color, mx, my),
-                super::document::PaintTarget::Mask => self.dab_mask(brush, color, mx, my),
+                super::document::PaintTarget::Color => {
+                    self.dab_one_resolved(brush, color, mx, my, size, opacity, angle)
+                }
+                super::document::PaintTarget::Mask => {
+                    self.dab_mask_resolved(brush, color, mx, my, size, opacity, angle)
+                }
             }
         }
     }
 
     /// Mask dab through the parametric falloff or the stamp tip; shared
     /// selection/symmetry gating comes from [`Document::dab`].
-    fn dab_mask(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
+    fn dab_mask_resolved(
+        &mut self,
+        brush: &Brush,
+        color: Color,
+        x: f32,
+        y: f32,
+        size: f32,
+        opacity: f32,
+        angle: f32,
+    ) {
         if brush.tip.is_some() {
-            return self.dab_mask_stamp(brush, color, x, y);
+            return self.dab_mask_stamp_resolved(brush, color, x, y, size, opacity, angle);
         }
         let (w_u32, h_u32) = (self.w, self.h);
-        let radius = (brush.size * 0.5).max(0.5);
-        let strength = brush.opacity.clamp(0.0, 1.0);
+        let radius = (size * 0.5).max(0.5);
+        let strength = opacity.clamp(0.0, 1.0);
         if strength <= 0.0 || self.layers.get(self.active).is_none() {
             return;
         }
@@ -140,6 +326,10 @@ impl Document {
             (299.0 * c[0] as f32 + 587.0 * c[1] as f32 + 114.0 * c[2] as f32) / 1000.0
         };
         let edge = brush.softness.clamp(0.0, 1.0);
+        let round = brush.roundness.clamp(0.1, 1.0);
+        let (cos_a, sin_a) = (angle.cos(), angle.sin());
+        let grain = clamp01(brush.grain);
+        let grain_scale = brush.grain_scale;
         let Some(layer_mask) = self.layers[active].mask.as_mut() else { return };
         for py in y0..=y1 {
             for px in x0..=x1 {
@@ -153,12 +343,19 @@ impl Document {
                         continue;
                     }
                 }
-                let d = ((px as f32 + 0.5 - x).hypot(py as f32 + 0.5 - y)) / radius;
+                // Dab-frame coords: u along the stroke, v across (squeezed
+                // by roundness). At roundness 1.0 this is the old circle.
+                let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+                let (u, v) = (dx * cos_a + dy * sin_a, (-dx * sin_a + dy * cos_a) / round);
+                let d = (u * u + v * v).sqrt() / radius;
                 if d > 1.0 {
                     continue;
                 }
                 let falloff = if d <= 1.0 - edge { 1.0 } else { 1.0 - (d - (1.0 - edge)) / edge.max(0.001) };
-                let a = (falloff.clamp(0.0, 1.0) * strength).clamp(0.0, 1.0);
+                let mut a = (falloff.clamp(0.0, 1.0) * strength).clamp(0.0, 1.0);
+                if grain > 0.0 {
+                    a *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
+                }
                 if a <= 0.0 {
                     continue;
                 }
@@ -173,33 +370,46 @@ impl Document {
 
     /// Mask dab through an imported stamp tip (nearest-neighbor at brush
     /// size, like [`Document::dab_stamp`] but writing luminance).
-    fn dab_mask_stamp(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
+    fn dab_mask_stamp_resolved(
+        &mut self,
+        brush: &Brush,
+        color: Color,
+        x: f32,
+        y: f32,
+        size: f32,
+        opacity: f32,
+        angle: f32,
+    ) {
         let Some(tip) = brush.tip.as_ref() else { return };
         if tip.w == 0 || tip.h == 0 || tip.mask.len() != (tip.w * tip.h) as usize {
             return;
         }
         let (w_u32, h_u32) = (self.w, self.h);
-        let strength = brush.opacity.clamp(0.0, 1.0);
-        if strength <= 0.0 || brush.size <= 0.0 || self.layers.get(self.active).is_none() {
+        let strength = opacity.clamp(0.0, 1.0);
+        if strength <= 0.0 || size <= 0.0 || self.layers.get(self.active).is_none() {
             return;
         }
-        let scale = brush.size / tip.w as f32;
+        let scale = size / tip.w as f32;
         let th = (tip.h as f32 * scale).max(1.0);
+        // A steered stamp sweeps its corners: bound the circumscribed
+        // circle so rotation never clips. Unsteered keeps the old box.
+        let (ex, ey) = if brush.angle_follow {
+            let r = (size * size + th * th).sqrt() * 0.5;
+            (r, r)
+        } else {
+            (size * 0.5, th * 0.5)
+        };
         // Fully outside: a complete no-op (no mask, no dirty rect).
-        if x + brush.size * 0.5 < 0.0
-            || y + th * 0.5 < 0.0
-            || x - brush.size * 0.5 >= w_u32 as f32
-            || y - th * 0.5 >= h_u32 as f32
-        {
+        if x + ex < 0.0 || y + ey < 0.0 || x - ex >= w_u32 as f32 || y - ey >= h_u32 as f32 {
             return;
         }
         if self.layers[self.active].mask.is_none() {
             self.add_mask(self.active);
         }
-        let x0 = (x - brush.size * 0.5).floor().max(0.0) as u32;
-        let y0 = (y - th * 0.5).floor().max(0.0) as u32;
-        let x1 = (x + brush.size * 0.5).ceil().min(w_u32 as f32 - 1.0).max(0.0) as u32;
-        let y1 = (y + th * 0.5).ceil().min(h_u32 as f32 - 1.0).max(0.0) as u32;
+        let x0 = (x - ex).floor().max(0.0) as u32;
+        let y0 = (y - ey).floor().max(0.0) as u32;
+        let x1 = (x + ex).ceil().min(w_u32 as f32 - 1.0).max(0.0) as u32;
+        let y1 = (y + ey).ceil().min(h_u32 as f32 - 1.0).max(0.0) as u32;
         self.mark_dirty(x0, y0, x1, y1);
         let selection = self.selection;
         let active = self.active;
@@ -214,6 +424,13 @@ impl Document {
             let c = color.0;
             (299.0 * c[0] as f32 + 587.0 * c[1] as f32 + 114.0 * c[2] as f32) / 1000.0
         };
+        let round = brush.roundness.clamp(0.1, 1.0);
+        let follow = brush.angle_follow;
+        let (cos_a, sin_a) = (angle.cos(), angle.sin());
+        let grain = clamp01(brush.grain);
+        let grain_scale = brush.grain_scale;
+        let half_w = size * 0.5;
+        let half_h = th * 0.5;
         let Some(layer_mask) = self.layers[active].mask.as_mut() else { return };
         for py in y0..=y1 {
             for px in x0..=x1 {
@@ -227,9 +444,26 @@ impl Document {
                         continue;
                     }
                 }
-                let tx = (((px as f32 + 0.5 - (x - brush.size * 0.5)) / scale) as u32).min(tip.w - 1);
-                let ty = (((py as f32 + 0.5 - (y - th * 0.5)) / scale) as u32).min(tip.h - 1);
-                let a = (tip.mask[(ty * tip.w + tx) as usize] as f32 / 255.0 * strength).clamp(0.0, 1.0);
+                // Stamp-frame coords: un-rotate into the tip when steered,
+                // squeeze across the stroke by roundness. Off-tip pixels
+                // are transparent (clean rotated corners).
+                let (ox, oy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+                let (rx, ry) = if follow {
+                    (ox * cos_a + oy * sin_a, (-ox * sin_a + oy * cos_a) / round)
+                } else {
+                    (ox, oy / round)
+                };
+                let tx = ((rx + half_w) / scale) as i32;
+                let ty = ((ry + half_h) / scale) as i32;
+                if tx < 0 || ty < 0 || tx >= tip.w as i32 || ty >= tip.h as i32 {
+                    continue;
+                }
+                let mut a = (tip.mask[(ty as u32 * tip.w + tx as u32) as usize] as f32 / 255.0
+                    * strength)
+                    .clamp(0.0, 1.0);
+                if grain > 0.0 {
+                    a *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
+                }
                 if a <= 0.0 {
                     continue;
                 }
@@ -242,14 +476,23 @@ impl Document {
         }
     }
 
-    fn dab_one(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
+    fn dab_one_resolved(
+        &mut self,
+        brush: &Brush,
+        color: Color,
+        x: f32,
+        y: f32,
+        size: f32,
+        opacity: f32,
+        angle: f32,
+    ) {
         if brush.tip.is_some() {
-            return self.dab_stamp(brush, color, x, y);
+            return self.dab_stamp_resolved(brush, color, x, y, size, opacity, angle);
         }
         let (w_u32, h_u32) = (self.w, self.h);
         let (w, h) = (w_u32 as f32, h_u32 as f32);
-        let radius = (brush.size * 0.5).max(0.5);
-        let strength = brush.opacity.clamp(0.0, 1.0);
+        let radius = (size * 0.5).max(0.5);
+        let strength = opacity.clamp(0.0, 1.0);
         if strength <= 0.0 || self.layers.get(self.active).is_none() {
             return;
         }
@@ -278,14 +521,26 @@ impl Document {
                         continue;
                     }
                 }
-                let d = ((px as f32 + 0.5 - x).hypot(py as f32 + 0.5 - y)) / radius;
+                // 1.0 inside the hard core, linear fade across the soft edge.
+                let edge = brush.softness.clamp(0.0, 1.0);
+                let round = brush.roundness.clamp(0.1, 1.0);
+                let (cos_a, sin_a) = (angle.cos(), angle.sin());
+                let grain = clamp01(brush.grain);
+                let grain_scale = brush.grain_scale;
+                // Dab-frame coords (see mask dab): roundness 1.0 keeps the
+                // old circular falloff bit-for-bit.
+                let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+                let (u, v) = (dx * cos_a + dy * sin_a, (-dx * sin_a + dy * cos_a) / round);
+                let d = (u * u + v * v).sqrt() / radius;
                 if d > 1.0 {
                     continue;
                 }
-                // 1.0 inside the hard core, linear fade across the soft edge.
-                let edge = brush.softness.clamp(0.0, 1.0);
                 let falloff = if d <= 1.0 - edge { 1.0 } else { 1.0 - (d - (1.0 - edge)) / edge.max(0.001) };
-                let a = (falloff.clamp(0.0, 1.0) * strength * 255.0).round() as u8;
+                let mut fa = (falloff.clamp(0.0, 1.0) * strength).clamp(0.0, 1.0);
+                if grain > 0.0 {
+                    fa *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
+                }
+                let a = (fa * 255.0).round() as u8;
                 if a == 0 {
                     continue;
                 }
@@ -317,23 +572,40 @@ impl Document {
     /// its width spans `brush.size` canvas pixels (nearest-neighbor), and
     /// each texel contributes `mask * opacity` exactly like falloff alpha.
     /// Selection, symmetry and eraser handling match [`Document::dab`].
-    fn dab_stamp(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
+    fn dab_stamp_resolved(
+        &mut self,
+        brush: &Brush,
+        color: Color,
+        x: f32,
+        y: f32,
+        size: f32,
+        opacity: f32,
+        angle: f32,
+    ) {
         let Some(tip) = brush.tip.as_ref() else { return };
         if tip.w == 0 || tip.h == 0 || tip.mask.len() != (tip.w * tip.h) as usize {
             return;
         }
         let (w_u32, h_u32) = (self.w, self.h);
         let (w, h) = (w_u32 as f32, h_u32 as f32);
-        let strength = brush.opacity.clamp(0.0, 1.0);
-        if strength <= 0.0 || brush.size <= 0.0 || self.layers.get(self.active).is_none() {
+        let strength = opacity.clamp(0.0, 1.0);
+        if strength <= 0.0 || size <= 0.0 || self.layers.get(self.active).is_none() {
             return;
         }
-        let scale = brush.size / tip.w as f32;
+        let scale = size / tip.w as f32;
         let th = (tip.h as f32 * scale).max(1.0);
-        let x0 = (x - brush.size * 0.5).floor().max(0.0) as u32;
-        let y0 = (y - th * 0.5).floor().max(0.0) as u32;
-        let x1 = (x + brush.size * 0.5).ceil().min(w - 1.0).max(0.0) as u32;
-        let y1 = (y + th * 0.5).ceil().min(h - 1.0).max(0.0) as u32;
+        // Steered stamps sweep their corners: bound the circumscribed
+        // circle so rotation never clips. Unsteered keeps the old box.
+        let (ex, ey) = if brush.angle_follow {
+            let r = (size * size + th * th).sqrt() * 0.5;
+            (r, r)
+        } else {
+            (size * 0.5, th * 0.5)
+        };
+        let x0 = (x - ex).floor().max(0.0) as u32;
+        let y0 = (y - ey).floor().max(0.0) as u32;
+        let x1 = (x + ex).ceil().min(w - 1.0).max(0.0) as u32;
+        let y1 = (y + ey).ceil().min(h - 1.0).max(0.0) as u32;
         self.mark_dirty(x0, y0, x1, y1);
         let selection = self.selection;
         let active = self.active;
@@ -343,6 +615,13 @@ impl Document {
         let mask = self.selection_mask.as_deref();
         let layer = &mut self.layers[active];
         let w = w_u32;
+        let round = brush.roundness.clamp(0.1, 1.0);
+        let follow = brush.angle_follow;
+        let (cos_a, sin_a) = (angle.cos(), angle.sin());
+        let grain = clamp01(brush.grain);
+        let grain_scale = brush.grain_scale;
+        let half_w = size * 0.5;
+        let half_h = th * 0.5;
         for py in y0..=y1 {
             for px in x0..=x1 {
                 if let Some((sx0, sy0, sx1, sy1)) = selection {
@@ -355,9 +634,27 @@ impl Document {
                         continue;
                     }
                 }
-                let tx = (((px as f32 + 0.5 - (x - brush.size * 0.5)) / scale) as u32).min(tip.w - 1);
-                let ty = (((py as f32 + 0.5 - (y - th * 0.5)) / scale) as u32).min(tip.h - 1);
-                let a = (tip.mask[(ty * tip.w + tx) as usize] as f32 / 255.0 * strength * 255.0).round() as u8;
+                // Stamp-frame coords (see mask stamp): un-rotate when
+                // steered, squeeze across the stroke by roundness. Off-tip
+                // pixels are transparent (clean rotated corners).
+                let (ox, oy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+                let (rx, ry) = if follow {
+                    (ox * cos_a + oy * sin_a, (-ox * sin_a + oy * cos_a) / round)
+                } else {
+                    (ox, oy / round)
+                };
+                let tx = ((rx + half_w) / scale) as i32;
+                let ty = ((ry + half_h) / scale) as i32;
+                if tx < 0 || ty < 0 || tx >= tip.w as i32 || ty >= tip.h as i32 {
+                    continue;
+                }
+                let mut fa = (tip.mask[(ty as u32 * tip.w + tx as u32) as usize] as f32 / 255.0
+                    * strength)
+                    .clamp(0.0, 1.0);
+                if grain > 0.0 {
+                    fa *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
+                }
+                let a = (fa * 255.0).round() as u8;
                 if a == 0 {
                     continue;
                 }
@@ -387,6 +684,8 @@ impl Document {
     /// Advance a stroke from `from` to `to`, laying dabs every
     /// `spacing * size` pixels. Returns the leftover distance for chaining.
     /// Call [`Document::checkpoint`] once when the stroke starts.
+    /// Full-pressure shorthand over [`Document::stroke_to_dyn`]: the segment
+    /// direction still steers `angle_follow` brushes (shapes, previews).
     pub fn stroke_to(
         &mut self,
         brush: &Brush,
@@ -395,9 +694,35 @@ impl Document {
         to: (f32, f32),
         leftover: f32,
     ) -> (Option<(f32, f32)>, f32) {
-        let step = (brush.size * brush.spacing).max(1.0);
+        let angle = match from {
+            Some((sx, sy)) => (to.1 - sy).atan2(to.0 - sx),
+            None => 0.0,
+        };
+        let dyn_ = DabDynamics { pressure: 1.0, speed_norm: 0.0, angle };
+        self.stroke_to_dyn(brush, color, from, dyn_, to, dyn_, leftover)
+    }
+
+    /// Advance a stroke with per-endpoint dynamics, interpolating pressure,
+    /// speed and direction per dab so segments taper, fade and turn across
+    /// their dabs. `from_dyn` is ignored when `from` is `None` (stroke start
+    /// paints one full `to_dyn` dab). Returns the leftover distance plus the
+    /// new endpoint for chaining. Call [`Document::checkpoint`] once when
+    /// the stroke starts.
+    pub fn stroke_to_dyn(
+        &mut self,
+        brush: &Brush,
+        color: Color,
+        from: Option<(f32, f32)>,
+        from_dyn: DabDynamics,
+        to: (f32, f32),
+        to_dyn: DabDynamics,
+        leftover: f32,
+    ) -> (Option<(f32, f32)>, f32) {
         let Some((sx, sy)) = from else {
-            self.dab(brush, color, to.0, to.1);
+            let size = brush.resolve_size(to_dyn.pressure, to_dyn.speed_norm);
+            let opacity = brush.resolve_opacity(to_dyn.pressure, to_dyn.speed_norm);
+            let (ox, oy) = scatter_offset(brush, to.0, to.1, size);
+            self.dab_dyn(brush, color, to.0 + ox, to.1 + oy, size, opacity, to_dyn.angle);
             return (Some(to), 0.0);
         };
         let (dx, dy) = (to.0 - sx, to.1 - sy);
@@ -405,14 +730,48 @@ impl Document {
         if dist <= 0.0 {
             return (from, leftover);
         }
+        // Step from the midpoint size so tapered strokes keep even dabs.
+        let mid_size = brush.resolve_size(
+            (from_dyn.pressure + to_dyn.pressure) * 0.5,
+            (from_dyn.speed_norm + to_dyn.speed_norm) * 0.5,
+        );
+        let step = (mid_size * brush.spacing).max(1.0);
+        // Lerp direction as unit vectors (stable across +/-PI).
+        let (fx, fy) = (from_dyn.angle.cos(), from_dyn.angle.sin());
+        let (tx, ty) = (to_dyn.angle.cos(), to_dyn.angle.sin());
         let mut travelled = leftover;
         while travelled <= dist {
             let t = travelled / dist;
-            self.dab(brush, color, sx + dx * t, sy + dy * t);
+            let pressure = from_dyn.pressure + (to_dyn.pressure - from_dyn.pressure) * t;
+            let speed = from_dyn.speed_norm + (to_dyn.speed_norm - from_dyn.speed_norm) * t;
+            let vx = fx + (tx - fx) * t;
+            let vy = fy + (ty - fy) * t;
+            let angle = vy.atan2(vx);
+            let size = brush.resolve_size(pressure, speed);
+            let opacity = brush.resolve_opacity(pressure, speed);
+            let (x, y) = (sx + dx * t, sy + dy * t);
+            let (ox, oy) = scatter_offset(brush, x, y, size);
+            self.dab_dyn(brush, color, x + ox, y + oy, size, opacity, angle);
             travelled += step;
         }
         (Some(to), travelled - dist)
     }
+}
+
+/// Deterministic scatter offset for a dab center: uniform in
+/// `[-scatter*size/2, +scatter*size/2]` per axis, hashed from the dab
+/// position (quantized) so strokes replay identically. Returns (0, 0)
+/// when `scatter` is 0.
+fn scatter_offset(brush: &Brush, x: f32, y: f32, size: f32) -> (f32, f32) {
+    let sc = brush.scatter.clamp(0.0, 1.0);
+    if sc <= 0.0 || size <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let qx = (x * 2.0).round() as i32;
+    let qy = (y * 2.0).round() as i32;
+    let ox = (hash01(qx, qy ^ 0x51ab) - 0.5) * sc * size;
+    let oy = (hash01(qx ^ 0x2b7e, qy) - 0.5) * sc * size;
+    (ox, oy)
 }
 
 /// A named brush for a `.pcbrush` library file: display name plus settings.
@@ -447,6 +806,33 @@ fn check_preset(name: &str, brush: &Brush) -> Result<String, String> {
     }
     if !(0.0 < brush.spacing && brush.spacing <= 2.0) {
         return Err(format!("brush '{clean}' has a bad spacing"));
+    }
+    if !(0.0 <= brush.pressure_size && brush.pressure_size <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad pressure-size"));
+    }
+    if !(0.0 <= brush.pressure_opacity && brush.pressure_opacity <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad pressure-opacity"));
+    }
+    if !(0.0 <= brush.velocity_size && brush.velocity_size <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad velocity-size"));
+    }
+    if !(0.0 <= brush.velocity_opacity && brush.velocity_opacity <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad velocity-opacity"));
+    }
+    if !(0.0 <= brush.grain && brush.grain <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad grain"));
+    }
+    if !(0.25 <= brush.grain_scale && brush.grain_scale <= 4.0) {
+        return Err(format!("brush '{clean}' has a bad grain scale"));
+    }
+    if !(0.1 <= brush.roundness && brush.roundness <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad roundness"));
+    }
+    if !(0.0 <= brush.scatter && brush.scatter <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad scatter"));
+    }
+    if !(0.0 <= brush.stabilizer && brush.stabilizer <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad stabilizer"));
     }
     if brush.eraser {
         return Err(format!("brush '{clean}' must not be an eraser"));
@@ -493,15 +879,54 @@ pub fn open_brush_library(path: &std::path::Path) -> Result<Vec<BrushPreset>, St
 }
 
 /// Built-in brush presets: name plus settings. Original set, roughly grouped
-/// from hard sketching to soft painting.
+/// from hard sketching to soft painting. M14 gives each preset its own
+/// dynamics voice: Pencil bites with pressure and grain, Ink smooths and
+/// follows direction, Marker is a flat chisel, Airbrush answers pressure
+/// with flow rather than size, Chalk is all grain and scatter.
 pub fn presets() -> Vec<(&'static str, Brush)> {
     vec![
-        ("Pencil", Brush { size: 3.0, opacity: 1.0, softness: 0.15, spacing: 0.1, eraser: false, tip: None }),
-        ("Ink Pen", Brush { size: 6.0, opacity: 1.0, softness: 0.3, spacing: 0.1, eraser: false, tip: None }),
-        ("Round", Brush { size: 24.0, opacity: 1.0, softness: 0.6, spacing: 0.15, eraser: false, tip: None }),
-        ("Marker", Brush { size: 28.0, opacity: 0.85, softness: 0.5, spacing: 0.12, eraser: false, tip: None }),
-        ("Airbrush", Brush { size: 64.0, opacity: 0.25, softness: 1.0, spacing: 0.08, eraser: false, tip: None }),
-        ("Chalk", Brush { size: 18.0, opacity: 0.8, softness: 0.9, spacing: 0.25, eraser: false, tip: None }),
+        ("Pencil", Brush {
+            size: 3.0, opacity: 1.0, softness: 0.15, spacing: 0.1, eraser: false, tip: None,
+            pressure_size: 0.8, pressure_opacity: 0.7,
+            velocity_size: 0.5, velocity_opacity: 0.4,
+            grain: 0.35, grain_scale: 0.8, roundness: 1.0,
+            angle_follow: false, scatter: 0.05, stabilizer: 0.25,
+        }),
+        ("Ink Pen", Brush {
+            size: 6.0, opacity: 1.0, softness: 0.3, spacing: 0.1, eraser: false, tip: None,
+            pressure_size: 0.9, pressure_opacity: 0.8,
+            velocity_size: 0.4, velocity_opacity: 0.3,
+            grain: 0.0, grain_scale: 1.0, roundness: 0.6,
+            angle_follow: true, scatter: 0.0, stabilizer: 0.5,
+        }),
+        ("Round", Brush {
+            size: 24.0, opacity: 1.0, softness: 0.6, spacing: 0.15, eraser: false, tip: None,
+            pressure_size: 0.7, pressure_opacity: 0.6,
+            velocity_size: 0.6, velocity_opacity: 0.6,
+            grain: 0.0, grain_scale: 1.0, roundness: 1.0,
+            angle_follow: false, scatter: 0.0, stabilizer: 0.35,
+        }),
+        ("Marker", Brush {
+            size: 28.0, opacity: 0.85, softness: 0.5, spacing: 0.12, eraser: false, tip: None,
+            pressure_size: 0.4, pressure_opacity: 0.5,
+            velocity_size: 0.3, velocity_opacity: 0.3,
+            grain: 0.0, grain_scale: 1.0, roundness: 0.55,
+            angle_follow: true, scatter: 0.0, stabilizer: 0.3,
+        }),
+        ("Airbrush", Brush {
+            size: 64.0, opacity: 0.25, softness: 1.0, spacing: 0.08, eraser: false, tip: None,
+            pressure_size: 0.3, pressure_opacity: 0.9,
+            velocity_size: 0.2, velocity_opacity: 0.3,
+            grain: 0.15, grain_scale: 1.5, roundness: 1.0,
+            angle_follow: false, scatter: 0.0, stabilizer: 0.4,
+        }),
+        ("Chalk", Brush {
+            size: 18.0, opacity: 0.8, softness: 0.9, spacing: 0.25, eraser: false, tip: None,
+            pressure_size: 0.6, pressure_opacity: 0.6,
+            velocity_size: 0.5, velocity_opacity: 0.5,
+            grain: 0.55, grain_scale: 0.7, roundness: 1.0,
+            angle_follow: false, scatter: 0.12, stabilizer: 0.2,
+        }),
     ]
 }
 impl Document {
@@ -877,6 +1302,7 @@ pub struct Stroke<'a> {
     brush: Brush,
     color: Color,
     last: Option<(f32, f32)>,
+    last_dyn: DabDynamics,
     leftover: f32,
 }
 
@@ -884,15 +1310,27 @@ impl<'a> Stroke<'a> {
     /// Checkpoint the active layer for undo, then start painting.
     pub fn begin(doc: &'a mut Document, brush: Brush, color: Color) -> Self {
         doc.checkpoint();
-        Self { doc, brush, color, last: None, leftover: 0.0 }
+        Self { doc, brush, color, last: None, last_dyn: DabDynamics::default(), leftover: 0.0 }
     }
 
     /// Feed a pointer position (canvas pixels).
     pub fn push(&mut self, x: f32, y: f32) {
-        let (last, leftover) = self
-            .doc
-            .stroke_to(&self.brush, self.color, self.last, (x, y), self.leftover);
+        self.push_dyn(x, y, DabDynamics::default());
+    }
+
+    /// Feed a pointer position with dynamics (pressure/speed/direction).
+    pub fn push_dyn(&mut self, x: f32, y: f32, dyn_: DabDynamics) {
+        let (last, leftover) = self.doc.stroke_to_dyn(
+            &self.brush,
+            self.color,
+            self.last,
+            self.last_dyn,
+            (x, y),
+            dyn_,
+            self.leftover,
+        );
         self.last = last;
+        self.last_dyn = dyn_;
         self.leftover = leftover;
     }
 }
@@ -1033,6 +1471,190 @@ mod tests {
             .into_iter()
             .map(|(name, brush)| BrushPreset { name: name.to_string(), brush })
             .collect()
+    }
+
+    #[test]
+    fn dynamics_resolve_identity_at_full_pressure() {
+        let brush = Brush::default();
+        assert_eq!(brush.resolve_size(1.0, 0.0), brush.size);
+        assert_eq!(brush.resolve_opacity(1.0, 0.0), brush.opacity);
+    }
+
+    #[test]
+    fn pressure_tapers_size_and_opacity() {
+        let brush = Brush {
+            size: 20.0,
+            opacity: 1.0,
+            pressure_size: 0.8,
+            pressure_opacity: 0.6,
+            velocity_size: 0.0,
+            velocity_opacity: 0.0,
+            ..Default::default()
+        };
+        // p=0 keeps (1-0.8)=20% of size, (1-0.6)=40% of opacity.
+        assert!((brush.resolve_size(0.0, 0.0) - 4.0).abs() < 0.001);
+        assert!((brush.resolve_opacity(0.0, 0.0) - 0.4).abs() < 0.001);
+        // Disabled amounts are no-ops at any pressure.
+        let flat = Brush {
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            ..brush.clone()
+        };
+        assert_eq!(flat.resolve_size(0.0, 0.0), 20.0);
+        assert_eq!(flat.resolve_opacity(0.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn velocity_thins_and_fades() {
+        let brush = Brush::default(); // velocity 0.6 / 0.6
+        let size_full = brush.resolve_size(1.0, 1.0);
+        let op_full = brush.resolve_opacity(1.0, 1.0);
+        assert!(size_full < brush.size);
+        assert!(op_full < brush.opacity);
+        // Old M7 weights preserved: size 0.6, opacity 0.4 at full speed.
+        assert!((size_full - brush.size * (1.0 - 0.6 * 0.6)).abs() < 0.001);
+        assert!((op_full - brush.opacity * (1.0 - 0.4 * 0.6)).abs() < 0.001);
+    }
+
+    #[test]
+    fn old_brush_json_loads_with_new_defaults() {
+        let old = r#"[{"name":"Old","brush":{"size":10.0,"opacity":1.0,"softness":0.5,"spacing":0.2,"eraser":false}}]"#;
+        let libs: Vec<BrushPreset> = serde_json::from_str(old).unwrap();
+        assert_eq!(libs.len(), 1);
+        let want = Brush { size: 10.0, softness: 0.5, spacing: 0.2, ..Default::default() };
+        assert_eq!(libs[0].brush, want);
+    }
+
+    fn alpha_sum(doc: &Document) -> u64 {
+        doc.layers[0].pixels.iter().skip(3).step_by(4).map(|&b| b as u64).sum()
+    }
+
+    fn painted_bbox(doc: &Document) -> Option<(u32, u32, u32, u32)> {
+        let (w, h) = (doc.w, doc.h);
+        let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+        let mut any = false;
+        for y in 0..h {
+            for x in 0..w {
+                if doc.layers[0].pixels[((y * w + x) * 4 + 3) as usize] > 0 {
+                    any = true;
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        any.then_some((x0, y0, x1, y1))
+    }
+
+    #[test]
+    fn light_pressure_stroke_paints_less() {
+        let brush = Brush { size: 12.0, softness: 0.0, spacing: 0.1, ..Default::default() };
+        let stroke = |pressure: f32| {
+            let mut doc = Document::new(64, 64);
+            let d = DabDynamics { pressure, speed_norm: 0.0, angle: 0.0 };
+            doc.stroke_to_dyn(&brush, Color::rgb(255, 0, 0), Some((10.0, 32.0)), d, (54.0, 32.0), d, 0.0);
+            doc
+        };
+        let full = alpha_sum(&stroke(1.0));
+        let light = alpha_sum(&stroke(0.2));
+        assert!(full > 0 && light > 0);
+        assert!(light < full, "light {light} vs full {full}");
+    }
+
+    #[test]
+    fn grain_breaks_up_the_dab() {
+        let clean = Brush { size: 20.0, softness: 0.0, spacing: 0.5, ..Default::default() };
+        let grained = Brush { grain: 0.8, grain_scale: 1.0, ..clean.clone() };
+        let paint = |brush: &Brush| {
+            let mut doc = Document::new(48, 48);
+            doc.dab(brush, Color::rgb(255, 255, 255), 24.0, 24.0);
+            doc
+        };
+        let (c, g) = (paint(&clean), paint(&grained));
+        assert!(alpha_sum(&g) < alpha_sum(&c));
+        // Same footprint (grain never fully erases), different values.
+        assert_eq!(painted_bbox(&g), painted_bbox(&c));
+        assert_ne!(c.layers[0].pixels, g.layers[0].pixels);
+    }
+
+    #[test]
+    fn roundness_squeezes_across_the_stroke() {
+        let paint = |roundness: f32| {
+            let brush = Brush {
+                size: 20.0,
+                softness: 0.0,
+                spacing: 0.5,
+                roundness,
+                ..Default::default()
+            };
+            let mut doc = Document::new(48, 48);
+            doc.dab(&brush, Color::rgb(255, 255, 255), 24.0, 24.0);
+            doc
+        };
+        let (x0r, y0r, x1r, y1r) = painted_bbox(&paint(1.0)).unwrap();
+        let (x0f, y0f, x1f, y1f) = painted_bbox(&paint(0.3)).unwrap();
+        // Angle 0: u along x stays full width, v (y) is squeezed.
+        assert_eq!((x0f, x1f), (x0r, x1r));
+        assert!(y1f - y0f < y1r - y0r, "flat {} vs round {}", y1f - y0f, y1r - y0r);
+    }
+
+    #[test]
+    fn scatter_moves_dabs() {
+        let plain = Brush { size: 12.0, softness: 0.5, spacing: 0.2, ..Default::default() };
+        let scattered = Brush { scatter: 0.6, ..plain.clone() };
+        let paint = |brush: &Brush| {
+            let mut doc = Document::new(64, 64);
+            let d = DabDynamics::default();
+            doc.stroke_to_dyn(&brush, Color::rgb(255, 0, 0), Some((8.0, 32.0)), d, (56.0, 32.0), d, 0.0);
+            doc
+        };
+        assert_ne!(paint(&plain).layers[0].pixels, paint(&scattered).layers[0].pixels);
+    }
+
+    #[test]
+    fn angle_follow_steers_stamp_orientation() {
+        // Wide flat tip: horizontal strokes stamp wide, vertical tall.
+        let tip = BrushTip::from_mask(8, 4, vec![255u8; 32]).unwrap();
+        let brush = Brush {
+            size: 8.0,
+            opacity: 1.0,
+            spacing: 2.0,
+            angle_follow: true,
+            ..Default::default()
+        };
+        let brush = Brush { tip: Some(tip), ..brush };
+        let paint = |from: (f32, f32), to: (f32, f32), angle: f32| {
+            let mut doc = Document::new(48, 48);
+            let d = DabDynamics { pressure: 1.0, speed_norm: 0.0, angle };
+            // Short segment + wide spacing: exactly one dab at `from`.
+            doc.stroke_to_dyn(&brush, Color::rgb(255, 255, 255), Some(from), d, to, d, 0.0);
+            painted_bbox(&doc).unwrap()
+        };
+        let (hx0, hy0, hx1, hy1) = paint((24.0, 24.0), (32.0, 24.0), 0.0);
+        let (vx0, vy0, vx1, vy1) = paint((24.0, 24.0), (24.0, 32.0), std::f32::consts::FRAC_PI_2);
+        assert!(hx1 - hx0 > hy1 - hy0, "horizontal should be wide");
+        assert!(vy1 - vy0 > vx1 - vx0, "vertical should be tall");
+    }
+
+    #[test]
+    fn validation_rejects_new_ranges() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-lib-m14-range.pcbrush");
+        for brush in [
+            Brush { pressure_size: 2.0, ..Default::default() },
+            Brush { pressure_opacity: -0.5, ..Default::default() },
+            Brush { velocity_size: 1.5, ..Default::default() },
+            Brush { grain: 1.5, ..Default::default() },
+            Brush { grain_scale: 9.0, ..Default::default() },
+            Brush { roundness: 0.0, ..Default::default() },
+            Brush { scatter: -1.0, ..Default::default() },
+            Brush { stabilizer: 2.0, ..Default::default() },
+        ] {
+            let libs = vec![BrushPreset { name: "Bad".to_string(), brush }];
+            assert!(save_brush_library(&path, &libs).is_err());
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

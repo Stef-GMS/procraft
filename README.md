@@ -11,7 +11,7 @@ original.
 > Interactive. ProCraft is an independent project with its own name, branding
 > and code, and is not affiliated with or endorsed by any other vendor.
 
-## Status: milestone 20
+## Status: milestone 22
 
 - [x] Layered document model (add / hide / reorder / opacity / blend)
 - [x] Soft-round brush + eraser with spacing, dynamics and undo
@@ -38,6 +38,8 @@ original.
 - [x] Text tool: click-to-anchor, multiline 8-128px dialog, bundled Inter (OFL, latin subset, fontdue raster), bakes to layer in one undo step
 - [x] Lossless layer moves: O(1) offsets (off-canvas content preserved, undoable), offset-aware paint/flood/text/merge/flip/affine/masks/animation/PSD
 - [x] Micro-steppers (−/+ on every slider), compact tools panel
+- [x] Drawing Assist: strokes lock to guides while drawing (perspective nearest-ray incl. draggable VPs, square/iso dominant axis; 4px deadzone, parked-on-VP and Off paint free) with checkbox + hint and amber lock-line overlay (brush + eraser)
+- [x] Selection Studio: feather/grow-shrink/smooth/invert/select-opaque/outline in a collapsing group, 0-255 weighted masks (graduated coverage through paint/tone/blur/sharpen, flood binary-gated), bbox-retightened rect ants, stamp-path feather fix
 
 ## Icon
 

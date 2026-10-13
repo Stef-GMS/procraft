@@ -217,6 +217,11 @@ struct ProCraftApp {
     /// `sel_edges_dirty` (set at every selection-mutating site).
     sel_edges: Vec<(u32, u32)>,
     sel_edges_dirty: bool,
+    /// Canvas pan offset in screen px (two-finger drag on touch; the
+    /// desktop scrolls the view with the wheel instead).
+    view_offset: egui::Vec2,
+    /// A stroke applied at least one dab (guards pinch-cancel revert).
+    stroke_painted: bool,
     fill_tolerance: u8,
     fill_preview: Option<FillPreview>,
     filter_preview: Option<FilterPreview>,
@@ -324,6 +329,8 @@ impl ProCraftApp {
             lasso_poly: Vec::new(),
             sel_edges: Vec::new(),
             sel_edges_dirty: true,
+            view_offset: egui::Vec2::ZERO,
+            stroke_painted: false,
             fill_tolerance: 32,
             fill_preview: None,
             filter_preview: None,
@@ -1298,6 +1305,7 @@ impl eframe::App for ProCraftApp {
                 }
                 if ui.button("Fit").clicked() {
                     self.zoom = 0.0; // recomputed in the canvas view
+                    self.view_offset = egui::Vec2::ZERO;
                 }
                 if ui.button("ⓘ About").clicked() {
                     self.show_about = !self.show_about;
@@ -1343,11 +1351,16 @@ impl eframe::App for ProCraftApp {
                 .collapsible(false)
                 .show(ui.ctx(), |ui| {
                     ui.label("Click the canvas to move the anchor, then Render.");
-                    ui.add(
+                    // Explicit focus like the layer rename: iOS shows no
+                    // keyboard for an unfocused multiline field.
+                    let field = ui.add(
                         egui::TextEdit::multiline(&mut self.text_body)
                             .desired_rows(3)
                             .hint_text("Type here (Enter = new line)"),
                     );
+                    if !field.has_focus() {
+                        field.request_focus();
+                    }
                     stepped_slider(ui, &mut self.text_size, MIN_TEXT_PX..=128.0, 1.0, "Size px");
                     ui.horizontal(|ui| {
                         if ui.button("Render").clicked() {
@@ -2436,13 +2449,57 @@ impl eframe::App for ProCraftApp {
             // Pinch-to-zoom (iOS touch; Ctrl+wheel on desktop): no-op when
             // the backend reports no gesture.
             let pinch = ui.ctx().input(|i| i.zoom_delta());
+            let fingers = ui.ctx().input(|i| i.multi_touch());
+            let gesture = fingers.is_some();
             if (pinch - 1.0).abs() > f32::EPSILON {
                 self.zoom = (self.zoom * pinch).clamp(0.1, 8.0);
+            }
+            // Two-finger drag pans the canvas. Touchscreens have no wheel
+            // to scroll the view with, so the offset is applied manually
+            // (desktop wheel-scroll leaves it at zero; a desktop trackpad
+            // pinch could add to it, harmlessly — same direction).
+            if let Some(m) = &fingers {
+                let d = m.translation_delta;
+                if d != egui::Vec2::ZERO {
+                    self.view_offset += d;
+                    let (cw, ch) = (w * self.zoom, h * self.zoom);
+                    self.view_offset.x = self.view_offset.x.clamp(-cw + 60.0, avail.x - 60.0);
+                    self.view_offset.y = self.view_offset.y.clamp(-ch + 60.0, avail.y - 60.0);
+                }
+            }
+            // A gesture aborts any in-progress stroke or drag so pinching
+            // never paints, selects, moves, or grabs. A partially painted
+            // stroke reverts (one undo step, from the stroke checkpoint).
+            if gesture {
+                if self.painting && self.stroke_painted {
+                    self.stroke_painted = false;
+                    if self.doc.undo() {
+                        self.ghost_dirty = true;
+                        self.status = "Pinch: stroke cancelled.".to_string();
+                    }
+                }
+                self.painting = false;
+                self.last = None;
+                self.smooth_pt = None;
+                self.assist_start = None;
+                self.assist_lock = None;
+                self.sel_anchor = None;
+                self.sel_current = None;
+                self.lasso_points.clear();
+                self.shape_anchor = None;
+                self.shape_current = None;
+                self.move_from = None;
+                self.fill_preview = None;
+                self.vp_grab = None;
+                self.sym_grab = false;
             }
             let z = self.zoom;
             egui::ScrollArea::both().show(ui, |ui| {
                 let (rect, resp) =
                     ui.allocate_exact_size(Vec2::new(w * z, h * z), Sense::click_and_drag());
+                // Pan applies to the drawn canvas and every overlay/mapping
+                // below (sizes are translation-invariant).
+                let rect = rect.translate(self.view_offset);
                 ui.painter().image(
                     tex,
                     rect,
@@ -2581,8 +2638,9 @@ impl eframe::App for ProCraftApp {
                     }
                 }
                 // Onion skins over the current frame (assist only, not in
-                // mask view): previous frame red, next frame blue.
-                if self.anim_assist && self.onion && !self.view_mask {
+                // mask view, hidden while playing so ghosts never tint
+                // the page as frames change).
+                if self.anim_assist && self.onion && !self.view_mask && !self.anim_playing {
                     self.refresh_ghosts(&ctx);
                     let full =
                         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0));
@@ -2670,7 +2728,7 @@ impl eframe::App for ProCraftApp {
                 if self.vp_move
                     && matches!(self.guides.kind, GuideKind::OnePoint | GuideKind::TwoPoint)
                 {
-                    if resp.drag_started() {
+                    if resp.drag_started() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let mut best: Option<(usize, f32)> = None;
                             for (i, (vx, vy)) in self.guides.vp_list(w, h).iter().enumerate() {
@@ -2706,7 +2764,7 @@ impl eframe::App for ProCraftApp {
                 // Mirror-center dragging (armed in the Symmetry panel):
                 // grabs pause painting and move the axes' crossing.
                 if self.sym_move && self.doc.symmetry != SymmetryMode::Off {
-                    if resp.drag_started() {
+                    if resp.drag_started() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let (scx, scy) = self.doc.symmetry_center_px();
                             let (p, _) = vp_handle_pos(rect, z, scx, scy);
@@ -2730,7 +2788,7 @@ impl eframe::App for ProCraftApp {
 
                 if self.tool == Tool::Select {
                     // Marquee selection.
-                    if resp.drag_started() {
+                    if resp.drag_started() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
                             self.sel_anchor = Some(clamp_pt(x, y));
@@ -2815,13 +2873,13 @@ impl eframe::App for ProCraftApp {
 
                 if self.tool == Tool::Lasso {
                     // Freehand loop: collect points, build the mask on release.
-                    if resp.drag_started() {
+                    if resp.drag_started() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
                             self.lasso_points = vec![clamp_pt(x, y)];
                         }
                     }
-                    if resp.dragged() {
+                    if resp.dragged() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
                             let p = clamp_pt(x, y);
@@ -2877,7 +2935,7 @@ impl eframe::App for ProCraftApp {
                     // ColorDrop: tap fills; keep holding and drag sideways to
                     // sweep the tolerance with a live preview (one undo step
                     // for the whole gesture).
-                    if resp.drag_started() {
+                    if resp.drag_started() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
                             let (cx, cy) = clamp_pt(x, y);
@@ -2911,7 +2969,7 @@ impl eframe::App for ProCraftApp {
                                 self.fill_tolerance
                             );
                         }
-                    } else if resp.dragged() {
+                    } else if resp.dragged() && !gesture {
                         if let Some(mut fp) = self.fill_preview.take() {
                             if let Some(pos) = resp.hover_pos() {
                                 let tol = (fp.start_tol as i32
@@ -2947,7 +3005,7 @@ impl eframe::App for ProCraftApp {
 
                 if self.tool == Tool::Move {
                     // Drag the active layer around (integer steps).
-                    if resp.drag_started() {
+                    if resp.drag_started() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             self.doc.checkpoint();
                             self.move_from = Some(to_canvas(pos));
@@ -2979,7 +3037,7 @@ impl eframe::App for ProCraftApp {
 
                 if self.tool == Tool::Shapes {
                     // Drag a preview, rasterize on release.
-                    if resp.drag_started() {
+                    if resp.drag_started() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
                             self.shape_anchor = Some(clamp_pt(x, y));
@@ -3158,7 +3216,7 @@ impl eframe::App for ProCraftApp {
                 if self.tool == Tool::Text {
                     // Click anchors the text block and opens the dialog;
                     // Render bakes it to the active layer (undoable).
-                    if resp.clicked() {
+                    if resp.clicked() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
                             self.text_anchor = Some(clamp_pt(x, y));
@@ -3170,9 +3228,10 @@ impl eframe::App for ProCraftApp {
                     return;
                 }
 
-                if resp.drag_started() {
+                if resp.drag_started() && !gesture {
                     self.doc.checkpoint();
                     self.painting = true;
+                    self.stroke_painted = false;
                     // Painting edits the current frame: pause playback so
                     // the viewed frame never goes stale mid-stroke.
                     if self.anim_playing {
@@ -3290,6 +3349,7 @@ impl eframe::App for ProCraftApp {
                         self.last = last;
                         self.last_dyn = to_dyn;
                         self.leftover = leftover;
+                        self.stroke_painted = true;
                     }
                 }
                 if resp.drag_stopped() {

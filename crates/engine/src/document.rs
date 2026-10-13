@@ -306,7 +306,16 @@ pub struct Document {
     dirty: Option<(u32, u32, u32, u32)>,
     undo: Vec<UndoEntry>,
     redo: Vec<UndoEntry>,
+    undo_bytes: usize,
+    redo_bytes: usize,
 }
+
+/// History cap: at most 32 steps per stack (backstop)…
+const MAX_UNDO_ENTRIES: usize = 32;
+/// …and at most 256 MiB per stack. A 4K masked layer is ~40 MiB per step,
+/// so the byte budget binds first on big canvases (6 steps) while the count
+/// cap binds on small ones (32 steps x ~5 MiB at 1280x800).
+const MAX_UNDO_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct UndoEntry {
@@ -315,6 +324,12 @@ struct UndoEntry {
     mask: Option<Vec<u8>>,
     ox: i32,
     oy: i32,
+}
+
+impl UndoEntry {
+    fn byte_size(&self) -> usize {
+        self.pixels.len() + self.mask.as_ref().map_or(0, Vec::len)
+    }
 }
 
 impl Document {
@@ -334,6 +349,8 @@ impl Document {
             dirty: None,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_bytes: 0,
+            redo_bytes: 0,
         }
     }
 
@@ -356,6 +373,8 @@ impl Document {
             dirty: None,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_bytes: 0,
+            redo_bytes: 0,
         }
     }
     /// Mirror center in canvas pixels (canvas middle when never moved).
@@ -439,11 +458,34 @@ impl Document {
     /// A new checkpoint discards the redo history.
     pub fn checkpoint(&mut self) {
         if let Some(entry) = self.snapshot() {
-            if self.undo.len() >= 32 {
-                self.undo.remove(0);
-            }
-            self.undo.push(entry);
+            self.push_undo(entry);
             self.redo.clear();
+            self.redo_bytes = 0;
+        }
+    }
+
+    /// Push onto the undo stack, evicting oldest-first while over either cap.
+    /// The newest step is always kept, even if it alone exceeds the budget.
+    fn push_undo(&mut self, entry: UndoEntry) {
+        self.undo_bytes += entry.byte_size();
+        self.undo.push(entry);
+        while self.undo.len() > 1
+            && (self.undo.len() > MAX_UNDO_ENTRIES || self.undo_bytes > MAX_UNDO_BYTES)
+        {
+            self.undo_bytes -= self.undo[0].byte_size();
+            self.undo.remove(0);
+        }
+    }
+
+    /// Push onto the redo stack, same dual-cap eviction as [`Self::push_undo`].
+    fn push_redo(&mut self, entry: UndoEntry) {
+        self.redo_bytes += entry.byte_size();
+        self.redo.push(entry);
+        while self.redo.len() > 1
+            && (self.redo.len() > MAX_UNDO_ENTRIES || self.redo_bytes > MAX_UNDO_BYTES)
+        {
+            self.redo_bytes -= self.redo[0].byte_size();
+            self.redo.remove(0);
         }
     }
 
@@ -461,11 +503,9 @@ impl Document {
     /// Restore the most recent snapshot. Returns false when history is empty.
     pub fn undo(&mut self) -> bool {
         if let Some(entry) = self.undo.pop() {
+            self.undo_bytes -= entry.byte_size();
             if let Some(cur) = self.snapshot() {
-                if self.redo.len() >= 32 {
-                    self.redo.remove(0);
-                }
-                self.redo.push(cur);
+                self.push_redo(cur);
                 if let Some(layer) = self.layers.get_mut(entry.layer) {
                     layer.pixels = entry.pixels;
                     layer.mask = entry.mask;
@@ -483,11 +523,9 @@ impl Document {
     /// Re-apply the most recently undone snapshot. Returns false when empty.
     pub fn redo(&mut self) -> bool {
         if let Some(entry) = self.redo.pop() {
+            self.redo_bytes -= entry.byte_size();
             if let Some(cur) = self.snapshot() {
-                if self.undo.len() >= 32 {
-                    self.undo.remove(0);
-                }
-                self.undo.push(cur);
+                self.push_undo(cur);
                 if let Some(layer) = self.layers.get_mut(entry.layer) {
                     layer.pixels = entry.pixels;
                     layer.mask = entry.mask;
@@ -1580,6 +1618,8 @@ impl Document {
         self.selection_mask = None;
         self.undo.clear();
         self.redo.clear();
+        self.undo_bytes = 0;
+        self.redo_bytes = 0;
         Ok(())
     }
 
@@ -1916,6 +1956,8 @@ impl Document {
             dirty: None,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_bytes: 0,
+            redo_bytes: 0,
         })
     }
 }
@@ -1967,6 +2009,30 @@ mod tests {
         // Undo still works after a redo.
         assert!(doc.undo());
         assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn undo_keeps_count_cap_on_small_canvas() {
+        let mut doc = Document::new(16, 16);
+        for _ in 0..40 {
+            doc.checkpoint();
+        }
+        assert_eq!(doc.undo.len(), 32);
+        assert!(doc.undo_bytes <= MAX_UNDO_BYTES);
+    }
+
+    #[test]
+    fn undo_byte_budget_binds_on_large_canvas() {
+        // 2048x2048 RGBA = 16 MiB per step: the 256 MiB budget caps at 16,
+        // well under the 32-count backstop.
+        let mut doc = Document::new(2048, 2048);
+        for _ in 0..40 {
+            doc.checkpoint();
+        }
+        assert_eq!(doc.undo.len(), 16);
+        assert!(doc.undo_bytes <= MAX_UNDO_BYTES);
+        // The newest step is still undoable after budget eviction.
+        assert!(doc.undo());
     }
 
     #[test]

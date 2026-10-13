@@ -150,6 +150,7 @@ impl SymmetryMode {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn mirrored_pixels(
         self,
         w: u32,
@@ -339,7 +340,7 @@ impl Document {
     /// Assemble a document from imported layers (white page, given active
     /// layer, no selection or history). For format importers in this crate.
     pub(crate) fn from_layers(w: u32, h: u32, layers: Vec<Layer>, active: usize) -> Self {
-        let active = active.min(layers.len().saturating_sub(1).max(0));
+        let active = active.min(layers.len().saturating_sub(1));
         Self {
             w,
             h,
@@ -359,10 +360,8 @@ impl Document {
     }
     /// Mirror center in canvas pixels (canvas middle when never moved).
     pub fn symmetry_center_px(&self) -> (f32, f32) {
-        self.symmetry_center.unwrap_or((
-            (self.w as f32 - 1.0) * 0.5,
-            (self.h as f32 - 1.0) * 0.5,
-        ))
+        self.symmetry_center
+            .unwrap_or(((self.w as f32 - 1.0) * 0.5, (self.h as f32 - 1.0) * 0.5))
     }
 
     /// Move the mirror center (clamped, like layer offsets and VPs).
@@ -504,8 +503,11 @@ impl Document {
     }
 
     fn composite_pixel(&self, x: u32, y: u32) -> [u8; 4] {
-        let (mut r, mut g, mut b) =
-            (self.background[0] as f32, self.background[1] as f32, self.background[2] as f32);
+        let (mut r, mut g, mut b) = (
+            self.background[0] as f32,
+            self.background[1] as f32,
+            self.background[2] as f32,
+        );
         // Opaque content composited so far (layers only, not the page):
         // clipping masks intersect against it.
         let mut below_a = 0.0f32;
@@ -515,7 +517,9 @@ impl Document {
             }
             // Buffer content sits at the layer offset; off-canvas parts of
             // the buffer simply don't cover this pixel.
-            let Some(o) = layer.local_offset(x, y, self.w, self.h) else { continue };
+            let Some(o) = layer.local_offset(x, y, self.w, self.h) else {
+                continue;
+            };
             if o + 3 >= layer.pixels.len() {
                 continue;
             }
@@ -605,7 +609,10 @@ impl Document {
         let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
         let mut out = [0u8; 4];
         for i in 0..4 {
-            let v = a[i] * (1.0 - fx) * (1.0 - fy) + b[i] * fx * (1.0 - fy) + c[i] * (1.0 - fx) * fy + d[i] * fx * fy;
+            let v = a[i] * (1.0 - fx) * (1.0 - fy)
+                + b[i] * fx * (1.0 - fy)
+                + c[i] * (1.0 - fx) * fy
+                + d[i] * fx * fy;
             out[i] = v.round().clamp(0.0, 255.0) as u8;
         }
         out
@@ -624,7 +631,7 @@ impl Document {
         if let Some(m) = self.layers[index].mask.clone() {
             let rgba: Vec<u8> = m.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
             let out = Self::affine_buffer(&rgba, w, h, scale, degrees);
-            self.layers[index].mask = Some(out.chunks_exact(4).map(|p| p[0]).collect());
+            self.layers[index].mask = Some(out.as_chunks::<4>().0.iter().map(|p| p[0]).collect());
         }
         // Carry the offset through the same forward map (scale, then
         // rotate about the canvas center) so transformed content lands
@@ -749,7 +756,11 @@ impl Document {
             return false;
         }
         let src = self.layers[index].clone();
-        let sa_base = if src.visible { src.opacity.clamp(0.0, 1.0) } else { 0.0 };
+        let sa_base = if src.visible {
+            src.opacity.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let (w, h) = (self.w, self.h);
         let dst = &mut self.layers[index - 1];
         let (dox, doy) = (dst.ox, dst.oy);
@@ -766,24 +777,21 @@ impl Document {
                     continue;
                 }
                 let (slx, sly) = (x as i32 - src.ox, y as i32 - src.oy);
-                let (sr, sg, sb, mut sa) = if slx < 0
-                    || sly < 0
-                    || slx >= w as i32
-                    || sly >= h as i32
-                {
-                    (0, 0, 0, 0.0)
-                } else {
-                    let so = ((sly as u32 * w + slx as u32) * 4) as usize;
-                    if so + 3 >= src.pixels.len() {
+                let (sr, sg, sb, mut sa) =
+                    if slx < 0 || sly < 0 || slx >= w as i32 || sly >= h as i32 {
                         (0, 0, 0, 0.0)
                     } else {
-                        let mut a = sa_base * src.pixels[so + 3] as f32 / 255.0;
-                        if let Some(m) = src.mask.as_deref() {
-                            a *= m.get(so / 4).copied().unwrap_or(255) as f32 / 255.0;
+                        let so = ((sly as u32 * w + slx as u32) * 4) as usize;
+                        if so + 3 >= src.pixels.len() {
+                            (0, 0, 0, 0.0)
+                        } else {
+                            let mut a = sa_base * src.pixels[so + 3] as f32 / 255.0;
+                            if let Some(m) = src.mask.as_deref() {
+                                a *= m.get(so / 4).copied().unwrap_or(255) as f32 / 255.0;
+                            }
+                            (src.pixels[so], src.pixels[so + 1], src.pixels[so + 2], a)
                         }
-                        (src.pixels[so], src.pixels[so + 1], src.pixels[so + 2], a)
-                    }
-                };
+                    };
                 if src.clip {
                     let dst_a = dst.pixels[o + 3] as f32 / 255.0;
                     let dst_m = dst
@@ -798,12 +806,10 @@ impl Document {
                 let out_a = sa + da * (1.0 - sa);
                 if out_a > 0.0 {
                     for (ch, sc) in [sr, sg, sb].iter().enumerate() {
-                        let blended =
-                            src.blend.apply(*sc as f32, dst.pixels[o + ch] as f32);
-                        dst.pixels[o + ch] = ((blended * sa
-                            + dst.pixels[o + ch] as f32 * da * (1.0 - sa))
-                            / out_a)
-                            .round() as u8;
+                        let blended = src.blend.apply(*sc as f32, dst.pixels[o + ch] as f32);
+                        dst.pixels[o + ch] =
+                            ((blended * sa + dst.pixels[o + ch] as f32 * da * (1.0 - sa)) / out_a)
+                                .round() as u8;
                     }
                     dst.pixels[o + 3] = (out_a * 255.0).round() as u8;
                 }
@@ -956,7 +962,10 @@ impl Document {
             fy1 = fy1.max(y);
         }
         let (x0, y0) = (fx0.floor().max(0.0) as u32, fy0.floor().max(0.0) as u32);
-        let (x1, y1) = (fx1.ceil().min(w as f32 - 1.0).max(0.0) as u32, fy1.ceil().min(h as f32 - 1.0).max(0.0) as u32);
+        let (x1, y1) = (
+            fx1.ceil().min(w as f32 - 1.0).max(0.0) as u32,
+            fy1.ceil().min(h as f32 - 1.0).max(0.0) as u32,
+        );
         if x1 <= x0 || y1 <= y0 {
             self.selection_mask = None;
             return None;
@@ -975,7 +984,7 @@ impl Document {
                 }
             }
             xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            for pair in xs.chunks_exact(2) {
+            for pair in xs.as_chunks::<2>().0 {
                 let xa = (pair[0] - 0.5).ceil() as i32;
                 let xb = (pair[1] - 0.5 - 1e-6).floor() as i32;
                 for x in xa.max(x0 as i32)..=xb.min(x1 as i32) {
@@ -1038,7 +1047,10 @@ impl Document {
             return false;
         }
         let Some((rx0, ry0, rx1, ry1)) = self.selection else {
-            return self.selection_mask.as_ref().map_or(false, |m| m.iter().any(|&b| b != 0));
+            return self
+                .selection_mask
+                .as_ref()
+                .is_some_and(|m| m.iter().any(|&b| b != 0));
         };
         let n = (w * h) as usize;
         let mut mask = vec![0u8; n];
@@ -1164,7 +1176,11 @@ impl Document {
         let (w, h, r) = (w as usize, h as usize, r as usize);
         let mut tmp = vec![0u8; w * h];
         for y in 0..h {
-            tmp[y * w..(y + 1) * w].copy_from_slice(&Self::slide_extreme(&src[y * w..(y + 1) * w], r, dilate));
+            tmp[y * w..(y + 1) * w].copy_from_slice(&Self::slide_extreme(
+                &src[y * w..(y + 1) * w],
+                r,
+                dilate,
+            ));
         }
         let mut out = vec![0u8; w * h];
         let mut col = vec![0u8; h];
@@ -1225,7 +1241,11 @@ impl Document {
         }
         if let Some(m) = self.selection_mask.take() {
             let soft = Self::blur_gray(&m, self.w, self.h, 2);
-            self.selection_mask = Some(soft.into_iter().map(|v| if v >= 128 { 255 } else { 0 }).collect());
+            self.selection_mask = Some(
+                soft.into_iter()
+                    .map(|v| if v >= 128 { 255 } else { 0 })
+                    .collect(),
+            );
         }
         self.retighten_selection();
         self.selection_mask.is_some()
@@ -1278,7 +1298,11 @@ impl Document {
                 }
             }
         }
-        self.selection_mask = if mask.iter().any(|&b| b != 0) { Some(mask) } else { None };
+        self.selection_mask = if mask.iter().any(|&b| b != 0) {
+            Some(mask)
+        } else {
+            None
+        };
         self.retighten_selection();
         self.selection_mask.is_some()
     }
@@ -1287,7 +1311,12 @@ impl Document {
     /// `brush` at `color` through `put` (symmetry- and target-aware). The
     /// edge comes from the selection itself. Caller checkpoints for undo.
     /// Returns false without a selection.
-    pub fn stroke_selection(&mut self, brush: &super::brush::Brush, color: super::brush::Color, width: u32) -> bool {
+    pub fn stroke_selection(
+        &mut self,
+        brush: &super::brush::Brush,
+        color: super::brush::Color,
+        width: u32,
+    ) -> bool {
         let (w, h) = (self.w, self.h);
         if w == 0 || h == 0 {
             return false;
@@ -1374,17 +1403,17 @@ impl Document {
         for y in 0..h {
             let mut sum = [0u32; 4];
             for dx in -r..=r {
-                for ch in 0..4 {
-                    sum[ch] += px(src, dx, y, ch);
+                for (ch, s) in sum.iter_mut().enumerate() {
+                    *s += px(src, dx, y, ch);
                 }
             }
             for x in 0..w {
                 for ch in 0..4 {
                     tmp[((y as u32 * wu + x as u32) * 4) as usize + ch] = (sum[ch] / window) as u8;
                 }
-                for ch in 0..4 {
-                    sum[ch] += px(src, x + r + 1, y, ch);
-                    sum[ch] -= px(src, x - r, y, ch);
+                for (ch, s) in sum.iter_mut().enumerate() {
+                    *s += px(src, x + r + 1, y, ch);
+                    *s -= px(src, x - r, y, ch);
                 }
             }
         }
@@ -1393,17 +1422,17 @@ impl Document {
         for x in 0..w {
             let mut sum = [0u32; 4];
             for dy in -r..=r {
-                for ch in 0..4 {
-                    sum[ch] += px(&tmp, x, dy, ch);
+                for (ch, s) in sum.iter_mut().enumerate() {
+                    *s += px(&tmp, x, dy, ch);
                 }
             }
             for y in 0..h {
                 for ch in 0..4 {
                     out[((y as u32 * wu + x as u32) * 4) as usize + ch] = (sum[ch] / window) as u8;
                 }
-                for ch in 0..4 {
-                    sum[ch] += px(&tmp, x, y + r + 1, ch);
-                    sum[ch] -= px(&tmp, x, y - r, ch);
+                for (ch, s) in sum.iter_mut().enumerate() {
+                    *s += px(&tmp, x, y + r + 1, ch);
+                    *s -= px(&tmp, x, y - r, ch);
                 }
             }
         }
@@ -1415,8 +1444,7 @@ impl Document {
     /// RGB only; alpha is untouched. Honors the active selection.
     /// Caller checkpoints for undo first.
     pub fn adjust_tone(&mut self, index: usize, brightness: i32, contrast: f32) {
-        if index >= self.layers.len()
-            || (brightness == 0 && (contrast - 1.0).abs() < f32::EPSILON)
+        if index >= self.layers.len() || (brightness == 0 && (contrast - 1.0).abs() < f32::EPSILON)
         {
             return;
         }
@@ -1470,20 +1498,18 @@ impl Document {
         let pixels = &mut self.layers[index].pixels;
         for y in 0..h {
             for x in 0..w {
-                let selected = match sel {
-                    Some((a, b, c, d)) if x < a || x > c || y < b || y > d => false,
-                    _ => true,
-                } && match mask {
-                    Some(m) => m[(y * w + x) as usize] != 0,
-                    None => true,
-                };
+                let selected = !matches!(sel, Some((a, b, c, d)) if x < a || x > c || y < b || y > d)
+                    && match mask {
+                        Some(m) => m[(y * w + x) as usize] != 0,
+                        None => true,
+                    };
                 if selected {
                     let o = ((y * w + x) * 4) as usize;
                     let k = Self::sel_k(mask, w, x, y);
                     for ch in 0..4 {
-                        pixels[o + ch] =
-                            (pixels[o + ch] as f32 * (1.0 - k) + blurred[o + ch] as f32 * k).round()
-                                as u8;
+                        pixels[o + ch] = (pixels[o + ch] as f32 * (1.0 - k)
+                            + blurred[o + ch] as f32 * k)
+                            .round() as u8;
                     }
                 }
             }
@@ -1507,13 +1533,11 @@ impl Document {
         let pixels = &mut self.layers[index].pixels;
         for y in 0..h {
             for x in 0..w {
-                let selected = match sel {
-                    Some((a, b, c, d)) if x < a || x > c || y < b || y > d => false,
-                    _ => true,
-                } && match mask {
-                    Some(m) => m[(y * w + x) as usize] != 0,
-                    None => true,
-                };
+                let selected = !matches!(sel, Some((a, b, c, d)) if x < a || x > c || y < b || y > d)
+                    && match mask {
+                        Some(m) => m[(y * w + x) as usize] != 0,
+                        None => true,
+                    };
                 if !selected {
                     continue;
                 }
@@ -1532,8 +1556,14 @@ impl Document {
 
     /// Save the composite as PNG.
     pub fn save_png(&self, path: &std::path::Path) -> Result<(), String> {
-        image::save_buffer(path, &self.flatten(), self.w, self.h, image::ColorType::Rgba8)
-            .map_err(|e| e.to_string())
+        image::save_buffer(
+            path,
+            &self.flatten(),
+            self.w,
+            self.h,
+            image::ColorType::Rgba8,
+        )
+        .map_err(|e| e.to_string())
     }
 
     /// Load an image file flattened onto a fresh layer.
@@ -1561,11 +1591,15 @@ impl Document {
         use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
         f.write_all(b"PCRAFT07").map_err(|e| e.to_string())?;
-        f.write_all(&self.w.to_le_bytes()).map_err(|e| e.to_string())?;
-        f.write_all(&self.h.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&self.w.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&self.h.to_le_bytes())
+            .map_err(|e| e.to_string())?;
         f.write_all(&self.background).map_err(|e| e.to_string())?;
-        f.write_all(&(self.layers.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
-        f.write_all(&(self.active as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&(self.layers.len() as u32).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&(self.active as u32).to_le_bytes())
+            .map_err(|e| e.to_string())?;
         let symmetry = match self.symmetry {
             SymmetryMode::Off => 0u8,
             SymmetryMode::Horizontal => 1u8,
@@ -1574,7 +1608,8 @@ impl Document {
             SymmetryMode::Kaleidoscope => 4u8,
         };
         f.write_all(&[symmetry]).map_err(|e| e.to_string())?;
-        f.write_all(&[self.symmetry_segments.clamp(2, 16)]).map_err(|e| e.to_string())?;
+        f.write_all(&[self.symmetry_segments.clamp(2, 16)])
+            .map_err(|e| e.to_string())?;
         // v7 stores the mirror center (flag + two f32s); older files read
         // canvas middle.
         match self.symmetry_center {
@@ -1589,10 +1624,13 @@ impl Document {
         }
         for layer in &self.layers {
             let name = layer.name.as_bytes();
-            f.write_all(&(name.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+            f.write_all(&(name.len() as u32).to_le_bytes())
+                .map_err(|e| e.to_string())?;
             f.write_all(name).map_err(|e| e.to_string())?;
-            f.write_all(&[u8::from(layer.visible)]).map_err(|e| e.to_string())?;
-            f.write_all(&layer.opacity.to_le_bytes()).map_err(|e| e.to_string())?;
+            f.write_all(&[u8::from(layer.visible)])
+                .map_err(|e| e.to_string())?;
+            f.write_all(&layer.opacity.to_le_bytes())
+                .map_err(|e| e.to_string())?;
             let blend = match layer.blend {
                 BlendMode::Normal => 0u8,
                 BlendMode::Multiply => 1u8,
@@ -1606,27 +1644,34 @@ impl Document {
                 BlendMode::HardLight => 9u8,
             };
             f.write_all(&[blend]).map_err(|e| e.to_string())?;
-            f.write_all(&[u8::from(layer.clip)]).map_err(|e| e.to_string())?;
+            f.write_all(&[u8::from(layer.clip)])
+                .map_err(|e| e.to_string())?;
             // v6 stores the canvas offset (Move tool) as two i32s.
-            f.write_all(&layer.ox.to_le_bytes()).map_err(|e| e.to_string())?;
-            f.write_all(&layer.oy.to_le_bytes()).map_err(|e| e.to_string())?;
+            f.write_all(&layer.ox.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            f.write_all(&layer.oy.to_le_bytes())
+                .map_err(|e| e.to_string())?;
             let expect = (self.w * self.h * 4) as usize;
             if layer.pixels.len() != expect {
                 return Err("layer has wrong pixel size".to_string());
             }
-            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
             enc.write_all(&layer.pixels).map_err(|e| e.to_string())?;
             let packed = enc.finish().map_err(|e| e.to_string())?;
-            f.write_all(&(packed.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+            f.write_all(&(packed.len() as u32).to_le_bytes())
+                .map_err(|e| e.to_string())?;
             f.write_all(&packed).map_err(|e| e.to_string())?;
             // Optional reveal mask, zlib-compressed like the pixels.
             match layer.mask.as_deref() {
                 Some(m) if m.len() == (self.w * self.h) as usize => {
                     f.write_all(&[1u8]).map_err(|e| e.to_string())?;
-                    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                    let mut enc =
+                        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
                     enc.write_all(m).map_err(|e| e.to_string())?;
                     let packed = enc.finish().map_err(|e| e.to_string())?;
-                    f.write_all(&(packed.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+                    f.write_all(&(packed.len() as u32).to_le_bytes())
+                        .map_err(|e| e.to_string())?;
                     f.write_all(&packed).map_err(|e| e.to_string())?;
                 }
                 _ => {
@@ -1662,17 +1707,35 @@ impl Document {
         if magic != b"PCRAFT01" && !v2 {
             return Err("not a ProCraft project file".to_string());
         }
-        let w = u32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad width".to_string())?);
-        let h = u32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad height".to_string())?);
+        let w = u32::from_le_bytes(
+            take(4)?[..4]
+                .try_into()
+                .map_err(|_| "bad width".to_string())?,
+        );
+        let h = u32::from_le_bytes(
+            take(4)?[..4]
+                .try_into()
+                .map_err(|_| "bad height".to_string())?,
+        );
         if w == 0 || h == 0 || w > 16384 || h > 16384 {
             return Err("project has bad dimensions".to_string());
         }
-        let bg: [u8; 4] = take(4)?[..4].try_into().map_err(|_| "bad background".to_string())?;
-        let count = u32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad layer count".to_string())?);
+        let bg: [u8; 4] = take(4)?[..4]
+            .try_into()
+            .map_err(|_| "bad background".to_string())?;
+        let count = u32::from_le_bytes(
+            take(4)?[..4]
+                .try_into()
+                .map_err(|_| "bad layer count".to_string())?,
+        );
         if count == 0 || count > 256 {
             return Err("project has bad layer count".to_string());
         }
-        let active = u32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad active layer".to_string())?) as usize;
+        let active = u32::from_le_bytes(
+            take(4)?[..4]
+                .try_into()
+                .map_err(|_| "bad active layer".to_string())?,
+        ) as usize;
         let symmetry = if v2 {
             match take(1)?[0] {
                 1 => SymmetryMode::Horizontal,
@@ -1686,7 +1749,11 @@ impl Document {
         };
         let symmetry_segments = if v3 {
             let s = take(1)?[0];
-            if (2..=16).contains(&s) { s } else { 6 }
+            if (2..=16).contains(&s) {
+                s
+            } else {
+                6
+            }
         } else {
             6
         };
@@ -1698,10 +1765,14 @@ impl Document {
                 None
             } else {
                 let cx = f32::from_le_bytes(
-                    take(4)?[..4].try_into().map_err(|_| "bad symmetry center".to_string())?,
+                    take(4)?[..4]
+                        .try_into()
+                        .map_err(|_| "bad symmetry center".to_string())?,
                 );
                 let cy = f32::from_le_bytes(
-                    take(4)?[..4].try_into().map_err(|_| "bad symmetry center".to_string())?,
+                    take(4)?[..4]
+                        .try_into()
+                        .map_err(|_| "bad symmetry center".to_string())?,
                 );
                 if cx.is_finite() && cy.is_finite() {
                     Some((cx.clamp(-16384.0, 16384.0), cy.clamp(-16384.0, 16384.0)))
@@ -1714,13 +1785,23 @@ impl Document {
         };
         let mut layers = Vec::new();
         for _ in 0..count {
-            let name_len = u32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad name".to_string())?) as usize;
+            let name_len = u32::from_le_bytes(
+                take(4)?[..4]
+                    .try_into()
+                    .map_err(|_| "bad name".to_string())?,
+            ) as usize;
             if name_len > 512 {
                 return Err("project has bad layer name".to_string());
             }
-            let name = String::from_utf8(take(name_len)?.to_vec()).map_err(|_| "bad layer name".to_string())?;
+            let name = String::from_utf8(take(name_len)?.to_vec())
+                .map_err(|_| "bad layer name".to_string())?;
             let visible = take(1)?[0] != 0;
-            let opacity = f32::from_le_bytes(take(4)?[..4].try_into().map_err(|_| "bad opacity".to_string())?).clamp(0.0, 1.0);
+            let opacity = f32::from_le_bytes(
+                take(4)?[..4]
+                    .try_into()
+                    .map_err(|_| "bad opacity".to_string())?,
+            )
+            .clamp(0.0, 1.0);
             let blend = match take(1)?[0] {
                 1 => BlendMode::Multiply,
                 2 => BlendMode::Screen,
@@ -1738,11 +1819,15 @@ impl Document {
             // v6 appends the canvas offset (two i32s); older files read 0.
             let (ox, oy) = if v6 {
                 let ox = i32::from_le_bytes(
-                    take(4)?[..4].try_into().map_err(|_| "bad layer offset".to_string())?,
+                    take(4)?[..4]
+                        .try_into()
+                        .map_err(|_| "bad layer offset".to_string())?,
                 )
                 .clamp(-16384, 16384);
                 let oy = i32::from_le_bytes(
-                    take(4)?[..4].try_into().map_err(|_| "bad layer offset".to_string())?,
+                    take(4)?[..4]
+                        .try_into()
+                        .map_err(|_| "bad layer offset".to_string())?,
                 )
                 .clamp(-16384, 16384);
                 (ox, oy)
@@ -1752,7 +1837,9 @@ impl Document {
             let expect = (w * h * 4) as usize;
             let pixels = if v4 {
                 let comp_len = u32::from_le_bytes(
-                    take(4)?[..4].try_into().map_err(|_| "bad compressed size".to_string())?,
+                    take(4)?[..4]
+                        .try_into()
+                        .map_err(|_| "bad compressed size".to_string())?,
                 ) as usize;
                 if comp_len == 0 || comp_len > expect.saturating_add(10 * 1024 * 1024) {
                     return Err("project has bad compressed size".to_string());
@@ -1761,7 +1848,8 @@ impl Document {
                 let mut dec = flate2::read::ZlibDecoder::new(&packed[..]);
                 let mut raw = Vec::with_capacity(expect);
                 use std::io::Read;
-                dec.read_to_end(&mut raw).map_err(|_| "project has corrupt pixels".to_string())?;
+                dec.read_to_end(&mut raw)
+                    .map_err(|_| "project has corrupt pixels".to_string())?;
                 if raw.len() != expect {
                     return Err("project has corrupt pixels".to_string());
                 }
@@ -1777,7 +1865,9 @@ impl Document {
                 } else {
                     let want = (w * h) as usize;
                     let comp_len = u32::from_le_bytes(
-                        take(4)?[..4].try_into().map_err(|_| "bad mask size".to_string())?,
+                        take(4)?[..4]
+                            .try_into()
+                            .map_err(|_| "bad mask size".to_string())?,
                     ) as usize;
                     if comp_len == 0 || comp_len > want.saturating_add(10 * 1024 * 1024) {
                         return Err("project has bad mask size".to_string());
@@ -1786,7 +1876,8 @@ impl Document {
                     let mut dec = flate2::read::ZlibDecoder::new(&packed[..]);
                     let mut raw = Vec::with_capacity(want);
                     use std::io::Read;
-                    dec.read_to_end(&mut raw).map_err(|_| "project has corrupt mask".to_string())?;
+                    dec.read_to_end(&mut raw)
+                        .map_err(|_| "project has corrupt mask".to_string())?;
                     if raw.len() != want {
                         return Err("project has corrupt mask".to_string());
                     }
@@ -1795,7 +1886,17 @@ impl Document {
             } else {
                 None
             };
-            layers.push(Layer { name, visible, opacity, blend, pixels, mask, clip, ox, oy });
+            layers.push(Layer {
+                name,
+                visible,
+                opacity,
+                blend,
+                pixels,
+                mask,
+                clip,
+                ox,
+                oy,
+            });
         }
         if !cur.is_empty() {
             return Err("project has trailing data".to_string());
@@ -1892,7 +1993,9 @@ mod tests {
     fn mask_multiplies_layer_alpha() {
         let mut doc = Document::new(4, 1);
         doc.background = [255, 255, 255, 255];
-        doc.layers[0].pixels = vec![255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255];
+        doc.layers[0].pixels = vec![
+            255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+        ];
         doc.add_mask(0);
         // Conceal the left half.
         if let Some(m) = doc.layers[0].mask.as_mut() {
@@ -1914,10 +2017,10 @@ mod tests {
         let mut doc = Document::new(4, 1);
         doc.background = [255, 255, 255, 255];
         // Base: single red dot at x=1.
-        doc.layers[0].pixels[((1 * 4) + 3) as usize] = 255;
-        doc.layers[0].pixels[((1 * 4)) as usize] = 255;
+        doc.layers[0].pixels[7] = 255;
+        doc.layers[0].pixels[4] = 255;
         doc.add_layer("top".to_string());
-        doc.layers[1].pixels = vec![0, 255, 0, 255].repeat(4);
+        doc.layers[1].pixels = [0, 255, 0, 255].repeat(4);
         doc.layers[1].clip = true;
         let flat = doc.flatten();
         assert_eq!(&flat[0..4], &[255, 255, 255, 255]);
@@ -1934,7 +2037,11 @@ mod tests {
         use crate::brush::{Brush, Color};
         let mut doc = Document::new(16, 16);
         doc.paint_target = PaintTarget::Mask;
-        let brush = Brush { size: 8.0, softness: 0.0, ..Default::default() };
+        let brush = Brush {
+            size: 8.0,
+            softness: 0.0,
+            ..Default::default()
+        };
         assert!(doc.layers[0].mask.is_none());
         doc.checkpoint();
         doc.dab(&brush, Color::rgb(0, 0, 0), 8.0, 8.0);
@@ -1943,7 +2050,10 @@ mod tests {
         assert!(m.iter().any(|&b| b < 255));
         // Eraser reveals back toward white.
         let before: Vec<u8> = m.clone();
-        let eraser = Brush { eraser: true, ..brush };
+        let eraser = Brush {
+            eraser: true,
+            ..brush
+        };
         doc.dab(&eraser, Color::rgb(0, 0, 0), 8.0, 8.0);
         let after = doc.layers[0].mask.as_ref().unwrap();
         assert!(after.iter().zip(before.iter()).all(|(&a, &b)| a >= b));
@@ -2003,10 +2113,11 @@ mod tests {
         buf.extend_from_slice(&1.0f32.to_le_bytes());
         buf.extend_from_slice(&[0]); // blend: Normal
         buf.extend_from_slice(&[0]); // clip: off
-        let raw = vec![9u8; 2 * 1 * 4];
+        let raw = vec![9u8; 2 * 4];
         let packed = {
             use std::io::Write;
-            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
             enc.write_all(&raw).unwrap();
             enc.finish().unwrap()
         };
@@ -2039,10 +2150,11 @@ mod tests {
         buf.extend_from_slice(&[1]);
         buf.extend_from_slice(&1.0f32.to_le_bytes());
         buf.extend_from_slice(&[0]);
-        let raw = vec![9u8; 2 * 1 * 4];
+        let raw = vec![9u8; 2 * 4];
         let packed = {
             use std::io::Write;
-            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
             enc.write_all(&raw).unwrap();
             enc.finish().unwrap()
         };
@@ -2170,7 +2282,7 @@ mod tests {
         buf.extend_from_slice(&[1]);
         buf.extend_from_slice(&1.0f32.to_le_bytes());
         buf.extend_from_slice(&[0]);
-        buf.extend_from_slice(&vec![9u8; 2 * 1 * 4]);
+        buf.extend_from_slice(&[9u8; 2 * 4]);
         std::fs::write(&path, &buf).unwrap();
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -2191,7 +2303,12 @@ mod tests {
         // Moved center x=5: x=2 mirrors to x=8 instead.
         doc.set_symmetry_center(5.0, 10.0);
         assert_eq!(doc.symmetry_center_px(), (5.0, 10.0));
-        let brush = Brush { size: 3.0, softness: 0.0, opacity: 1.0, ..Default::default() };
+        let brush = Brush {
+            size: 3.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
         doc.dab(&brush, Color::rgb(255, 0, 0), 2.5, 5.5);
         let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 21 + x) * 4 + 3) as usize];
         assert!(at(&doc, 2, 5) > 0);
@@ -2228,7 +2345,7 @@ mod tests {
         buf.extend_from_slice(&0i32.to_le_bytes());
         buf.extend_from_slice(&0i32.to_le_bytes());
         let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        enc.write_all(&vec![9u8; 2 * 1 * 4]).unwrap();
+        enc.write_all(&[9u8; 2 * 4]).unwrap();
         let packed = enc.finish().unwrap();
         buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
         buf.extend_from_slice(&packed);
@@ -2287,7 +2404,12 @@ mod tests {
         assert_eq!(&doc.flatten()[0..4], &[255, 0, 0, 255]);
         // Fully off-canvas: composite shows only the page, buffer intact.
         doc.translate_layer(0, 100, 0);
-        assert!(doc.flatten().chunks_exact(4).all(|p| p == [255, 255, 255, 255]));
+        assert!(doc
+            .flatten()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| p == &[255, 255, 255, 255]));
         assert_eq!(doc.layers[0].pixels, want);
         // Back home: pixel-perfect, buffer untouched throughout.
         doc.translate_layer(0, -100, 0);
@@ -2321,12 +2443,22 @@ mod tests {
         use crate::brush::{Brush, Color};
         let mut doc = Document::new(32, 32);
         doc.translate_layer(0, 5, 0);
-        let brush = Brush { size: 3.0, softness: 0.0, opacity: 1.0, ..Default::default() };
+        let brush = Brush {
+            size: 3.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
         doc.dab(&brush, Color::rgb(255, 0, 0), 10.5, 10.5);
         // Composite shows paint at the canvas dab point...
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 32 + x) * 4) as usize;
-            [d.flatten()[o], d.flatten()[o + 1], d.flatten()[o + 2], d.flatten()[o + 3]]
+            [
+                d.flatten()[o],
+                d.flatten()[o + 1],
+                d.flatten()[o + 2],
+                d.flatten()[o + 3],
+            ]
         };
         assert_eq!(at(&doc, 10, 10), [255, 0, 0, 255]);
         // ...stored shifted in the buffer (local 5, 10).
@@ -2390,7 +2522,12 @@ mod tests {
         assert_eq!(doc.layers[0].pixels, before);
         // 2x zoom of solid color stays solid.
         doc.affine_layer(0, 2.0, 0.0);
-        assert!(doc.layers[0].pixels.chunks_exact(4).all(|p| p[0] == 100 && p[3] == 100));
+        assert!(doc.layers[0]
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| p[0] == 100 && p[3] == 100));
     }
 
     #[test]
@@ -2445,7 +2582,10 @@ mod tests {
         doc.sharpen_layer(0, 1.0);
         let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 8 + x) * 4) as usize];
         assert!(at(&doc, 3, 4) < 100, "dark edge pixel dips");
-        assert!(at(&doc, 4, 4) > 200 || at(&doc, 4, 4) == 255, "bright edge pixel rises");
+        assert!(
+            at(&doc, 4, 4) > 200 || at(&doc, 4, 4) == 255,
+            "bright edge pixel rises"
+        );
         // Flat area is untouched by sharpening.
         assert_eq!(at(&doc, 0, 0), 100);
         assert_eq!(at(&doc, 7, 7), 200);
@@ -2454,7 +2594,7 @@ mod tests {
     #[test]
     fn filters_respect_selection() {
         let mut doc = Document::new(6, 6);
-        for b in doc.layers[0].pixels.chunks_exact_mut(4) {
+        for b in doc.layers[0].pixels.as_chunks_mut::<4>().0 {
             b.copy_from_slice(&[255, 255, 255, 255]);
         }
         doc.selection = Some((0, 0, 2, 2));
@@ -2483,7 +2623,12 @@ mod tests {
         let mut doc = Document::new(21, 21);
         doc.symmetry = SymmetryMode::Kaleidoscope;
         doc.symmetry_segments = 4;
-        let brush = Brush { size: 3.0, softness: 0.0, opacity: 1.0, ..Default::default() };
+        let brush = Brush {
+            size: 3.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
         doc.dab(&brush, Color::rgb(255, 0, 0), 14.5, 10.5);
         let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 21 + x) * 4 + 3) as usize];
         for (x, y) in [(14, 10), (10, 14), (6, 10), (10, 6)] {
@@ -2524,7 +2669,7 @@ mod tests {
         buf.extend_from_slice(&[1]);
         buf.extend_from_slice(&1.0f32.to_le_bytes());
         buf.extend_from_slice(&[0]);
-        buf.extend_from_slice(&vec![5u8; 2 * 1 * 4]);
+        buf.extend_from_slice(&[5u8; 2 * 4]);
         std::fs::write(&path, &buf).unwrap();
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -2585,7 +2730,10 @@ mod tests {
         assert_eq!(doc.selection, Some(bbox));
         assert!(doc.selection_pixel_count() > 0);
         // Painting is constrained to the lasso.
-        let brush = Brush { opacity: 1.0, ..Default::default() };
+        let brush = Brush {
+            opacity: 1.0,
+            ..Default::default()
+        };
         doc.fill_rect(&brush, Color::rgb(9, 9, 9), 0, 0, 19, 19);
         let inside = ((2 * 20 + 2) * 4) as usize;
         assert_eq!(doc.layers[0].pixels[inside + 3], 255);
@@ -2603,7 +2751,10 @@ mod tests {
     fn shape_fill_respects_selection() {
         use crate::brush::{Brush, Color};
         let mut doc = Document::new(10, 10);
-        let brush = Brush { opacity: 1.0, ..Default::default() };
+        let brush = Brush {
+            opacity: 1.0,
+            ..Default::default()
+        };
         doc.selection = Some((2, 2, 5, 5));
         doc.fill_rect(&brush, Color::rgb(1, 2, 3), 0, 0, 9, 9);
         assert_eq!(doc.layers[0].pixels[0..4], vec![0, 0, 0, 0]);
@@ -2630,7 +2781,7 @@ mod tests {
         buf.extend_from_slice(&[1]);
         buf.extend_from_slice(&1.0f32.to_le_bytes());
         buf.extend_from_slice(&[0]);
-        buf.extend_from_slice(&vec![6u8; 2 * 1 * 4]);
+        buf.extend_from_slice(&[6u8; 2 * 4]);
         std::fs::write(&path, &buf).unwrap();
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -2648,7 +2799,11 @@ mod tests {
         doc.save_project(&path).unwrap();
         let meta = std::fs::metadata(&path).unwrap();
         let raw = 128usize * 128 * 4;
-        assert!(meta.len() as usize * 4 < raw, "compressed {} vs raw {raw}", meta.len());
+        assert!(
+            meta.len() as usize * 4 < raw,
+            "compressed {} vs raw {raw}",
+            meta.len()
+        );
         let head = std::fs::read(&path).unwrap();
         assert_eq!(&head[..8], b"PCRAFT07");
         let back = Document::open_project(&path).unwrap();
@@ -2698,13 +2853,16 @@ mod tests {
         // inverted dirty rect, and the texture upload's `x1 - x0 + 1` then
         // underflowed and quit the app.
         let mut doc = Document::new(32, 32);
-        let brush = Brush { size: 8.0, ..Default::default() };
+        let brush = Brush {
+            size: 8.0,
+            ..Default::default()
+        };
         let clean = doc.layers[0].pixels.clone();
         for (from, to) in [
-            (Some((100.0, 100.0)), (400.0, 400.0)), // right-bottom
+            (Some((100.0, 100.0)), (400.0, 400.0)),   // right-bottom
             (Some((-400.0, 100.0)), (-100.0, 100.0)), // left
             (Some((100.0, -400.0)), (100.0, -100.0)), // above
-            (None, (1000.0, 1000.0)), // single dab far outside
+            (None, (1000.0, 1000.0)),                 // single dab far outside
         ] {
             doc.stroke_to(&brush, Color::rgb(255, 0, 0), from, to, 0.0);
         }
@@ -2719,11 +2877,27 @@ mod tests {
         }
         // Same for stamp tips and mask painting.
         let tip = BrushTip::from_mask(2, 2, vec![255; 4]).unwrap();
-        let stamp = Brush { size: 16.0, tip: Some(tip), ..Brush::default() };
-        doc.stroke_to(&stamp, Color::rgb(1, 2, 3), Some((200.0, 200.0)), (500.0, 500.0), 0.0);
+        let stamp = Brush {
+            size: 16.0,
+            tip: Some(tip),
+            ..Brush::default()
+        };
+        doc.stroke_to(
+            &stamp,
+            Color::rgb(1, 2, 3),
+            Some((200.0, 200.0)),
+            (500.0, 500.0),
+            0.0,
+        );
         assert_eq!(doc.layers[0].pixels, clean);
         doc.paint_target = PaintTarget::Mask;
-        doc.stroke_to(&brush, Color::rgb(0, 0, 0), Some((200.0, 200.0)), (500.0, 500.0), 0.0);
+        doc.stroke_to(
+            &brush,
+            Color::rgb(0, 0, 0),
+            Some((200.0, 200.0)),
+            (500.0, 500.0),
+            0.0,
+        );
         assert!(doc.layers[0].mask.is_none());
         doc.paint_target = PaintTarget::Color;
     }
@@ -2740,7 +2914,10 @@ mod tests {
         doc.set_lasso(&[(2.0, 2.0), (2.0, 5.0), (5.0, 5.0), (5.0, 2.0)]);
         let mask = doc.selection_mask.clone().unwrap();
         assert!(mask.iter().all(|&b| b == 0 || b == 255));
-        assert_eq!(doc.selection_pixel_count(), mask.iter().filter(|&&b| b != 0).count());
+        assert_eq!(
+            doc.selection_pixel_count(),
+            mask.iter().filter(|&&b| b != 0).count()
+        );
     }
 
     #[test]
@@ -2796,7 +2973,10 @@ mod tests {
         // Solid rects survive smoothing byte-identical in the interior.
         let mut doc2 = selected_rect(20, 20, (5, 5, 14, 14));
         assert!(doc2.smooth_selection());
-        assert_eq!(doc2.selection_mask.clone().unwrap()[(10 * 20 + 10) as usize], 255);
+        assert_eq!(
+            doc2.selection_mask.clone().unwrap()[(10 * 20 + 10) as usize],
+            255
+        );
         let mut doc3 = Document::new(8, 8);
         assert!(!doc3.smooth_selection());
     }
@@ -2818,7 +2998,12 @@ mod tests {
     fn opaque_selects_painted_pixels() {
         use crate::brush::{Brush, Color};
         let mut doc = Document::new(10, 10);
-        let brush = Brush { size: 3.0, softness: 0.0, opacity: 1.0, ..Default::default() };
+        let brush = Brush {
+            size: 3.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
         doc.dab(&brush, Color::rgb(255, 0, 0), 2.5, 2.5);
         assert!(doc.select_opaque(8));
         let n = doc.selection_pixel_count();
@@ -2836,7 +3021,12 @@ mod tests {
     fn stroke_paints_only_the_edge() {
         use crate::brush::{Brush, Color};
         let mut doc = selected_rect(12, 12, (2, 2, 7, 7));
-        let brush = Brush { size: 1.0, softness: 0.0, opacity: 1.0, ..Default::default() };
+        let brush = Brush {
+            size: 1.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
         doc.checkpoint();
         assert!(doc.stroke_selection(&brush, Color::rgb(0, 255, 0), 1));
         let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 12 + x) * 4) as usize + 3];
@@ -2878,7 +3068,12 @@ mod tests {
         let mut doc2 = Document::new(20, 20);
         doc2.selection = Some((5, 5, 14, 14));
         assert!(doc2.feather_selection(3));
-        let brush = Brush { size: 1.0, softness: 0.0, opacity: 1.0, ..Default::default() };
+        let brush = Brush {
+            size: 1.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
         doc2.dab(&brush, Color::rgb(255, 255, 255), 10.5, 4.5);
         let a = doc2.layers[0].pixels[((4 * 20 + 10) * 4) as usize + 3];
         let ramp2 = doc2.selection_mask.clone().unwrap()[(4 * 20 + 10) as usize];

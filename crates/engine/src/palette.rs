@@ -41,7 +41,10 @@ impl PaletteSet {
     /// One empty "My colors" palette selected (matches the old single-set UI).
     pub fn new() -> Self {
         Self {
-            palettes: vec![Palette { name: "My colors".to_string(), colors: Vec::new() }],
+            palettes: vec![Palette {
+                name: "My colors".to_string(),
+                colors: Vec::new(),
+            }],
             active: 0,
         }
     }
@@ -89,7 +92,10 @@ impl PaletteSet {
         }
         let clean = check_name(name)?;
         let name = self.unique_name(&clean);
-        self.palettes.push(Palette { name, colors: Vec::new() });
+        self.palettes.push(Palette {
+            name,
+            colors: Vec::new(),
+        });
         self.active = self.palettes.len() - 1;
         Ok(self.active)
     }
@@ -100,7 +106,12 @@ impl PaletteSet {
         if idx >= self.palettes.len() {
             return Err("no such palette".to_string());
         }
-        if self.palettes.iter().enumerate().any(|(i, p)| i != idx && p.name == clean) {
+        if self
+            .palettes
+            .iter()
+            .enumerate()
+            .any(|(i, p)| i != idx && p.name == clean)
+        {
             return Err(format!("palette name taken: {clean}"));
         }
         self.palettes[idx].name = clean;
@@ -180,7 +191,10 @@ fn check_palette(name: &str, colors: &[[u8; 3]]) -> Result<String, String> {
 /// Save a palette to a `.pcpalette` file (pretty JSON `{name, colors}`).
 pub fn save_palette(path: &std::path::Path, palette: &Palette) -> Result<(), String> {
     let name = check_palette(&palette.name, &palette.colors)?;
-    let clean = Palette { name, colors: palette.colors.clone() };
+    let clean = Palette {
+        name,
+        colors: palette.colors.clone(),
+    };
     let text = serde_json::to_string_pretty(&clean).map_err(|e| e.to_string())?;
     std::fs::write(path, text).map_err(|e| e.to_string())
 }
@@ -190,7 +204,10 @@ pub fn open_palette(path: &std::path::Path) -> Result<Palette, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let raw: Palette = serde_json::from_str(&text).map_err(|_| "not a palette file".to_string())?;
     let name = check_palette(&raw.name, &raw.colors)?;
-    Ok(Palette { name, colors: raw.colors })
+    Ok(Palette {
+        name,
+        colors: raw.colors,
+    })
 }
 
 /// Parse GIMP `.gpl` text into a palette (interchange import; the file's
@@ -240,7 +257,10 @@ pub fn import_gpl_text(text: &str, stem: &str) -> Result<Palette, String> {
         }
     }
     let clean = check_palette(&name, &colors)?;
-    let mut palette = Palette { name: clean, colors };
+    let mut palette = Palette {
+        name: clean,
+        colors,
+    };
     palette.colors.truncate(MAX_PALETTE_COLORS);
     Ok(palette)
 }
@@ -299,7 +319,11 @@ pub fn rgb_to_hsl([r, g, b]: [u8; 3]) -> (f32, f32, f32) {
         return (0.0, 0.0, l);
     }
     let d = max - min;
-    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
     let h = if max == r {
         60.0 * (((g - b) / d) % 6.0)
     } else if max == g {
@@ -379,15 +403,33 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("procraft-pal-bad.pcpalette");
         // Empty set.
-        assert!(save_palette(&path, &Palette { name: "E".to_string(), colors: vec![] }).is_err());
+        assert!(save_palette(
+            &path,
+            &Palette {
+                name: "E".to_string(),
+                colors: vec![]
+            }
+        )
+        .is_err());
         // Empty name.
-        assert!(
-            save_palette(&path, &Palette { name: "  ".to_string(), colors: vec![[1, 2, 3]] })
-                .is_err()
-        );
+        assert!(save_palette(
+            &path,
+            &Palette {
+                name: "  ".to_string(),
+                colors: vec![[1, 2, 3]]
+            }
+        )
+        .is_err());
         // Too many colors.
         let many = vec![[9u8, 9, 9]; MAX_PALETTE_COLORS + 1];
-        assert!(save_palette(&path, &Palette { name: "Many".to_string(), colors: many }).is_err());
+        assert!(save_palette(
+            &path,
+            &Palette {
+                name: "Many".to_string(),
+                colors: many
+            }
+        )
+        .is_err());
         // Not JSON at all.
         std::fs::write(&path, "nope").unwrap();
         assert!(open_palette(&path).is_err());
@@ -413,11 +455,21 @@ mod tests {
 
     #[test]
     fn hsl_roundtrips_primary_colors() {
-        for rgb in [[255, 0, 0], [0, 255, 0], [0, 0, 255], [0, 0, 0], [255, 255, 255], [30, 144, 255]] {
+        for rgb in [
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [0, 0, 0],
+            [255, 255, 255],
+            [30, 144, 255],
+        ] {
             let (h, s, l) = rgb_to_hsl(rgb);
             let back = hsl_to_rgb(h, s, l);
             for (a, b) in rgb.iter().zip(back.iter()) {
-                assert!(((*a as i32) - (*b as i32)).abs() <= 1, "{rgb:?} -> {back:?}");
+                assert!(
+                    ((*a as i32) - (*b as i32)).abs() <= 1,
+                    "{rgb:?} -> {back:?}"
+                );
             }
         }
     }

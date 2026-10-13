@@ -19,8 +19,13 @@ pub enum GuideKind {
 }
 
 impl GuideKind {
-    pub const ALL: [GuideKind; 5] =
-        [GuideKind::Off, GuideKind::Square, GuideKind::Isometric, GuideKind::OnePoint, GuideKind::TwoPoint];
+    pub const ALL: [GuideKind; 5] = [
+        GuideKind::Off,
+        GuideKind::Square,
+        GuideKind::Isometric,
+        GuideKind::OnePoint,
+        GuideKind::TwoPoint,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -74,19 +79,32 @@ pub struct AssistLine {
 impl AssistLine {
     fn new(through: (f32, f32), dir: (f32, f32)) -> Self {
         let len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(f32::EPSILON);
-        Self { through, dir: (dir.0 / len, dir.1 / len) }
+        Self {
+            through,
+            dir: (dir.0 / len, dir.1 / len),
+        }
     }
 
     /// Closest point on the line (strokes ride this while locked).
     pub fn project(self, x: f32, y: f32) -> (f32, f32) {
         let t = (x - self.through.0) * self.dir.0 + (y - self.through.1) * self.dir.1;
-        (self.through.0 + t * self.dir.0, self.through.1 + t * self.dir.1)
+        (
+            self.through.0 + t * self.dir.0,
+            self.through.1 + t * self.dir.1,
+        )
     }
 }
 
 impl Default for Guides {
     fn default() -> Self {
-        Self { kind: GuideKind::Off, spacing: 64.0, snap: true, snap_px: 8.0, opacity: 0.35, vp: None }
+        Self {
+            kind: GuideKind::Off,
+            spacing: 64.0,
+            snap: true,
+            snap_px: 8.0,
+            opacity: 0.35,
+            vp: None,
+        }
     }
 }
 
@@ -148,7 +166,13 @@ impl Guides {
     /// Returns `None` (paint free) for Off, for taps inside the deadzone,
     /// and for perspective starts parked on a vanishing point (no ray to
     /// pick until the stroke leaves it).
-    pub fn assist_lock(self, w: f32, h: f32, start: (f32, f32), pos: (f32, f32)) -> Option<AssistLine> {
+    pub fn assist_lock(
+        self,
+        w: f32,
+        h: f32,
+        start: (f32, f32),
+        pos: (f32, f32),
+    ) -> Option<AssistLine> {
         if w <= 0.0 || h <= 0.0 {
             return None;
         }
@@ -197,7 +221,7 @@ impl Guides {
                     let ang = dy.atan2(dx);
                     let nearest = (ang / RAY_STEP).round() * RAY_STEP;
                     let arc = (nearest - ang).abs() * r;
-                    if best.map_or(true, |(ba, _)| arc < ba) {
+                    if best.is_none_or(|(ba, _)| arc < ba) {
                         best = Some((
                             arc,
                             AssistLine::new((cx, cy), (nearest.cos(), nearest.sin())),
@@ -223,7 +247,10 @@ impl Guides {
                 let t = self.snap_px_clamped();
                 let nx = (x / s).round() * s;
                 let ny = (y / s).round() * s;
-                ((if (nx - x).abs() <= t { nx } else { x }), (if (ny - y).abs() <= t { ny } else { y }))
+                (
+                    (if (nx - x).abs() <= t { nx } else { x }),
+                    (if (ny - y).abs() <= t { ny } else { y }),
+                )
             }
             GuideKind::Isometric => snap_iso(self, x, y),
             GuideKind::OnePoint | GuideKind::TwoPoint => snap_rays(self, &self.vp_list(w, h), x, y),
@@ -298,8 +325,11 @@ fn snap_iso(g: Guides, x: f32, y: f32) -> (f32, f32) {
         let along = x * nx + y * ny;
         let nearest = (along / d).round() * d;
         let dist = (nearest - along).abs();
-        if best.map_or(true, |(bd, _)| dist < bd) {
-            best = Some((dist, (x + (nearest - along) * nx, y + (nearest - along) * ny)));
+        if best.is_none_or(|(bd, _)| dist < bd) {
+            best = Some((
+                dist,
+                (x + (nearest - along) * nx, y + (nearest - along) * ny),
+            ));
         }
     }
     match best {
@@ -325,7 +355,7 @@ fn snap_rays(g: Guides, vps: &[(f32, f32)], x: f32, y: f32) -> (f32, f32) {
         let ang = dy.atan2(dx);
         let nearest = (ang / RAY_STEP).round() * RAY_STEP;
         let arc = (nearest - ang).abs() * r;
-        if best.map_or(true, |(ba, _)| arc < ba) {
+        if best.is_none_or(|(ba, _)| arc < ba) {
             best = Some((arc, (cx + r * nearest.cos(), cy + r * nearest.sin())));
         }
     }
@@ -341,7 +371,15 @@ fn emit_rays(out: &mut Vec<[f32; 4]>, cx: f32, cy: f32, w: f32, h: f32) {
     let n = (std::f32::consts::TAU / RAY_STEP).round() as i32;
     for k in 0..n {
         let a = k as f32 * RAY_STEP;
-        push_clipped(&mut *out, cx, cy, cx + len * a.cos(), cy + len * a.sin(), w, h);
+        push_clipped(
+            &mut *out,
+            cx,
+            cy,
+            cx + len * a.cos(),
+            cy + len * a.sin(),
+            w,
+            h,
+        );
     }
 }
 
@@ -359,8 +397,19 @@ fn clip_segment(x0: f32, y0: f32, x1: f32, y1: f32, w: f32, h: f32) -> Option<[f
     const BOTTOM: u8 = 4;
     const TOP: u8 = 8;
     let code = |x: f32, y: f32| {
-        (if x < 0.0 { LEFT } else if x > w { RIGHT } else { 0 })
-            | (if y < 0.0 { BOTTOM } else if y > h { TOP } else { 0 })
+        (if x < 0.0 {
+            LEFT
+        } else if x > w {
+            RIGHT
+        } else {
+            0
+        }) | (if y < 0.0 {
+            BOTTOM
+        } else if y > h {
+            TOP
+        } else {
+            0
+        })
     };
     let (mut x0, mut y0, mut x1, mut y1) = (x0, y0, x1, y1);
     let (mut c0, mut c1) = (code(x0, y0), code(x1, y1));
@@ -403,7 +452,14 @@ mod tests {
     use super::*;
 
     fn g(kind: GuideKind) -> Guides {
-        Guides { kind, spacing: 64.0, snap: true, snap_px: 8.0, opacity: 0.35, vp: None }
+        Guides {
+            kind,
+            spacing: 64.0,
+            snap: true,
+            snap_px: 8.0,
+            opacity: 0.35,
+            vp: None,
+        }
     }
 
     #[test]
@@ -413,7 +469,10 @@ mod tests {
         assert_eq!(off.snap_point(128.0, 128.0, 10.0, 20.0), (10.0, 20.0));
         assert!(off.overlay_lines(128.0, 128.0).is_empty());
         // Snap toggle off also passes points through.
-        let nosnap = Guides { snap: false, ..g(GuideKind::Square) };
+        let nosnap = Guides {
+            snap: false,
+            ..g(GuideKind::Square)
+        };
         assert_eq!(nosnap.snap_point(128.0, 128.0, 63.0, 63.0), (63.0, 63.0));
     }
 
@@ -437,14 +496,20 @@ mod tests {
         // Every segment stays inside the canvas.
         for &[x0, y0, x1, y1] in &lines {
             for v in [x0, y0, x1, y1] {
-                assert!(v >= -0.01 && v <= 128.01, "{v}");
+                assert!((-0.01..=128.01).contains(&v), "{v}");
             }
         }
         // Near a vertical (away from diagonal crossings): x snaps, y survives.
         let (sx, sy) = g(GuideKind::Isometric).snap_point(256.0, 256.0, 66.0, 64.0);
-        assert!((sx - 64.0).abs() < 0.01 && (sy - 64.0).abs() < 0.01, "{sx} {sy}");
+        assert!(
+            (sx - 64.0).abs() < 0.01 && (sy - 64.0).abs() < 0.01,
+            "{sx} {sy}"
+        );
         // Mid-cell: untouched.
-        assert_eq!(g(GuideKind::Isometric).snap_point(256.0, 256.0, 32.0, 200.0), (32.0, 200.0));
+        assert_eq!(
+            g(GuideKind::Isometric).snap_point(256.0, 256.0, 32.0, 200.0),
+            (32.0, 200.0)
+        );
     }
 
     #[test]
@@ -454,14 +519,23 @@ mod tests {
         let guides = g(GuideKind::OnePoint);
         // A point exactly on the east ray stays put.
         let (sx, sy) = guides.snap_point(200.0, 200.0, 150.0, 100.0);
-        assert!((sx - 150.0).abs() < 0.02 && (sy - 100.0).abs() < 0.02, "{sx} {sy}");
+        assert!(
+            (sx - 150.0).abs() < 0.02 && (sy - 100.0).abs() < 0.02,
+            "{sx} {sy}"
+        );
         // A point just off the ray collapses onto it (y -> horizon).
         let (qx, qy) = guides.snap_point(200.0, 200.0, 150.0, 102.0);
         assert!((qy - 100.0).abs() < (102.0 - 100.0), "{qx} {qy}");
         // A point midway between rays at large radius stays (arc > capture).
-        assert_eq!(guides.snap_point(200.0, 200.0, 192.0, 138.0), (192.0, 138.0));
+        assert_eq!(
+            guides.snap_point(200.0, 200.0, 192.0, 138.0),
+            (192.0, 138.0)
+        );
         // At the vanishing point: collapses onto it.
-        assert_eq!(guides.snap_point(200.0, 200.0, 102.0, 101.0), (100.0, 100.0));
+        assert_eq!(
+            guides.snap_point(200.0, 200.0, 102.0, 101.0),
+            (100.0, 100.0)
+        );
     }
 
     #[test]
@@ -493,9 +567,9 @@ mod tests {
         // Same ray count, but the fan now leaves from the custom point.
         assert_eq!(custom.len(), plain.len());
         assert_ne!(custom, plain);
-        assert!(custom.iter().any(|&[x0, y0, _, _]| {
-            (x0 - 40.0).abs() < 0.5 && (y0 - 160.0).abs() < 0.5
-        }));
+        assert!(custom
+            .iter()
+            .any(|&[x0, y0, _, _]| { (x0 - 40.0).abs() < 0.5 && (y0 - 160.0).abs() < 0.5 }));
         // Snap collapses onto the custom VP, not the old center.
         assert_eq!(moved.snap_point(200.0, 200.0, 42.0, 161.0), (40.0, 160.0));
     }
@@ -512,7 +586,10 @@ mod tests {
         guides.reset_vps();
         assert_eq!(guides.vp, None);
         // Reset restores the stock overlay exactly.
-        assert_eq!(guides.overlay_lines(200.0, 200.0), g(GuideKind::TwoPoint).overlay_lines(200.0, 200.0));
+        assert_eq!(
+            guides.overlay_lines(200.0, 200.0),
+            g(GuideKind::TwoPoint).overlay_lines(200.0, 200.0)
+        );
     }
 
     #[test]
@@ -537,40 +614,62 @@ mod tests {
     fn assist_locks_to_the_nearest_ray() {
         let guides = g(GuideKind::OnePoint);
         // East of the VP, drifting north: locks the east (0-degree) ray.
-        let lock = guides.assist_lock(200.0, 200.0, (150.0, 100.0), (160.0, 104.0)).unwrap();
+        let lock = guides
+            .assist_lock(200.0, 200.0, (150.0, 100.0), (160.0, 104.0))
+            .unwrap();
         assert_eq!(lock.through, (100.0, 100.0));
         assert!((lock.dir.0 - 1.0).abs() < 0.01 && lock.dir.1.abs() < 0.01);
         // Riding the lock collapses y back to the horizon.
         assert_eq!(lock.project(170.0, 130.0), (170.0, 100.0));
         // Parked on the VP: no ray to pick, paint stays free.
-        assert_eq!(guides.assist_lock(200.0, 200.0, (100.0, 100.0), (102.0, 101.0)), None);
+        assert_eq!(
+            guides.assist_lock(200.0, 200.0, (100.0, 100.0), (102.0, 101.0)),
+            None
+        );
         // Off guides never lock.
-        assert_eq!(g(GuideKind::Off).assist_lock(200.0, 200.0, (10.0, 10.0), (90.0, 90.0)), None);
+        assert_eq!(
+            g(GuideKind::Off).assist_lock(200.0, 200.0, (10.0, 10.0), (90.0, 90.0)),
+            None
+        );
     }
 
     #[test]
     fn assist_locks_grid_axes_past_deadzone() {
         let guides = g(GuideKind::Square);
         // Taps inside the deadzone paint free (dots stay dots).
-        assert_eq!(guides.assist_lock(200.0, 200.0, (50.0, 50.0), (52.0, 51.0)), None);
+        assert_eq!(
+            guides.assist_lock(200.0, 200.0, (50.0, 50.0), (52.0, 51.0)),
+            None
+        );
         // Dominant axis wins, locked through the stroke start.
-        let h = guides.assist_lock(200.0, 200.0, (50.0, 50.0), (80.0, 56.0)).unwrap();
+        let h = guides
+            .assist_lock(200.0, 200.0, (50.0, 50.0), (80.0, 56.0))
+            .unwrap();
         assert_eq!(h.through, (50.0, 50.0));
         assert_eq!(h.dir, (1.0, 0.0));
         assert_eq!(h.project(90.0, 99.0), (90.0, 50.0));
-        let v = guides.assist_lock(200.0, 200.0, (50.0, 50.0), (54.0, 90.0)).unwrap();
+        let v = guides
+            .assist_lock(200.0, 200.0, (50.0, 50.0), (54.0, 90.0))
+            .unwrap();
         assert_eq!(v.dir, (0.0, 1.0));
     }
 
     #[test]
     fn assist_locks_iso_lattice_directions() {
         let guides = g(GuideKind::Isometric);
-        assert_eq!(guides.assist_lock(200.0, 200.0, (50.0, 50.0), (51.0, 51.0)), None);
+        assert_eq!(
+            guides.assist_lock(200.0, 200.0, (50.0, 50.0), (51.0, 51.0)),
+            None
+        );
         // Straight down: the vertical family.
-        let v = guides.assist_lock(200.0, 200.0, (50.0, 50.0), (52.0, 90.0)).unwrap();
+        let v = guides
+            .assist_lock(200.0, 200.0, (50.0, 50.0), (52.0, 90.0))
+            .unwrap();
         assert!(v.dir.0.abs() < 0.01 && (v.dir.1 - 1.0).abs() < 0.01);
         // Along +30 degrees: that diagonal family (cos30, sin30).
-        let d = guides.assist_lock(200.0, 200.0, (50.0, 50.0), (120.0, 90.0)).unwrap();
+        let d = guides
+            .assist_lock(200.0, 200.0, (50.0, 50.0), (120.0, 90.0))
+            .unwrap();
         assert!((d.dir.0 - 0.8660254).abs() < 0.01 && (d.dir.1 - 0.5).abs() < 0.01);
         assert_eq!(d.through, (50.0, 50.0));
     }
@@ -579,7 +678,9 @@ mod tests {
     fn assist_follows_custom_vps() {
         let mut guides = g(GuideKind::OnePoint);
         guides.set_vp(0, 40.0, 160.0, 200.0, 200.0);
-        let lock = guides.assist_lock(200.0, 200.0, (100.0, 160.0), (120.0, 162.0)).unwrap();
+        let lock = guides
+            .assist_lock(200.0, 200.0, (100.0, 160.0), (120.0, 162.0))
+            .unwrap();
         assert_eq!(lock.through, (40.0, 160.0));
     }
 }

@@ -49,7 +49,7 @@ is the editable source). Shipped as the window icon and the embedded exe icon.
 
 ## Build
 
-Needs Rust 1.85+ ([rustup](https://rustup.rs)):
+Needs Rust 1.88+ ([rustup](https://rustup.rs)):
 
 ```sh
 git clone https://github.com/surfrpt1/procraft.git

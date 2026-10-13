@@ -6,16 +6,18 @@
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
 // iOS has no rfd backend: same call shape, every dialog declined.
+use procraft_engine::{
+    analogous, clamp_frame, complementary, export_gif_ext, export_tip_png, import_brush_file,
+    import_gif_document, import_gpl_file, next_frame, onion_ghost, open_brush_library,
+    open_palette, open_psd, prev_frame, rasterize_frame, rasterize_frame_region,
+    save_brush_library, save_palette, save_psd, starter_palette, step_playback_visible, triadic,
+    AssistLine, BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides,
+    LoopMode, PaintTarget, Palette, PaletteSet, ShapePoly, SymmetryMode, MAX_ANIM_FPS,
+    MAX_ANIM_HOLD, MAX_LIBRARY_BRUSHES, MAX_PALETTES, MAX_PALETTE_COLORS, MIN_ANIM_FPS,
+    MIN_ANIM_HOLD, MIN_TEXT_PX,
+};
 #[cfg(target_os = "ios")]
 use rfd_shim as rfd;
-use procraft_engine::{
-    AssistLine, BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides, LoopMode, PaintTarget,
-    Palette, PaletteSet, ShapePoly, SymmetryMode, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_LIBRARY_BRUSHES,
-    MAX_PALETTES, MAX_PALETTE_COLORS, MIN_ANIM_FPS, MIN_ANIM_HOLD, analogous, clamp_frame, complementary,
-    export_gif_ext, export_tip_png, import_brush_file, import_gif_document, import_gpl_file, next_frame, onion_ghost,
-    open_brush_library, open_palette, open_psd, prev_frame, rasterize_frame, rasterize_frame_region,
-    save_brush_library, save_palette, save_psd, starter_palette, step_playback_visible, triadic, MIN_TEXT_PX,
-};
 
 /// Latest Apple Pencil / touch pressure (0.0..=1.0) seen in this frame's
 /// input events, if the backend forwarded any. egui 0.36 exposes pressure
@@ -25,7 +27,10 @@ fn latest_touch_force(ctx: &egui::Context) -> Option<f32> {
     ctx.input(|i| {
         let mut force = None;
         for e in &i.events {
-            if let egui::Event::Touch { force: f, phase, .. } = e {
+            if let egui::Event::Touch {
+                force: f, phase, ..
+            } = e
+            {
                 if *phase == egui::TouchPhase::End || *phase == egui::TouchPhase::Cancel {
                     continue;
                 }
@@ -158,7 +163,8 @@ fn ensure_extension(mut path: std::path::PathBuf, ext: &str) -> std::path::PathB
     path
 }
 
-fn page_presets() -> Vec<(&'static str, [u8; 3])> {    vec![
+fn page_presets() -> Vec<(&'static str, [u8; 3])> {
+    vec![
         ("White", [255, 255, 255]),
         ("Black", [0, 0, 0]),
         ("Gray", [128, 128, 128]),
@@ -356,12 +362,17 @@ impl ProCraftApp {
             text_body: String::new(),
             text_size: 48.0,
             zoom: 1.0,
-            status: "Drag on the canvas to paint. Ctrl+Z undoes, Ctrl+Y redoes, Esc clears selection.".to_string(),
+            status:
+                "Drag on the canvas to paint. Ctrl+Z undoes, Ctrl+Y redoes, Esc clears selection."
+                    .to_string(),
         }
     }
 
     fn base_brush(&self) -> Brush {
-        Brush { eraser: self.tool == Tool::Eraser, ..self.brush.clone() }
+        Brush {
+            eraser: self.tool == Tool::Eraser,
+            ..self.brush.clone()
+        }
     }
 
     fn current_color(&self) -> Color {
@@ -436,7 +447,11 @@ impl ProCraftApp {
         let active = clamp_frame(&self.doc, self.doc.active).unwrap_or(0);
         let bits = (self.onion_amount.clamp(0.05, 0.8) * 1000.0).round() as u32;
         let pair = if self.anim_assist && self.onion && !self.doc.layers.is_empty() {
-            (prev_frame(&self.doc, active), next_frame(&self.doc, active), bits)
+            (
+                prev_frame(&self.doc, active),
+                next_frame(&self.doc, active),
+                bits,
+            )
         } else {
             (None, None, bits)
         };
@@ -494,12 +509,10 @@ impl ProCraftApp {
                 }
                 Err(e) => self.status = format!("PSD open failed: {e}"),
             },
-            PendingOpen::Brushes => {
-                match load_brush_file(&path) {
-                    Ok(libs) => self.status = self.absorb_brushes(libs, &path),
-                    Err(e) => self.status = format!("Brush import failed: {e}"),
-                }
-            }
+            PendingOpen::Brushes => match load_brush_file(&path) {
+                Ok(libs) => self.status = self.absorb_brushes(libs, &path),
+                Err(e) => self.status = format!("Brush import failed: {e}"),
+            },
             PendingOpen::Palette => match load_palette_file(&path) {
                 Ok(pal) => self.status = self.absorb_colors(pal, &path),
                 Err(e) => self.status = format!("Palette import failed: {e}"),
@@ -535,22 +548,21 @@ impl ProCraftApp {
             .collect();
         for (idx, preset) in brushes.into_iter().enumerate() {
             let mut doc = Document::new(144, 36);
-            let brush = Brush { eraser: false, ..preset };
+            let brush = Brush {
+                eraser: false,
+                ..preset
+            };
             let mut last = None;
             let mut left = 0.0;
             let mut x = 8.0;
             while x <= 136.0 {
-                let y = 18.0
-                    + 8.0 * ((x - 8.0) / 128.0 * std::f32::consts::PI * 2.0).sin();
+                let y = 18.0 + 8.0 * ((x - 8.0) / 128.0 * std::f32::consts::PI * 2.0).sin();
                 let (l, lo) = doc.stroke_to(&brush, ink, last, (x, y), left);
                 last = l;
                 left = lo;
                 x += 2.0;
             }
-            let img = ColorImage::from_rgba_unmultiplied(
-                [144, 36],
-                &doc.layers[0].pixels.clone(),
-            );
+            let img = ColorImage::from_rgba_unmultiplied([144, 36], &doc.layers[0].pixels.clone());
             self.preset_textures.push(ctx.load_texture(
                 format!("brush-{idx}"),
                 img,
@@ -568,7 +580,11 @@ impl ProCraftApp {
 /// Dispatch a palette file by extension (shared by the desktop Import arm
 /// and the iOS picker resolve path): `.pcpalette`/`.json` or GIMP `.gpl`.
 fn load_palette_file(path: &std::path::Path) -> Result<Palette, String> {
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     if ext == "gpl" {
         import_gpl_file(path)
     } else {
@@ -578,14 +594,28 @@ fn load_palette_file(path: &std::path::Path) -> Result<Palette, String> {
 /// Dispatch a brush file by extension into presets (shared by the desktop
 /// Import arm and the iOS picker resolve path).
 fn load_brush_file(path: &std::path::Path) -> Result<Vec<BrushPreset>, String> {
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     if ext == "pcbrush" || ext == "json" {
         open_brush_library(path).map(|libs| {
-            libs.into_iter().map(|p| BrushPreset { name: p.name, brush: p.brush }).collect()
+            libs.into_iter()
+                .map(|p| BrushPreset {
+                    name: p.name,
+                    brush: p.brush,
+                })
+                .collect()
         })
     } else {
         import_brush_file(path).map(|libs| {
-            libs.into_iter().map(|b| BrushPreset { name: b.name, brush: b.brush }).collect()
+            libs.into_iter()
+                .map(|b| BrushPreset {
+                    name: b.name,
+                    brush: b.brush,
+                })
+                .collect()
         })
     }
 }
@@ -615,7 +645,10 @@ impl ProCraftApp {
                 break;
             }
             let name = self.unique_brush_name(&p.name);
-            self.custom_brushes.push(BrushPreset { name, brush: p.brush });
+            self.custom_brushes.push(BrushPreset {
+                name,
+                brush: p.brush,
+            });
             added += 1;
         }
         format!("Imported {added} brushes from {}.", path.display())
@@ -651,7 +684,11 @@ impl ProCraftApp {
             Some(fp) => {
                 fp.kind != kind
                     || fp.layer != layer
-                    || self.doc.layers.get(layer).map_or(true, |l| l.pixels.len() != fp.pixels.len())
+                    || self
+                        .doc
+                        .layers
+                        .get(layer)
+                        .is_none_or(|l| l.pixels.len() != fp.pixels.len())
             }
             None => true,
         };
@@ -659,8 +696,11 @@ impl ProCraftApp {
             self.doc.checkpoint();
             match self.doc.layers.get(layer) {
                 Some(l) => {
-                    self.filter_preview =
-                        Some(FilterPreview { kind, layer, pixels: l.pixels.clone() });
+                    self.filter_preview = Some(FilterPreview {
+                        kind,
+                        layer,
+                        pixels: l.pixels.clone(),
+                    });
                 }
                 None => {
                     self.filter_preview = None;
@@ -793,7 +833,7 @@ fn downsample_half(full: &[u8], w: usize, h: usize) -> ColorImage {
             }
             let o = (y * hw + x) * 4;
             for c in 0..4 {
-                px[o + c] = if n > 0 { (acc[c] / n) as u8 } else { 0 };
+                px[o + c] = acc[c].checked_div(n).unwrap_or(0) as u8;
             }
         }
     }
@@ -853,24 +893,36 @@ impl eframe::App for ProCraftApp {
             self.theme_applied = Some(self.theme);
         }
         // Ctrl+Z undo, Ctrl+Y / Ctrl+Shift+Z redo, Esc clears selection.
-        if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z)) && self.doc.undo()
+        if ui
+            .ctx()
+            .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z))
+            && self.doc.undo()
         {
             self.ghost_dirty = true;
             self.status = "Undone.".to_string();
         }
-        if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Y)) && self.doc.redo()
+        if ui
+            .ctx()
+            .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Y))
+            && self.doc.redo()
         {
             self.ghost_dirty = true;
             self.status = "Redone.".to_string();
         }
         if ui.ctx().input_mut(|i| {
-            i.consume_key(egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT), egui::Key::Z)
+            i.consume_key(
+                egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
+                egui::Key::Z,
+            )
         }) && self.doc.redo()
         {
             self.ghost_dirty = true;
             self.status = "Redone.".to_string();
         }
-        if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        if ui
+            .ctx()
+            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
             self.doc.clear_selection();
             self.sel_anchor = None;
             self.sel_current = None;
@@ -945,7 +997,10 @@ impl eframe::App for ProCraftApp {
             // Wrapped rows: one row on desktop, two on narrow screens.
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Save PNG").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).save_file() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("PNG", &["png"])
+                        .save_file()
+                    {
                         // The dialog may return an extensionless path (always
                         // on iOS); the encoder needs the suffix to pick PNG.
                         let path = ensure_extension(path, "png");
@@ -962,7 +1017,10 @@ impl eframe::App for ProCraftApp {
                 if ui.button("Open image").clicked() {
                     #[cfg(not(target_os = "ios"))]
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"])
+                        .add_filter(
+                            "Images",
+                            &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
+                        )
                         .pick_file()
                     {
                         match self.doc.load_background(&path) {
@@ -979,7 +1037,10 @@ impl eframe::App for ProCraftApp {
                     #[cfg(target_os = "ios")]
                     {
                         let _ = rfd::FileDialog::new()
-                            .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"])
+                            .add_filter(
+                                "Images",
+                                &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
+                            )
                             .pick_file();
                         self.pending_open = Some(PendingOpen::Image);
                         self.status = "Pick an image…".to_string();
@@ -1035,7 +1096,10 @@ impl eframe::App for ProCraftApp {
                         let path = ensure_extension(path, "psd");
                         match save_psd(&path, &self.doc) {
                             Ok(()) => {
-                                self.status = format!("PSD saved {} (masks do not round-trip)", path.display());
+                                self.status = format!(
+                                    "PSD saved {} (masks do not round-trip)",
+                                    path.display()
+                                );
                                 #[cfg(target_os = "ios")]
                                 rfd::ios_share_file(&path);
                             }
@@ -1055,7 +1119,8 @@ impl eframe::App for ProCraftApp {
                                 self.texture = None;
                                 self.lasso_points.clear();
                                 self.lasso_poly.clear();
-                                self.status = format!("PSD opened {} (masks do not import)", path.display());
+                                self.status =
+                                    format!("PSD opened {} (masks do not import)", path.display());
                             }
                             Err(e) => self.status = format!("PSD open failed: {e}"),
                         }
@@ -1151,10 +1216,15 @@ impl eframe::App for ProCraftApp {
                             match self.text_anchor {
                                 Some((ax, ay)) => {
                                     self.doc.checkpoint();
-                                    match self.doc.draw_text(ink, ax, ay, self.text_size, &self.text_body) {
+                                    match self.doc.draw_text(
+                                        ink,
+                                        ax,
+                                        ay,
+                                        self.text_size,
+                                        &self.text_body,
+                                    ) {
                                         Ok((w, h)) => {
-                                            self.status =
-                                                format!("Text placed ({w}x{h}px).");
+                                            self.status = format!("Text placed ({w}x{h}px).");
                                             self.text_open = false;
                                         }
                                         Err(e) => self.status = format!("Text failed: {e}"),
@@ -1180,7 +1250,7 @@ impl eframe::App for ProCraftApp {
         // the panel stays freely resizable, it just starts compact (swatch
         // grids wrap to ~3 rows, page gets the room).
         if self.show_tools {
-        egui::Panel::left("tools-compact").default_size(240.0).show(ui, |ui| {
+            egui::Panel::left("tools-compact").default_size(240.0).show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Tool");
@@ -1727,7 +1797,7 @@ impl eframe::App for ProCraftApp {
         // Fresh id (not "layers"): eframe persists panel widths to disk, and the
         // old narrow width would otherwise override `default_size` forever.
         if self.show_layers {
-        egui::Panel::right("layers-wide").default_size(280.0).show(ui, |ui| {
+            egui::Panel::right("layers-wide").default_size(280.0).show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Layers");
@@ -2119,7 +2189,7 @@ impl eframe::App for ProCraftApp {
                 self.status = "Previewing tone — Apply to keep.".to_string();
             }
             if ui.button("Apply tone").clicked() {
-                if self.filter_preview.as_ref().map_or(true, |fp| fp.kind != 0) {
+                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 0) {
                     let (b, c) = (self.filt_brightness, self.filt_contrast);
                     self.doc.checkpoint();
                     self.doc.adjust_tone(
@@ -2141,7 +2211,7 @@ impl eframe::App for ProCraftApp {
                 self.status = "Previewing blur — Apply to keep.".to_string();
             }
             if ui.button("Apply blur").clicked() {
-                if self.filter_preview.as_ref().map_or(true, |fp| fp.kind != 1) {
+                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 1) {
                     self.doc.checkpoint();
                     self.doc.blur_layer(self.doc.active, self.filt_blur.max(0) as u32);
                 }
@@ -2158,7 +2228,7 @@ impl eframe::App for ProCraftApp {
                 self.status = "Previewing sharpen — Apply to keep.".to_string();
             }
             if ui.button("Apply sharpen").clicked() {
-                if self.filter_preview.as_ref().map_or(true, |fp| fp.kind != 2) {
+                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 2) {
                     self.doc.checkpoint();
                     self.doc.sharpen_layer(self.doc.active, self.filt_sharpen / 100.0);
                 }
@@ -2220,9 +2290,7 @@ impl eframe::App for ProCraftApp {
                 );
                 let to_canvas =
                     |pos: egui::Pos2| ((pos.x - rect.min.x) / z, (pos.y - rect.min.y) / z);
-                let clamp_pt = |x: f32, y: f32| {
-                    (x.clamp(0.0, w - 1.0), y.clamp(0.0, h - 1.0))
-                };
+                let clamp_pt = |x: f32, y: f32| (x.clamp(0.0, w - 1.0), y.clamp(0.0, h - 1.0));
                 // Mirror axis overlay so the symmetry center is visible.
                 let axis_color = Color32::from_rgba_unmultiplied(220, 40, 40, 180);
                 let axis = |a: egui::Pos2, b: egui::Pos2| {
@@ -2273,11 +2341,15 @@ impl eframe::App for ProCraftApp {
                             p + egui::Vec2::new(-r, 0.0),
                         ];
                         let red = Color32::from_rgb(220, 60, 60);
-                        ui.painter().add(egui::Shape::closed_line(diamond, (3.0, red)));
+                        ui.painter()
+                            .add(egui::Shape::closed_line(diamond, (3.0, red)));
                         ui.painter().circle_filled(p, 2.0, Color32::WHITE);
                     } else {
                         let (fill, r) = if self.sym_move {
-                            (Color32::from_rgb(220, 60, 60), if self.sym_grab { 11.0 } else { 9.0 })
+                            (
+                                Color32::from_rgb(220, 60, 60),
+                                if self.sym_grab { 11.0 } else { 9.0 },
+                            )
                         } else {
                             (Color32::from_rgb(220, 60, 60), 6.0)
                         };
@@ -2330,11 +2402,15 @@ impl eframe::App for ProCraftApp {
                                 p + egui::Vec2::new(-r, 0.0),
                             ];
                             let amber = Color32::from_rgb(255, 200, 60);
-                            ui.painter().add(egui::Shape::closed_line(diamond, (3.0, amber)));
+                            ui.painter()
+                                .add(egui::Shape::closed_line(diamond, (3.0, amber)));
                             ui.painter().circle_filled(p, 2.0, Color32::WHITE);
                         } else {
                             let (fill, r) = if self.vp_move {
-                                (Color32::from_rgb(255, 200, 60), if grabbed { 11.0 } else { 9.0 })
+                                (
+                                    Color32::from_rgb(255, 200, 60),
+                                    if grabbed { 11.0 } else { 9.0 },
+                                )
                             } else {
                                 (Color32::from_rgb(70, 130, 200), 6.0)
                             };
@@ -2347,15 +2423,15 @@ impl eframe::App for ProCraftApp {
                 // mask view): previous frame red, next frame blue.
                 if self.anim_assist && self.onion && !self.view_mask {
                     self.refresh_ghosts(&ctx);
-                    let full = egui::Rect::from_min_max(
-                        egui::Pos2::ZERO,
-                        egui::Pos2::new(1.0, 1.0),
-                    );
+                    let full =
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0));
                     if let Some(tex) = &self.ghost_prev {
-                        ui.painter().image(tex.id(), rect, full, Color32::from_rgb(255, 130, 130));
+                        ui.painter()
+                            .image(tex.id(), rect, full, Color32::from_rgb(255, 130, 130));
                     }
                     if let Some(tex) = &self.ghost_next {
-                        ui.painter().image(tex.id(), rect, full, Color32::from_rgb(130, 165, 255));
+                        ui.painter()
+                            .image(tex.id(), rect, full, Color32::from_rgb(130, 165, 255));
                     }
                 }
                 // Text anchor crosshair while placing type.
@@ -2364,11 +2440,17 @@ impl eframe::App for ProCraftApp {
                         let p = egui::Pos2::new(rect.min.x + ax * z, rect.min.y + ay * z);
                         for (color, width) in [(Color32::BLACK, 3.0), (Color32::WHITE, 1.5)] {
                             ui.painter().line_segment(
-                                [p + egui::Vec2::new(-8.0, 0.0), p + egui::Vec2::new(8.0, 0.0)],
+                                [
+                                    p + egui::Vec2::new(-8.0, 0.0),
+                                    p + egui::Vec2::new(8.0, 0.0),
+                                ],
                                 (width, color),
                             );
                             ui.painter().line_segment(
-                                [p + egui::Vec2::new(0.0, -8.0), p + egui::Vec2::new(0.0, 8.0)],
+                                [
+                                    p + egui::Vec2::new(0.0, -8.0),
+                                    p + egui::Vec2::new(0.0, 8.0),
+                                ],
                                 (width, color),
                             );
                         }
@@ -2395,10 +2477,8 @@ impl eframe::App for ProCraftApp {
                             let (cx, cy) = clamp_pt(x, y);
                             if let Some(rgb) = self.doc.sample(cx as u32, cy as u32) {
                                 self.color = rgb;
-                                self.status = format!(
-                                    "Picked #{:02X}{:02X}{:02X}.",
-                                    rgb[0], rgb[1], rgb[2]
-                                );
+                                self.status =
+                                    format!("Picked #{:02X}{:02X}{:02X}.", rgb[0], rgb[1], rgb[2]);
                             }
                         }
                     }
@@ -2415,13 +2495,11 @@ impl eframe::App for ProCraftApp {
                     if resp.drag_started() {
                         if let Some(pos) = resp.hover_pos() {
                             let mut best: Option<(usize, f32)> = None;
-                            for (i, (vx, vy)) in
-                                self.guides.vp_list(w, h).iter().enumerate()
-                            {
+                            for (i, (vx, vy)) in self.guides.vp_list(w, h).iter().enumerate() {
                                 // Parked edge markers grab exactly where drawn.
                                 let (p, _) = vp_handle_pos(rect, z, *vx, *vy);
                                 let d = (p.x - pos.x).hypot(p.y - pos.y);
-                                if best.map_or(true, |(_, bd)| d < bd) {
+                                if best.is_none_or(|(_, bd)| d < bd) {
                                     best = Some((i, d));
                                 }
                             }
@@ -2458,12 +2536,10 @@ impl eframe::App for ProCraftApp {
                                 self.sym_grab = true;
                             }
                         }
-                    } else if resp.dragged() {
-                        if self.sym_grab {
-                            if let Some(pos) = resp.hover_pos() {
-                                let (x, y) = to_canvas(pos);
-                                self.doc.set_symmetry_center(x, y);
-                            }
+                    } else if resp.dragged() && self.sym_grab {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            self.doc.set_symmetry_center(x, y);
                         }
                     }
                     if resp.drag_stopped() {
@@ -2490,14 +2566,25 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                     if resp.drag_stopped() {
-                        if let (Some((ax, ay)), Some((bx, by))) = (self.sel_anchor, self.sel_current) {
-                            let (x0, x1) = if ax <= bx { (ax as u32, bx as u32) } else { (bx as u32, ax as u32) };
-                            let (y0, y1) = if ay <= by { (ay as u32, by as u32) } else { (by as u32, ay as u32) };
+                        if let (Some((ax, ay)), Some((bx, by))) =
+                            (self.sel_anchor, self.sel_current)
+                        {
+                            let (x0, x1) = if ax <= bx {
+                                (ax as u32, bx as u32)
+                            } else {
+                                (bx as u32, ax as u32)
+                            };
+                            let (y0, y1) = if ay <= by {
+                                (ay as u32, by as u32)
+                            } else {
+                                (by as u32, ay as u32)
+                            };
                             if x1.saturating_sub(x0) >= 2 && y1.saturating_sub(y0) >= 2 {
                                 self.doc.selection = Some((x0, y0, x1, y1));
                                 self.doc.selection_mask = None;
                                 self.lasso_poly.clear();
-                                self.status = format!("Selected {}x{} px.", x1 - x0 + 1, y1 - y0 + 1);
+                                self.status =
+                                    format!("Selected {}x{} px.", x1 - x0 + 1, y1 - y0 + 1);
                             } else {
                                 self.doc.clear_selection();
                             }
@@ -2635,7 +2722,8 @@ impl eframe::App for ProCraftApp {
                                     }
                                     let brush = self.base_brush();
                                     let color = self.current_color();
-                                    self.doc.flood_fill(&brush, color, fp.seed.0, fp.seed.1, tol);
+                                    self.doc
+                                        .flood_fill(&brush, color, fp.seed.0, fp.seed.1, tol);
                                     fp.applied = tol;
                                     self.fill_tolerance = tol;
                                     self.status = format!("Fill preview — tolerance {tol}.");
@@ -2703,25 +2791,44 @@ impl eframe::App for ProCraftApp {
                             self.shape_current = Some(clamp_pt(x, y));
                         }
                     }
-                    if let (Some((ax, ay)), Some((bx, by))) = (self.shape_anchor, self.shape_current) {
+                    if let (Some((ax, ay)), Some((bx, by))) =
+                        (self.shape_anchor, self.shape_current)
+                    {
                         let r = egui::Rect::from_min_max(
-                            egui::Pos2::new(rect.min.x + ax.min(bx) * z, rect.min.y + ay.min(by) * z),
-                            egui::Pos2::new(rect.min.x + ax.max(bx) * z, rect.min.y + ay.max(by) * z),
+                            egui::Pos2::new(
+                                rect.min.x + ax.min(bx) * z,
+                                rect.min.y + ay.min(by) * z,
+                            ),
+                            egui::Pos2::new(
+                                rect.min.x + ax.max(bx) * z,
+                                rect.min.y + ay.max(by) * z,
+                            ),
                         );
                         paint_selection(ui.painter(), r, ctx.input(|i| i.time));
                     }
                     if resp.drag_stopped() {
-                        if let (Some((ax, ay)), Some((bx, by))) = (self.shape_anchor, self.shape_current) {
+                        if let (Some((ax, ay)), Some((bx, by))) =
+                            (self.shape_anchor, self.shape_current)
+                        {
                             self.doc.checkpoint();
                             let brush = self.base_brush();
                             let color = self.current_color();
                             match self.shape_kind {
                                 ShapeKind::Line => {
-                                    self.doc.shape_line(&brush, color, Some((ax, ay)), (bx, by), 0.0);
+                                    self.doc.shape_line(
+                                        &brush,
+                                        color,
+                                        Some((ax, ay)),
+                                        (bx, by),
+                                        0.0,
+                                    );
                                 }
                                 ShapeKind::Rect => {
                                     if self.shape_fill {
-                                        self.doc.fill_rect(&brush, color, ax as u32, ay as u32, bx as u32, by as u32);
+                                        self.doc.fill_rect(
+                                            &brush, color, ax as u32, ay as u32, bx as u32,
+                                            by as u32,
+                                        );
                                     } else {
                                         self.doc.shape_rect(&brush, color, ax, ay, bx, by);
                                     }
@@ -2735,23 +2842,77 @@ impl eframe::App for ProCraftApp {
                                 }
                                 ShapeKind::Triangle => {
                                     if self.shape_fill {
-                                        self.doc.fill_poly(&brush, color, ShapePoly::Triangle, ax, ay, bx, by, self.shape_sides);
+                                        self.doc.fill_poly(
+                                            &brush,
+                                            color,
+                                            ShapePoly::Triangle,
+                                            ax,
+                                            ay,
+                                            bx,
+                                            by,
+                                            self.shape_sides,
+                                        );
                                     } else {
-                                        self.doc.shape_poly(&brush, color, ShapePoly::Triangle, ax, ay, bx, by, self.shape_sides);
+                                        self.doc.shape_poly(
+                                            &brush,
+                                            color,
+                                            ShapePoly::Triangle,
+                                            ax,
+                                            ay,
+                                            bx,
+                                            by,
+                                            self.shape_sides,
+                                        );
                                     }
                                 }
                                 ShapeKind::Diamond => {
                                     if self.shape_fill {
-                                        self.doc.fill_poly(&brush, color, ShapePoly::Diamond, ax, ay, bx, by, self.shape_sides);
+                                        self.doc.fill_poly(
+                                            &brush,
+                                            color,
+                                            ShapePoly::Diamond,
+                                            ax,
+                                            ay,
+                                            bx,
+                                            by,
+                                            self.shape_sides,
+                                        );
                                     } else {
-                                        self.doc.shape_poly(&brush, color, ShapePoly::Diamond, ax, ay, bx, by, self.shape_sides);
+                                        self.doc.shape_poly(
+                                            &brush,
+                                            color,
+                                            ShapePoly::Diamond,
+                                            ax,
+                                            ay,
+                                            bx,
+                                            by,
+                                            self.shape_sides,
+                                        );
                                     }
                                 }
                                 ShapeKind::Star => {
                                     if self.shape_fill {
-                                        self.doc.fill_poly(&brush, color, ShapePoly::Star, ax, ay, bx, by, self.shape_sides);
+                                        self.doc.fill_poly(
+                                            &brush,
+                                            color,
+                                            ShapePoly::Star,
+                                            ax,
+                                            ay,
+                                            bx,
+                                            by,
+                                            self.shape_sides,
+                                        );
                                     } else {
-                                        self.doc.shape_poly(&brush, color, ShapePoly::Star, ax, ay, bx, by, self.shape_sides);
+                                        self.doc.shape_poly(
+                                            &brush,
+                                            color,
+                                            ShapePoly::Star,
+                                            ax,
+                                            ay,
+                                            bx,
+                                            by,
+                                            self.shape_sides,
+                                        );
                                     }
                                 }
                                 ShapeKind::Arrow => {
@@ -2759,9 +2920,27 @@ impl eframe::App for ProCraftApp {
                                 }
                                 ShapeKind::Polygon => {
                                     if self.shape_fill {
-                                        self.doc.fill_poly(&brush, color, ShapePoly::Polygon, ax, ay, bx, by, self.shape_sides);
+                                        self.doc.fill_poly(
+                                            &brush,
+                                            color,
+                                            ShapePoly::Polygon,
+                                            ax,
+                                            ay,
+                                            bx,
+                                            by,
+                                            self.shape_sides,
+                                        );
                                     } else {
-                                        self.doc.shape_poly(&brush, color, ShapePoly::Polygon, ax, ay, bx, by, self.shape_sides);
+                                        self.doc.shape_poly(
+                                            &brush,
+                                            color,
+                                            ShapePoly::Polygon,
+                                            ax,
+                                            ay,
+                                            bx,
+                                            by,
+                                            self.shape_sides,
+                                        );
                                     }
                                 }
                             }
@@ -2839,7 +3018,9 @@ impl eframe::App for ProCraftApp {
                         // pointer; 0 keeps the raw point bit-for-bit.
                         let a = brush.stabilizer.clamp(0.0, 1.0) * 0.85;
                         let (sx, sy) = match self.smooth_pt {
-                            Some((px, py)) => (px + (x - px) * (1.0 - a), py + (y - py) * (1.0 - a)),
+                            Some((px, py)) => {
+                                (px + (x - px) * (1.0 - a), py + (y - py) * (1.0 - a))
+                            }
                             None => (x, y),
                         };
                         self.smooth_pt = Some((sx, sy));
@@ -2885,7 +3066,11 @@ impl eframe::App for ProCraftApp {
                             }
                             None => (0.0, self.last_dyn.angle),
                         };
-                        let from_dyn = if self.last.is_some() { self.last_dyn } else { DabDynamics::default() };
+                        let from_dyn = if self.last.is_some() {
+                            self.last_dyn
+                        } else {
+                            DabDynamics::default()
+                        };
                         let to_dyn = DabDynamics {
                             pressure: self.smooth_pressure,
                             speed_norm,
@@ -2924,7 +3109,11 @@ fn app_icon() -> Option<egui::IconData> {
     let bytes = include_bytes!("../../../assets/icon-48.png");
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (w, h) = (img.width(), img.height());
-    Some(egui::IconData { rgba: img.into_raw(), width: w, height: h })
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width: w,
+        height: h,
+    })
 }
 
 fn main() {
@@ -2932,7 +3121,10 @@ fn main() {
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(icon);
     }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
     let _ = eframe::run_native(
         "ProCraft",
         options,

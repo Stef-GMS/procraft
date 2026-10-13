@@ -49,16 +49,21 @@ pub fn layout_text(text: &str, size_px: f32) -> Result<TextLayout, String> {
     if lines.len() > MAX_TEXT_LINES {
         return Err(format!("too many lines (max {MAX_TEXT_LINES})"));
     }
-    if !text.chars().any(|c| c != '\n' && c != '\r' && !c.is_whitespace()) {
+    if !text
+        .chars()
+        .any(|c| c != '\n' && c != '\r' && !c.is_whitespace())
+    {
         return Err("nothing to render: text is blank".to_string());
     }
     let font = load_font()?;
-    let lm = font.horizontal_line_metrics(size_px).unwrap_or(fontdue::LineMetrics {
-        ascent: size_px * 0.8,
-        descent: -size_px * 0.2,
-        line_gap: 0.0,
-        new_line_size: size_px,
-    });
+    let lm = font
+        .horizontal_line_metrics(size_px)
+        .unwrap_or(fontdue::LineMetrics {
+            ascent: size_px * 0.8,
+            descent: -size_px * 0.2,
+            line_gap: 0.0,
+            new_line_size: size_px,
+        });
     let line_height = (lm.new_line_size).max(1.0);
     let total_h = ((lines.len() as f32 * line_height).ceil() as u32).max(1);
     if total_h > MAX_LAYOUT_SIDE {
@@ -139,7 +144,11 @@ pub fn layout_text(text: &str, size_px: f32) -> Result<TextLayout, String> {
             prev = Some(c);
         }
     }
-    Ok(TextLayout { w: total_w, h: total_h, mask })
+    Ok(TextLayout {
+        w: total_w,
+        h: total_h,
+        mask,
+    })
 }
 
 impl Document {
@@ -213,15 +222,18 @@ impl Document {
                 let dst_a = layer.pixels[o + 3] as f32 / 255.0;
                 let out_a = cov + dst_a * (1.0 - cov);
                 if out_a > 0.0 {
-                    layer.pixels[o] =
-                        ((c[0] as f32 * cov + layer.pixels[o] as f32 * dst_a * (1.0 - cov)) / out_a)
-                            .round() as u8;
-                    layer.pixels[o + 1] =
-                        ((c[1] as f32 * cov + layer.pixels[o + 1] as f32 * dst_a * (1.0 - cov)) / out_a)
-                            .round() as u8;
-                    layer.pixels[o + 2] =
-                        ((c[2] as f32 * cov + layer.pixels[o + 2] as f32 * dst_a * (1.0 - cov)) / out_a)
-                            .round() as u8;
+                    layer.pixels[o] = ((c[0] as f32 * cov
+                        + layer.pixels[o] as f32 * dst_a * (1.0 - cov))
+                        / out_a)
+                        .round() as u8;
+                    layer.pixels[o + 1] = ((c[1] as f32 * cov
+                        + layer.pixels[o + 1] as f32 * dst_a * (1.0 - cov))
+                        / out_a)
+                        .round() as u8;
+                    layer.pixels[o + 2] = ((c[2] as f32 * cov
+                        + layer.pixels[o + 2] as f32 * dst_a * (1.0 - cov))
+                        / out_a)
+                        .round() as u8;
                     layer.pixels[o + 3] = (out_a * 255.0).round() as u8;
                 }
             }
@@ -261,7 +273,10 @@ mod tests {
         let two = layout_text("Hello\nWorld", 32.0).unwrap();
         assert!(two.w >= one.w);
         assert!(two.h > one.h);
-        assert!(two.mask.iter().filter(|&&b| b > 0).count() > one.mask.iter().filter(|&&b| b > 0).count());
+        assert!(
+            two.mask.iter().filter(|&&b| b > 0).count()
+                > one.mask.iter().filter(|&&b| b > 0).count()
+        );
     }
 
     #[test]
@@ -269,17 +284,21 @@ mod tests {
         use super::super::brush::Brush;
         let mut doc = Document::new(64, 64);
         doc.checkpoint();
-        let (w, h) = doc.draw_text(Color::rgb(255, 0, 0), 4.0, 4.0, 24.0, "Hi").unwrap();
+        let (w, h) = doc
+            .draw_text(Color::rgb(255, 0, 0), 4.0, 4.0, 24.0, "Hi")
+            .unwrap();
         assert!(w > 0 && h > 0);
         assert!(doc.layers[0].pixels.iter().any(|&b| b != 0));
         // Half off-canvas: clips, never panics.
         let mut doc2 = Document::new(64, 64);
         doc2.checkpoint();
-        doc2.draw_text(Color::rgb(0, 255, 0), -20.0, -20.0, 48.0, "Clip").unwrap();
+        doc2.draw_text(Color::rgb(0, 255, 0), -20.0, -20.0, 48.0, "Clip")
+            .unwrap();
         // Fully outside: no-op, no pixels, no panic.
         let mut doc3 = Document::new(64, 64);
         doc3.checkpoint();
-        doc3.draw_text(Color::rgb(0, 0, 255), 500.0, 500.0, 24.0, "Far").unwrap();
+        doc3.draw_text(Color::rgb(0, 0, 255), 500.0, 500.0, 24.0, "Far")
+            .unwrap();
         assert!(doc3.layers[0].pixels.iter().all(|&b| b == 0));
         let _ = Brush::default();
     }
@@ -290,12 +309,14 @@ mod tests {
         // Selection far from the text: nothing paints.
         doc.selection = Some((48, 48, 63, 63));
         doc.checkpoint();
-        doc.draw_text(Color::rgb(255, 0, 0), 2.0, 2.0, 20.0, "Nope").unwrap();
+        doc.draw_text(Color::rgb(255, 0, 0), 2.0, 2.0, 20.0, "Nope")
+            .unwrap();
         assert!(doc.layers[0].pixels.iter().all(|&b| b == 0));
         // Undo restores a painted stroke.
         doc.selection = None;
         doc.checkpoint();
-        doc.draw_text(Color::rgb(255, 0, 0), 2.0, 2.0, 20.0, "Yep").unwrap();
+        doc.draw_text(Color::rgb(255, 0, 0), 2.0, 2.0, 20.0, "Yep")
+            .unwrap();
         assert!(doc.layers[0].pixels.iter().any(|&b| b != 0));
         assert!(doc.undo());
         assert!(doc.layers[0].pixels.iter().all(|&b| b == 0));

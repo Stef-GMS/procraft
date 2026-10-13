@@ -6,8 +6,8 @@
 //! the frame count so unhiding never renumbers). Playback state itself
 //! lives app-side; this module is pure document math plus the exporter.
 
-use super::document::{BlendMode, Document};
 use super::document::Layer;
+use super::document::{BlendMode, Document};
 use image::{
     codecs::gif::{GifEncoder, Repeat},
     Delay, Frame, RgbaImage,
@@ -57,7 +57,12 @@ pub fn visible_frames(doc: &Document) -> Vec<usize> {
 /// GIF exporter writes. A hidden or deleted current frame (manually
 /// selected mid-playback) joins the sequence in the travel direction;
 /// fully-hidden documents hold their position instead of panicking.
-pub fn step_playback_visible(doc: &Document, pos: usize, fwd: bool, mode: LoopMode) -> (usize, bool) {
+pub fn step_playback_visible(
+    doc: &Document,
+    pos: usize,
+    fwd: bool,
+    mode: LoopMode,
+) -> (usize, bool) {
     let vis = visible_frames(doc);
     if vis.is_empty() {
         return (pos, true);
@@ -70,7 +75,11 @@ pub fn step_playback_visible(doc: &Document, pos: usize, fwd: bool, mode: LoopMo
             LoopMode::Forward => (vis[(k + 1) % vis.len()], true),
             LoopMode::PingPong => {
                 if fwd {
-                    if k + 1 < vis.len() { (vis[k + 1], true) } else { (vis[k - 1], false) }
+                    if k + 1 < vis.len() {
+                        (vis[k + 1], true)
+                    } else {
+                        (vis[k - 1], false)
+                    }
                 } else if k > 0 {
                     (vis[k - 1], false)
                 } else {
@@ -80,9 +89,19 @@ pub fn step_playback_visible(doc: &Document, pos: usize, fwd: bool, mode: LoopMo
         };
     }
     if fwd {
-        (vis.iter().copied().find(|&i| i > pos).unwrap_or(vis[0]), true)
+        (
+            vis.iter().copied().find(|&i| i > pos).unwrap_or(vis[0]),
+            true,
+        )
     } else {
-        (vis.iter().rev().copied().find(|&i| i < pos).unwrap_or(vis[vis.len() - 1]), false)
+        (
+            vis.iter()
+                .rev()
+                .copied()
+                .find(|&i| i < pos)
+                .unwrap_or(vis[vis.len() - 1]),
+            false,
+        )
     }
 }
 /// Advance one playback tick over `len` frames from `pos`: returns the next
@@ -100,7 +119,11 @@ pub fn step_playback(len: usize, pos: usize, fwd: bool, mode: LoopMode) -> (usiz
                 return (0, true);
             }
             if fwd {
-                if pos + 1 < len { (pos + 1, true) } else { (pos - 1, false) }
+                if pos + 1 < len {
+                    (pos + 1, true)
+                } else {
+                    (pos - 1, false)
+                }
             } else if pos > 0 {
                 (pos - 1, false)
             } else {
@@ -122,7 +145,9 @@ pub fn clamp_frame(doc: &Document, pos: usize) -> Option<usize> {
 
 /// Nearest visible layer strictly below `index` (onion: previous frame).
 pub fn prev_frame(doc: &Document, index: usize) -> Option<usize> {
-    (0..index.min(doc.layers.len())).rev().find(|&i| doc.layers[i].visible)
+    (0..index.min(doc.layers.len()))
+        .rev()
+        .find(|&i| doc.layers[i].visible)
 }
 
 /// Nearest visible layer strictly above `index` (onion: next frame).
@@ -138,7 +163,7 @@ pub fn next_frame(doc: &Document, index: usize) -> Option<usize> {
 pub fn rasterize_frame(doc: &Document, index: usize) -> Vec<u8> {
     let n = (doc.w * doc.h) as usize;
     let mut out = vec![0u8; n * 4];
-    for px in out.chunks_exact_mut(4) {
+    for px in out.as_chunks_mut::<4>().0 {
         px.copy_from_slice(&doc.background);
     }
     let Some(layer) = doc.layers.get(index) else {
@@ -311,7 +336,12 @@ pub fn import_gif_document(bytes: &[u8]) -> Result<(Document, u32), String> {
 /// [`export_gif`] plus loop mode and frame hold: ping-pong appends the
 /// interior frames in reverse (no duplicated endpoints), and `hold`
 /// stretches every frame delay (`hold` ticks at `fps`).
-pub fn export_gif_ext(doc: &Document, fps: u32, mode: LoopMode, hold: u32) -> Result<Vec<u8>, String> {
+pub fn export_gif_ext(
+    doc: &Document,
+    fps: u32,
+    mode: LoopMode,
+    hold: u32,
+) -> Result<Vec<u8>, String> {
     if !(MIN_ANIM_FPS..=MAX_ANIM_FPS).contains(&fps) {
         return Err(format!("bad animation rate: {fps}"));
     }
@@ -342,7 +372,8 @@ pub fn export_gif_ext(doc: &Document, fps: u32, mode: LoopMode, hold: u32) -> Re
     let mut buf = Vec::new();
     {
         let mut enc = GifEncoder::new(&mut buf);
-        enc.set_repeat(Repeat::Infinite).map_err(|e| e.to_string())?;
+        enc.set_repeat(Repeat::Infinite)
+            .map_err(|e| e.to_string())?;
         let delay = Delay::from_numer_denom_ms(1000 * hold, fps);
         for idx in seq {
             let px = rasterize_frame(doc, idx);
@@ -360,7 +391,11 @@ mod tests {
     use super::*;
 
     fn paint_layer(doc: &mut Document, idx: usize, rgb: [u8; 3]) {
-        let brush = Brush { size: 64.0, softness: 0.0, ..Default::default() };
+        let brush = Brush {
+            size: 64.0,
+            softness: 0.0,
+            ..Default::default()
+        };
         doc.active = idx;
         doc.fill_rect(&brush, Color::rgb(rgb[0], rgb[1], rgb[2]), 0, 0, 15, 15);
     }
@@ -459,7 +494,10 @@ mod tests {
         let frames: Vec<_> = dec.into_frames().collect::<Result<_, _>>().unwrap();
         // Hidden layer skipped: 2 frames.
         assert_eq!(frames.len(), 2);
-        assert_eq!((frames[0].buffer().width(), frames[0].buffer().height()), (16, 16));
+        assert_eq!(
+            (frames[0].buffer().width(), frames[0].buffer().height()),
+            (16, 16)
+        );
         // First frame is the red cel.
         assert_eq!(&frames[0].buffer()[(0, 0)].0[0..3], &[255, 0, 0]);
         assert!(export_gif(&doc, 0).is_err());
@@ -540,19 +578,46 @@ mod tests {
         doc.layers[1].visible = false;
         assert_eq!(visible_frames(&doc), vec![0, 2]);
         // Forward cycles the visible pair; ping-pong alternates it.
-        assert_eq!(step_playback_visible(&doc, 0, true, LoopMode::Forward), (2, true));
-        assert_eq!(step_playback_visible(&doc, 2, true, LoopMode::Forward), (0, true));
-        assert_eq!(step_playback_visible(&doc, 0, true, LoopMode::PingPong), (2, true));
-        assert_eq!(step_playback_visible(&doc, 2, true, LoopMode::PingPong), (0, false));
-        assert_eq!(step_playback_visible(&doc, 0, false, LoopMode::PingPong), (2, true));
+        assert_eq!(
+            step_playback_visible(&doc, 0, true, LoopMode::Forward),
+            (2, true)
+        );
+        assert_eq!(
+            step_playback_visible(&doc, 2, true, LoopMode::Forward),
+            (0, true)
+        );
+        assert_eq!(
+            step_playback_visible(&doc, 0, true, LoopMode::PingPong),
+            (2, true)
+        );
+        assert_eq!(
+            step_playback_visible(&doc, 2, true, LoopMode::PingPong),
+            (0, false)
+        );
+        assert_eq!(
+            step_playback_visible(&doc, 0, false, LoopMode::PingPong),
+            (2, true)
+        );
         // A hidden current frame joins the sequence in travel direction.
-        assert_eq!(step_playback_visible(&doc, 1, true, LoopMode::Forward), (2, true));
-        assert_eq!(step_playback_visible(&doc, 1, false, LoopMode::PingPong), (0, false));
+        assert_eq!(
+            step_playback_visible(&doc, 1, true, LoopMode::Forward),
+            (2, true)
+        );
+        assert_eq!(
+            step_playback_visible(&doc, 1, false, LoopMode::PingPong),
+            (0, false)
+        );
         // One visible frame sits still; none holds position.
         doc.layers[0].visible = false;
-        assert_eq!(step_playback_visible(&doc, 2, true, LoopMode::PingPong), (2, true));
+        assert_eq!(
+            step_playback_visible(&doc, 2, true, LoopMode::PingPong),
+            (2, true)
+        );
         doc.layers[2].visible = false;
-        assert_eq!(step_playback_visible(&doc, 1, true, LoopMode::Forward), (1, true));
+        assert_eq!(
+            step_playback_visible(&doc, 1, true, LoopMode::Forward),
+            (1, true)
+        );
     }
 
     #[test]
@@ -569,7 +634,11 @@ mod tests {
         assert_eq!(back.layers[0].name, "Frame 1");
         // First pixels survive the round trip (GIF palette-quantized).
         let at = |d: &Document, i: usize| {
-            [d.layers[i].pixels[0], d.layers[i].pixels[1], d.layers[i].pixels[2]]
+            [
+                d.layers[i].pixels[0],
+                d.layers[i].pixels[1],
+                d.layers[i].pixels[2],
+            ]
         };
         assert_eq!(at(&back, 0), [255, 0, 0]);
         assert_eq!(at(&back, 1), [0, 0, 255]);

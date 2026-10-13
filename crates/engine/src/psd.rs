@@ -52,7 +52,11 @@ fn psd_name(name: &str) -> Vec<u8> {
         .take(255)
         .map(|c| {
             let u = c as u32;
-            if u <= 255 { u as u8 } else { b'?' }
+            if u <= 255 {
+                u as u8
+            } else {
+                b'?'
+            }
         })
         .collect();
     // A zero-length name still stores the length byte + padding.
@@ -84,7 +88,7 @@ fn planes(pixels: &[u8], w: u32, h: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)
     let mut g = vec![0u8; n];
     let mut b = vec![0u8; n];
     let mut a = vec![0u8; n];
-    for (i, px) in pixels.chunks_exact(4).enumerate().take(n) {
+    for (i, px) in pixels.as_chunks::<4>().0.iter().enumerate().take(n) {
         r[i] = px[0];
         g[i] = px[1];
         b[i] = px[2];
@@ -162,7 +166,7 @@ pub fn save_psd(path: &std::path::Path, doc: &Document) -> Result<(), String> {
         records.push(u8::from(layer.clip));
         records.push(if layer.visible { 0 } else { 0x02 });
         records.push(0); // filler
-        // Extra data: mask section + empty blending ranges + name.
+                         // Extra data: mask section + empty blending ranges + name.
         let mut extra = Vec::new();
         if has_mask {
             be32(&mut extra, 18); // mask section size

@@ -18,6 +18,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test engine
         run: cargo test -p procraft-engine
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy (zero warnings)
+        run: cargo clippy --all-targets -- -D warnings
       - name: Build app
         run: cargo build -p procraft
 

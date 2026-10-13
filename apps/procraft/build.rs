@@ -21,7 +21,9 @@ fn find_rc_exe() -> Option<PathBuf> {
     ];
     let mut best: Option<(String, PathBuf)> = None;
     for root in roots {
-        let Ok(entries) = std::fs::read_dir(root) else { continue };
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if !name.starts_with("10.") {
@@ -41,7 +43,11 @@ fn find_rc_exe() -> Option<PathBuf> {
 fn main() {
     println!("cargo:rerun-if-changed=assets/icon.ico");
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let ico = manifest.join("..").join("..").join("assets").join("icon.ico");
+    let ico = manifest
+        .join("..")
+        .join("..")
+        .join("assets")
+        .join("icon.ico");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let rc_path = out.join("procraft-icon.rc");
     let res_path = out.join("procraft-icon.res");
@@ -64,7 +70,9 @@ fn main() {
             println!("cargo:rustc-link-arg-bins={}", res_path.display());
         }
         other => {
-            println!("cargo:warning=rc.exe failed ({other:?}): building without an embedded exe icon");
+            println!(
+                "cargo:warning=rc.exe failed ({other:?}): building without an embedded exe icon"
+            );
         }
     }
 }

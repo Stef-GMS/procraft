@@ -9,3 +9,7 @@ edition = "2021"
 license = "MIT"
 authors = ["surfrpt1"]
 repository = "https://github.com/surfrpt1/procraft"
+
+[profile.release]
+strip = true
+opt-level = 3

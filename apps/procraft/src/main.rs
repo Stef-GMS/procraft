@@ -121,6 +121,16 @@ struct FilterPreview {
     pixels: Vec<u8>,
 }
 
+/// In-progress multi-finger tap (undo/redo): tracks the widest finger
+/// count, start time/center, and whether it moved (a pan/pinch is not
+/// a tap). Fires on clean release; see the top of `App::ui`.
+struct TapTrack {
+    n: usize,
+    t0: f64,
+    c0: egui::Pos2,
+    moved: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Theme {
     Dark,
@@ -226,6 +236,8 @@ struct ProCraftApp {
     view_angle: f32,
     /// A stroke applied at least one dab (guards pinch-cancel revert).
     stroke_painted: bool,
+    /// Multi-finger tap in progress (two = undo, three = redo on release).
+    tap_track: Option<TapTrack>,
     fill_tolerance: u8,
     fill_preview: Option<FillPreview>,
     smudge_strength: f32,
@@ -339,6 +351,7 @@ impl ProCraftApp {
             view_offset: egui::Vec2::ZERO,
             view_angle: 0.0,
             stroke_painted: false,
+            tap_track: None,
             fill_tolerance: 32,
             fill_preview: None,
             smudge_strength: 0.5,
@@ -1126,6 +1139,43 @@ impl eframe::App for ProCraftApp {
             self.lasso_points.clear();
             self.lasso_poly.clear();
             self.sel_edges_dirty = true;
+        }
+        // Multi-finger taps (touch): two fingers = undo, three = redo.
+        // A tap is a quick clean release with no travel; pans and pinches
+        // set `moved` and never fire. Single-finger taps never arm this.
+        {
+            let now = ui.ctx().input(|i| i.time);
+            let mt = ui.ctx().input(|i| i.multi_touch());
+            if let Some(m) = mt {
+                if let Some(t) = self.tap_track.as_mut() {
+                    t.n = t.n.max(m.num_touches);
+                    if (m.center_pos - t.c0).length() > 12.0 {
+                        t.moved = true;
+                    }
+                } else {
+                    self.tap_track = Some(TapTrack {
+                        n: m.num_touches,
+                        t0: now,
+                        c0: m.center_pos,
+                        moved: false,
+                    });
+                }
+            } else if let Some(t) = self.tap_track.take() {
+                let any_down = ui.ctx().input(|i| i.pointer.any_down());
+                if !t.moved && !any_down && now - t.t0 < 0.35 {
+                    match t.n {
+                        2 if self.doc.undo() => {
+                            self.ghost_dirty = true;
+                            self.status = "Undone.".to_string();
+                        }
+                        3 if self.doc.redo() => {
+                            self.ghost_dirty = true;
+                            self.status = "Redone.".to_string();
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
         // Keep frames coming while painting, selecting, lassoing, moving,
         // shaping, or marching ants.

@@ -356,7 +356,10 @@ impl Document {
                     continue;
                 }
                 let falloff = if d <= 1.0 - edge { 1.0 } else { 1.0 - (d - (1.0 - edge)) / edge.max(0.001) };
-                let mut a = (falloff.clamp(0.0, 1.0) * strength).clamp(0.0, 1.0);
+                let mut a = (falloff.clamp(0.0, 1.0)
+                    * strength
+                    * Document::sel_k(sel_mask, w, px, py))
+                .clamp(0.0, 1.0);
                 if grain > 0.0 {
                     a *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
                 }
@@ -472,8 +475,9 @@ impl Document {
                     continue;
                 }
                 let mut a = (tip.mask[(ty as u32 * tip.w + tx as u32) as usize] as f32 / 255.0
-                    * strength)
-                    .clamp(0.0, 1.0);
+                    * strength
+                    * Document::sel_k(sel_mask, w, px, py))
+                .clamp(0.0, 1.0);
                 if grain > 0.0 {
                     a *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
                 }
@@ -557,7 +561,10 @@ impl Document {
                     continue;
                 }
                 let falloff = if d <= 1.0 - edge { 1.0 } else { 1.0 - (d - (1.0 - edge)) / edge.max(0.001) };
-                let mut fa = (falloff.clamp(0.0, 1.0) * strength).clamp(0.0, 1.0);
+                let mut fa = (falloff.clamp(0.0, 1.0)
+                    * strength
+                    * Document::sel_k(mask, w, px, py))
+                .clamp(0.0, 1.0);
                 if grain > 0.0 {
                     fa *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
                 }
@@ -678,8 +685,9 @@ impl Document {
                     continue;
                 }
                 let mut fa = (tip.mask[(ty as u32 * tip.w + tx as u32) as usize] as f32 / 255.0
-                    * strength)
-                    .clamp(0.0, 1.0);
+                    * strength
+                    * Document::sel_k(mask, w, px, py))
+                .clamp(0.0, 1.0);
                 if grain > 0.0 {
                     fa *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
                 }
@@ -966,7 +974,7 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
 impl Document {
     /// Paint one pixel with source-over at brush opacity, honoring selection
     /// and mirroring per [`Document::symmetry`].
-    fn put(&mut self, brush: &Brush, color: Color, px: u32, py: u32) {
+    pub(crate) fn put(&mut self, brush: &Brush, color: Color, px: u32, py: u32) {
         let (ccx, ccy) = self.symmetry_center_px();
         let pts =
             self.symmetry.mirrored_pixels(self.w, self.h, self.symmetry_segments, ccx, ccy, px, py);
@@ -995,6 +1003,8 @@ impl Document {
             }
         }
         let (w, h) = (self.w, self.h);
+        // Graduated feathered masks scale the paint (binary masks: full).
+        let sel_k = Document::sel_k(self.selection_mask.as_deref(), self.w, px, py);
         // Layer offset: store at the buffer slot for this canvas pixel.
         let Some(layer) = self.active_layer_mut() else { return };
         let (lox, loy) = (layer.ox, layer.oy);
@@ -1006,7 +1016,7 @@ impl Document {
         if o + 3 >= layer.pixels.len() {
             return;
         }
-        let src_a = brush.opacity.clamp(0.0, 1.0);
+        let src_a = brush.opacity.clamp(0.0, 1.0) * sel_k;
         let dst_a = layer.pixels[o + 3] as f32 / 255.0;
         let out_a = src_a + dst_a * (1.0 - src_a);
         if out_a > 0.0 {
@@ -1485,6 +1495,27 @@ mod tests {
         preview.layers[0].pixels = snap;
         preview.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 10);
         assert_eq!(preview.layers[0].pixels, direct.layers[0].pixels);
+    }
+
+    #[test]
+    fn stamp_dabs_fade_through_feathered_masks() {
+        use crate::document::Document;
+        let mut doc = Document::new(20, 20);
+        doc.selection = Some((5, 5, 14, 14));
+        assert!(doc.feather_selection(3));
+        let ramp = doc.selection_mask.clone().unwrap()[(4 * 20 + 10) as usize];
+        assert!(ramp > 0 && ramp < 255, "{ramp}");
+        // Solid 2x2 stamp tip through the ramp paints partially.
+        let tip = BrushTip::from_mask(2, 2, vec![255; 4]).unwrap();
+        let stamp = Brush { size: 4.0, tip: Some(tip), ..Brush::default() };
+        doc.dab(&stamp, Color::rgb(255, 255, 255), 10.5, 4.5);
+        let mut peak = 0u8;
+        for y in 3..=5 {
+            for x in 9..=11 {
+                peak = peak.max(doc.layers[0].pixels[((y * 20 + x) * 4) as usize + 3]);
+            }
+        }
+        assert!(peak > 0 && peak < 255, "{peak}");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptio
 #[cfg(target_os = "ios")]
 use rfd_shim as rfd;
 use procraft_engine::{
-    BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides, LoopMode, PaintTarget,
+    AssistLine, BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides, LoopMode, PaintTarget,
     Palette, PaletteSet, ShapePoly, SymmetryMode, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_LIBRARY_BRUSHES,
     MAX_PALETTES, MAX_PALETTE_COLORS, MIN_ANIM_FPS, MIN_ANIM_HOLD, analogous, clamp_frame, complementary,
     export_gif_ext, export_tip_png, import_brush_file, import_gif_document, import_gpl_file, next_frame, onion_ghost,
@@ -193,6 +193,10 @@ struct ProCraftApp {
     fill_tolerance: u8,
     fill_preview: Option<FillPreview>,
     filter_preview: Option<FilterPreview>,
+    sel_feather: u32,
+    sel_grow: i32,
+    sel_opaque_t: u8,
+    sel_stroke_w: u32,
     filt_brightness: i32,
     filt_contrast: f32,
     filt_blur: i32,
@@ -218,6 +222,9 @@ struct ProCraftApp {
     vp_grab: Option<usize>,
     sym_move: bool,
     sym_grab: bool,
+    assist: bool,
+    assist_start: Option<(f32, f32)>,
+    assist_lock: Option<AssistLine>,
     // Animation Assist: layers are frames (bottom-to-top), the active
     // layer is the current frame. Ghost handles are half-res overlays,
     // rebuilt when the neighbor pair changes or `ghost_dirty` is set by
@@ -291,6 +298,10 @@ impl ProCraftApp {
             fill_tolerance: 32,
             fill_preview: None,
             filter_preview: None,
+            sel_feather: 4,
+            sel_grow: 4,
+            sel_opaque_t: 8,
+            sel_stroke_w: 2,
             filt_brightness: 0,
             filt_contrast: 100.0,
             filt_blur: 0,
@@ -316,6 +327,9 @@ impl ProCraftApp {
             vp_grab: None,
             sym_move: false,
             sym_grab: false,
+            assist: false,
+            assist_start: None,
+            assist_lock: None,
             anim_assist: false,
             anim_playing: false,
             anim_fps: 12,
@@ -1206,6 +1220,57 @@ impl eframe::App for ProCraftApp {
                 self.lasso_poly.clear();
                 self.status = "Selection cleared.".to_string();
             }
+            ui.collapsing("Selection Studio", |ui| {
+                stepped_slider(ui, &mut self.sel_feather, 0..=32, 1.0, "Feather px");
+                if ui.button("Apply feather").clicked() {
+                    if self.doc.feather_selection(self.sel_feather) {
+                        self.status = format!("Feathered ({} px).", self.doc.selection_pixel_count());
+                    } else {
+                        self.status = "No selection to feather.".to_string();
+                    }
+                }
+                stepped_slider(ui, &mut self.sel_grow, -32..=32, 1.0, "Grow px");
+                if ui.button("Apply grow").clicked() {
+                    if self.doc.grow_selection(self.sel_grow) {
+                        self.status = format!("Grown ({} px).", self.doc.selection_pixel_count());
+                    } else {
+                        self.status = "No selection left.".to_string();
+                    }
+                }
+                if ui.button("Smooth").clicked() {
+                    if self.doc.smooth_selection() {
+                        self.status = format!("Smoothed ({} px).", self.doc.selection_pixel_count());
+                    } else {
+                        self.status = "No selection to smooth.".to_string();
+                    }
+                }
+                if ui.button("Invert").clicked() {
+                    if self.doc.invert_selection() {
+                        self.status = format!("Inverted ({} px).", self.doc.selection_pixel_count());
+                    } else {
+                        self.status = "No selection to invert.".to_string();
+                    }
+                }
+                stepped_slider(ui, &mut self.sel_opaque_t, 0..=255, 1.0, "Opacity >");
+                if ui.button("Select opaque").clicked() {
+                    if self.doc.select_opaque(self.sel_opaque_t) {
+                        self.status = format!("Opaque selected ({} px).", self.doc.selection_pixel_count());
+                    } else {
+                        self.status = "Layer is empty.".to_string();
+                    }
+                }
+                stepped_slider(ui, &mut self.sel_stroke_w, 1..=16, 1.0, "Outline px");
+                if ui.button("Paint outline").clicked() {
+                    self.doc.checkpoint();
+                    let brush = self.base_brush();
+                    let color = self.current_color();
+                    if self.doc.stroke_selection(&brush, color, self.sel_stroke_w) {
+                        self.status = "Outlined.".to_string();
+                    } else {
+                        self.status = "No selection to outline.".to_string();
+                    }
+                }
+            });
             ui.separator();
             ui.heading("Brushes");
             // Theme ink: light strokes on dark theme, dark strokes otherwise.
@@ -1641,6 +1706,10 @@ impl eframe::App for ProCraftApp {
                 ui.checkbox(&mut self.guides.snap, "Snap while painting");
                 if self.guides.snap {
                     stepped_slider(ui, &mut self.guides.snap_px, 2.0..=32.0, 1.0, "Snap range (px)");
+                }
+                ui.checkbox(&mut self.assist, "Drawing Assist (lock strokes to guides)");
+                if self.assist {
+                    ui.label("Rays/axes engage as you draw; taps stay free.");
                 }
                 stepped_slider(ui, &mut self.guides.opacity, 0.05..=1.0, 0.05, "Opacity");
             }
@@ -2230,6 +2299,20 @@ impl eframe::App for ProCraftApp {
                         );
                     }
                 }
+                // Drawing Assist: the engaged lock draws bright while the
+                // stroke rides it (cleared on release).
+                if let Some(lock) = self.assist_lock {
+                    let reach = (rect.width().powi(2) + rect.height().powi(2)).sqrt();
+                    let (tx, ty) = lock.through;
+                    let (dx, dy) = (lock.dir.0 * reach, lock.dir.1 * reach);
+                    ui.painter().line_segment(
+                        [
+                            egui::Pos2::new(rect.min.x + (tx - dx) * z, rect.min.y + (ty - dy) * z),
+                            egui::Pos2::new(rect.min.x + (tx + dx) * z, rect.min.y + (ty + dy) * z),
+                        ],
+                        (1.5, Color32::from_rgb(255, 200, 60)),
+                    );
+                }
                 // Vanishing-point handles for perspective guides (draggable
                 // while Move VPs is armed in the Guides panel). Off-canvas
                 // VPs park as hollow diamonds on the canvas edge so they
@@ -2722,6 +2805,20 @@ impl eframe::App for ProCraftApp {
                     self.smooth_pt = None;
                     self.smooth_pressure = 1.0;
                     self.last_t = ctx.input(|i| i.time);
+                    // Drawing Assist: remember the stroke start; the lock
+                    // engages on first travel and projects every dab after.
+                    if self.assist && self.guides.kind != GuideKind::Off {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            self.assist_start = Some(clamp_pt(x, y));
+                        } else {
+                            self.assist_start = None;
+                        }
+                        self.assist_lock = None;
+                    } else {
+                        self.assist_start = None;
+                        self.assist_lock = None;
+                    }
                 }
                 if self.painting && resp.dragged() {
                     if let Some(pos) = resp.hover_pos() {
@@ -2746,9 +2843,33 @@ impl eframe::App for ProCraftApp {
                             None => (x, y),
                         };
                         self.smooth_pt = Some((sx, sy));
-                        // Drawing assist: snap the smoothed point to the
-                        // guides before speed + stroke (shapes stay free).
-                        let (sx, sy) = self.guides.snap_point(w, h, sx, sy);
+                        // Drawing Assist: ride an engaged ray/axis lock,
+                        // else fall back to guide point-snap (shapes stay
+                        // free). Projected points re-clamp so rays running
+                        // off-canvas never streak the edge.
+                        let (sx, sy) = if self.assist && self.guides.kind != GuideKind::Off {
+                            match self.assist_lock {
+                                Some(lock) => {
+                                    let (px, py) = lock.project(sx, sy);
+                                    clamp_pt(px, py)
+                                }
+                                None => {
+                                    let lock = self
+                                        .assist_start
+                                        .and_then(|s| self.guides.assist_lock(w, h, s, (sx, sy)));
+                                    match lock {
+                                        Some(l) => {
+                                            self.assist_lock = Some(l);
+                                            let (px, py) = l.project(sx, sy);
+                                            clamp_pt(px, py)
+                                        }
+                                        None => self.guides.snap_point(w, h, sx, sy),
+                                    }
+                                }
+                            }
+                        } else {
+                            self.guides.snap_point(w, h, sx, sy)
+                        };
                         self.smooth_pressure += (pressure - self.smooth_pressure) * (1.0 - a);
                         // Speed + direction from the smoothed trail.
                         let (speed_norm, angle) = match self.last {
@@ -2789,6 +2910,8 @@ impl eframe::App for ProCraftApp {
                     self.painting = false;
                     self.last = None;
                     self.smooth_pt = None;
+                    self.assist_start = None;
+                    self.assist_lock = None;
                 }
             });
         });

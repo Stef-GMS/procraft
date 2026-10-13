@@ -830,6 +830,16 @@ impl Document {
         self.selection_mask = None;
     }
 
+    /// Selection coverage 0.0..=1.0 at a canvas pixel (1.0 with no mask):
+    /// how strongly paint and filters apply through graduated feathered
+    /// masks. Binary masks behave exactly as before.
+    pub(crate) fn sel_k(mask: Option<&[u8]>, w: u32, x: u32, y: u32) -> f32 {
+        match mask {
+            Some(m) => m.get((y * w + x) as usize).copied().unwrap_or(0) as f32 / 255.0,
+            None => 1.0,
+        }
+    }
+
     /// Attach a fully-revealing (white) mask to a layer. Structural, like
     /// add/remove layer: not undoable itself, but every mask stroke after
     /// it is (snapshots carry the mask).
@@ -970,7 +980,7 @@ impl Document {
                 let xb = (pair[1] - 0.5 - 1e-6).floor() as i32;
                 for x in xa.max(x0 as i32)..=xb.min(x1 as i32) {
                     if x >= 0 {
-                        mask[(y * w + x as u32) as usize] = 1;
+                        mask[(y * w + x as u32) as usize] = 255;
                     }
                 }
             }
@@ -984,15 +994,369 @@ impl Document {
         Some((x0, y0, x1, y1))
     }
 
-    /// Pixels covered by the active selection (lasso pixel count, else the
-    /// rectangle area, else 0 when nothing is selected).
-    pub fn selection_pixel_count(&self) -> usize {        if let Some(mask) = self.selection_mask.as_deref() {
-            mask.iter().filter(|&&b| b != 0).count()
+    /// Pixels covered by the active selection (mask coverage for graduated
+    /// feathered masks, rectangle area, else 0 when nothing is selected).
+    pub fn selection_pixel_count(&self) -> usize {
+        if let Some(mask) = self.selection_mask.as_deref() {
+            ((mask.iter().map(|&b| b as u32).sum::<u32>() + 127) / 255) as usize
         } else if let Some((x0, y0, x1, y1)) = self.selection {
             ((x1 - x0 + 1) * (y1 - y0 + 1)) as usize
         } else {
             0
         }
+    }
+
+    /// Honored radius bound for feather/grow (the UI offers a subset).
+    pub const MAX_SELECT_RADIUS: i32 = 64;
+
+    /// Bounding box of nonzero mask pixels (tight marching-ants bounds).
+    fn mask_bbox(mask: &[u8], w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                if mask[(y * w + x) as usize] != 0 {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        if x0 == u32::MAX {
+            None
+        } else {
+            Some((x0, y0, x1, y1))
+        }
+    }
+
+    /// Rasterize the rectangular selection into the mask (255 inside),
+    /// ANDed with any existing mask. Returns false when nothing is
+    /// selected (mask-only selections pass through untouched).
+    fn bake_rect_to_mask(&mut self) -> bool {
+        let (w, h) = (self.w, self.h);
+        if w == 0 || h == 0 {
+            return false;
+        }
+        let Some((rx0, ry0, rx1, ry1)) = self.selection else {
+            return self.selection_mask.as_ref().map_or(false, |m| m.iter().any(|&b| b != 0));
+        };
+        let n = (w * h) as usize;
+        let mut mask = vec![0u8; n];
+        for y in ry0..=ry1.min(h - 1) {
+            for x in rx0..=rx1.min(w - 1) {
+                mask[(y * w + x) as usize] = 255;
+            }
+        }
+        if let Some(old) = self.selection_mask.as_deref() {
+            if old.len() == n {
+                for (d, s) in mask.iter_mut().zip(old.iter()) {
+                    *d = (*d).min(*s);
+                }
+            }
+        }
+        if mask.iter().all(|&b| b == 0) {
+            self.clear_selection();
+            return false;
+        }
+        self.selection_mask = Some(mask);
+        true
+    }
+
+    /// Re-tighten the bounds rect to the mask (clears both when empty).
+    fn retighten_selection(&mut self) {
+        match self.selection_mask.as_deref() {
+            Some(m) => {
+                self.selection = Self::mask_bbox(m, self.w, self.h);
+                if self.selection.is_none() {
+                    self.selection_mask = None;
+                }
+            }
+            None => self.selection = None,
+        }
+    }
+
+    /// Separable sliding-window blur over one gray channel (edge-replicated).
+    fn blur_gray(src: &[u8], w: u32, h: u32, r: i32) -> Vec<u8> {
+        if r <= 0 || w == 0 || h == 0 {
+            return src.to_vec();
+        }
+        let (w, h, r) = (w as usize, h as usize, r as isize);
+        let win = (2 * r + 1) as u32;
+        let at = |buf: &[u8], i: isize, n: isize| buf[i.clamp(0, n - 1) as usize] as u32;
+        let mut tmp = vec![0u8; w * h];
+        for y in 0..h {
+            let mut sum = 0u32;
+            for x in -r..=r {
+                sum += at(&src[y * w..(y + 1) * w], x, w as isize);
+            }
+            for x in 0..w {
+                tmp[y * w + x] = ((sum + win / 2) / win) as u8;
+                sum = sum - at(&src[y * w..(y + 1) * w], x as isize - r, w as isize)
+                    + at(&src[y * w..(y + 1) * w], x as isize + r + 1, w as isize);
+            }
+        }
+        let mut out = vec![0u8; w * h];
+        for x in 0..w {
+            let mut sum = 0u32;
+            for y in -r..=r {
+                let yy = y.clamp(0, h as isize - 1) as usize;
+                sum += tmp[yy * w + x] as u32;
+            }
+            for y in 0..h {
+                out[y * w + x] = ((sum + win / 2) / win) as u8;
+                let yo = (y as isize - r).clamp(0, h as isize - 1) as usize;
+                let yi = (y as isize + r + 1).clamp(0, h as isize - 1) as usize;
+                sum = sum - tmp[yo * w + x] as u32 + tmp[yi * w + x] as u32;
+            }
+        }
+        out
+    }
+
+    /// Sliding-window extremum over a replicated-edge line.
+    fn slide_extreme(line: &[u8], r: usize, dilate: bool) -> Vec<u8> {
+        use std::collections::VecDeque;
+        let n = line.len();
+        if n == 0 || r == 0 {
+            return line.to_vec();
+        }
+        let mut pad = Vec::with_capacity(n + 2 * r);
+        for _ in 0..r {
+            pad.push(line[0]);
+        }
+        pad.extend_from_slice(line);
+        for _ in 0..r {
+            pad.push(line[n - 1]);
+        }
+        let better = |a: u8, b: u8| if dilate { a >= b } else { a <= b };
+        let mut out = vec![0u8; n];
+        let mut dq: VecDeque<usize> = VecDeque::new();
+        for i in 0..pad.len() {
+            while let Some(&back) = dq.back() {
+                if better(pad[i], pad[back]) {
+                    dq.pop_back();
+                } else {
+                    break;
+                }
+            }
+            dq.push_back(i);
+            if i >= 2 * r {
+                let j = i - 2 * r;
+                while let Some(&front) = dq.front() {
+                    if front < j {
+                        dq.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                if j < n {
+                    out[j] = pad[*dq.front().unwrap()];
+                }
+            }
+        }
+        out
+    }
+
+    /// Separable box dilate (max) / erode (min) over one gray channel.
+    fn morph_gray(src: &[u8], w: u32, h: u32, r: i32, dilate: bool) -> Vec<u8> {
+        if r <= 0 || w == 0 || h == 0 {
+            return src.to_vec();
+        }
+        let (w, h, r) = (w as usize, h as usize, r as usize);
+        let mut tmp = vec![0u8; w * h];
+        for y in 0..h {
+            tmp[y * w..(y + 1) * w].copy_from_slice(&Self::slide_extreme(&src[y * w..(y + 1) * w], r, dilate));
+        }
+        let mut out = vec![0u8; w * h];
+        let mut col = vec![0u8; h];
+        for x in 0..w {
+            for y in 0..h {
+                col[y] = tmp[y * w + x];
+            }
+            let done = Self::slide_extreme(&col, r, dilate);
+            for y in 0..h {
+                out[y * w + x] = done[y];
+            }
+        }
+        out
+    }
+
+    /// Feather (soften) the selection edge by `radius` px: the mask ramps
+    /// instead of stepping, so paint and filters fade across the edge.
+    /// The bounds rect grows to contain the falloff. Returns false when
+    /// there was nothing to feather. Selection-only: not undoable (like
+    /// Clear selection).
+    pub fn feather_selection(&mut self, radius: u32) -> bool {
+        let r = radius.min(Self::MAX_SELECT_RADIUS as u32) as i32;
+        if !self.bake_rect_to_mask() {
+            return false;
+        }
+        if r > 0 {
+            if let Some(m) = self.selection_mask.take() {
+                self.selection_mask = Some(Self::blur_gray(&m, self.w, self.h, r));
+            }
+            self.retighten_selection();
+        }
+        self.selection_mask.is_some()
+    }
+
+    /// Grow (positive) or shrink (negative) the selection by `px`,
+    /// clamped to ±[`Document::MAX_SELECT_RADIUS`]. Shrinking to nothing
+    /// clears it. Returns false when nothing remains. Not undoable.
+    pub fn grow_selection(&mut self, px: i32) -> bool {
+        let px = px.clamp(-Self::MAX_SELECT_RADIUS, Self::MAX_SELECT_RADIUS);
+        if !self.bake_rect_to_mask() {
+            return false;
+        }
+        if px == 0 {
+            return true;
+        }
+        if let Some(m) = self.selection_mask.take() {
+            self.selection_mask = Some(Self::morph_gray(&m, self.w, self.h, px.abs(), px > 0));
+        }
+        self.retighten_selection();
+        self.selection_mask.is_some()
+    }
+
+    /// De-jag the selection edge (blur + re-threshold, edge position kept).
+    /// Returns false when there was nothing to smooth. Not undoable.
+    pub fn smooth_selection(&mut self) -> bool {
+        if !self.bake_rect_to_mask() {
+            return false;
+        }
+        if let Some(m) = self.selection_mask.take() {
+            let soft = Self::blur_gray(&m, self.w, self.h, 2);
+            self.selection_mask = Some(soft.into_iter().map(|v| if v >= 128 { 255 } else { 0 }).collect());
+        }
+        self.retighten_selection();
+        self.selection_mask.is_some()
+    }
+
+    /// Flip the selection (unbounded complements become full-canvas masks).
+    /// Returns false when there was nothing to invert. Not undoable.
+    pub fn invert_selection(&mut self) -> bool {
+        if !self.bake_rect_to_mask() {
+            return false;
+        }
+        if let Some(m) = self.selection_mask.take() {
+            self.selection_mask = Some(m.into_iter().map(|v| 255 - v).collect());
+        }
+        self.retighten_selection();
+        self.selection_mask.is_some()
+    }
+
+    /// Select the active layer's pixels more opaque than `threshold`
+    /// (offset-aware; uncovered canvas counts as transparent). Replaces any
+    /// selection; empty layers clear it. Returns false when nothing is
+    /// selected. Not undoable.
+    pub fn select_opaque(&mut self, threshold: u8) -> bool {
+        let (w, h) = (self.w, self.h);
+        if w == 0 || h == 0 {
+            self.clear_selection();
+            return false;
+        }
+        let Some(layer) = self.layers.get(self.active) else {
+            self.clear_selection();
+            return false;
+        };
+        let (ox, oy) = (layer.ox, layer.oy);
+        let mut mask = vec![0u8; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let (lx, ly) = (x as i32 - ox, y as i32 - oy);
+                let a = if lx < 0 || ly < 0 || lx >= w as i32 || ly >= h as i32 {
+                    0
+                } else {
+                    let o = ((ly as u32 * w + lx as u32) * 4) as usize;
+                    if o + 3 < layer.pixels.len() {
+                        layer.pixels[o + 3]
+                    } else {
+                        0
+                    }
+                };
+                if a > threshold {
+                    mask[(y * w + x) as usize] = 255;
+                }
+            }
+        }
+        self.selection_mask = if mask.iter().any(|&b| b != 0) { Some(mask) } else { None };
+        self.retighten_selection();
+        self.selection_mask.is_some()
+    }
+
+    /// Paint the selection outline `width` px wide (clamped 1..=32) with
+    /// `brush` at `color` through `put` (symmetry- and target-aware). The
+    /// edge comes from the selection itself. Caller checkpoints for undo.
+    /// Returns false without a selection.
+    pub fn stroke_selection(&mut self, brush: &super::brush::Brush, color: super::brush::Color, width: u32) -> bool {
+        let (w, h) = (self.w, self.h);
+        if w == 0 || h == 0 {
+            return false;
+        }
+        let inside = |m: &[u8], x: i32, y: i32| -> bool {
+            if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                return false;
+            }
+            m[(y as u32 * w + x as u32) as usize] > 127
+        };
+        let mut edge = vec![false; (w * h) as usize];
+        let mut any = false;
+        match self.selection_mask.as_deref() {
+            Some(m) if m.len() == (w * h) as usize => {
+                for y in 0..h as i32 {
+                    for x in 0..w as i32 {
+                        if !inside(m, x, y) {
+                            continue;
+                        }
+                        if !(inside(m, x - 1, y)
+                            && inside(m, x + 1, y)
+                            && inside(m, x, y - 1)
+                            && inside(m, x, y + 1))
+                        {
+                            edge[(y as u32 * w + x as u32) as usize] = true;
+                            any = true;
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Some((x0, y0, x1, y1)) = self.selection {
+                    for x in x0..=x1.min(w - 1) {
+                        for &y in &[y0, y1] {
+                            if y < h {
+                                edge[(y * w + x) as usize] = true;
+                                any = true;
+                            }
+                        }
+                    }
+                    for y in y0..=y1.min(h - 1) {
+                        for &x in &[x0, x1] {
+                            if x < w {
+                                edge[(y * w + x) as usize] = true;
+                                any = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !any {
+            return false;
+        }
+        let r = width.clamp(1, 32) as i32 - 1;
+        if r > 0 {
+            let gray: Vec<u8> = edge.iter().map(|&b| if b { 255 } else { 0 }).collect();
+            let fat = Self::morph_gray(&gray, w, h, r, true);
+            edge = fat.into_iter().map(|v| v != 0).collect();
+        }
+        for y in 0..h {
+            for x in 0..w {
+                if edge[(y * w + x) as usize] {
+                    self.put(brush, color, x, y);
+                }
+            }
+        }
+        self.mark_full_dirty();
+        true
     }
 
     /// Separable sliding-window box blur (all channels), O(w*h).
@@ -1076,9 +1440,12 @@ impl Document {
                 if o + 2 >= pixels.len() {
                     continue;
                 }
+                // Graduated masks partially apply (binary masks: full strength).
+                let k = Self::sel_k(mask, w, x, y);
                 for ch in 0..3 {
                     let v = (pixels[o + ch] as f32 - 128.0) * contrast + 128.0 + brightness as f32;
-                    pixels[o + ch] = v.round().clamp(0.0, 255.0) as u8;
+                    let mixed = pixels[o + ch] as f32 * (1.0 - k) + v * k;
+                    pixels[o + ch] = mixed.round().clamp(0.0, 255.0) as u8;
                 }
             }
         }
@@ -1112,7 +1479,12 @@ impl Document {
                 };
                 if selected {
                     let o = ((y * w + x) * 4) as usize;
-                    pixels[o..o + 4].copy_from_slice(&blurred[o..o + 4]);
+                    let k = Self::sel_k(mask, w, x, y);
+                    for ch in 0..4 {
+                        pixels[o + ch] =
+                            (pixels[o + ch] as f32 * (1.0 - k) + blurred[o + ch] as f32 * k).round()
+                                as u8;
+                    }
                 }
             }
         }
@@ -1146,10 +1518,12 @@ impl Document {
                     continue;
                 }
                 let o = ((y * w + x) * 4) as usize;
+                let k = Self::sel_k(mask, w, x, y);
                 for ch in 0..3 {
                     let v = pixels[o + ch] as f32
                         + (pixels[o + ch] as f32 - blurred[o + ch] as f32) * amount;
-                    pixels[o + ch] = v.round().clamp(0.0, 255.0) as u8;
+                    let mixed = pixels[o + ch] as f32 * (1.0 - k) + v * k;
+                    pixels[o + ch] = mixed.round().clamp(0.0, 255.0) as u8;
                 }
             }
         }
@@ -2352,5 +2726,166 @@ mod tests {
         doc.stroke_to(&brush, Color::rgb(0, 0, 0), Some((200.0, 200.0)), (500.0, 500.0), 0.0);
         assert!(doc.layers[0].mask.is_none());
         doc.paint_target = PaintTarget::Color;
+    }
+
+    fn selected_rect(w: u32, h: u32, r: (u32, u32, u32, u32)) -> Document {
+        let mut doc = Document::new(w, h);
+        doc.selection = Some(r);
+        doc
+    }
+
+    #[test]
+    fn lasso_writes_full_strength_masks() {
+        let mut doc = Document::new(10, 10);
+        doc.set_lasso(&[(2.0, 2.0), (2.0, 5.0), (5.0, 5.0), (5.0, 2.0)]);
+        let mask = doc.selection_mask.clone().unwrap();
+        assert!(mask.iter().all(|&b| b == 0 || b == 255));
+        assert_eq!(doc.selection_pixel_count(), mask.iter().filter(|&&b| b != 0).count());
+    }
+
+    #[test]
+    fn feather_ramps_and_expands_bounds() {
+        let mut doc = selected_rect(20, 20, (5, 5, 14, 14));
+        assert!(doc.feather_selection(3));
+        let m = doc.selection_mask.clone().unwrap();
+        let at = |x: u32, y: u32| m[(y * 20 + x) as usize];
+        // Deep interior stays full, far exterior stays empty.
+        assert_eq!(at(10, 10), 255);
+        assert_eq!(at(0, 0), 0);
+        // The old hard edge is now a ramp (partial coverage just outside).
+        let ramp = at(3, 10);
+        assert!(ramp > 0 && ramp < 255, "{ramp}");
+        // Bounds grew to contain the falloff; coverage is conserved by blur.
+        assert_eq!(doc.selection, Some((2, 2, 17, 17)));
+        let count = doc.selection_pixel_count() as i32;
+        assert!((count - 100).abs() <= 2, "{count}");
+        // Radius 0 only normalizes, and empty selections report false.
+        let mut doc2 = selected_rect(20, 20, (5, 5, 14, 14));
+        assert!(doc2.feather_selection(0));
+        assert_eq!(doc2.selection_pixel_count(), 100);
+        let mut doc3 = Document::new(8, 8);
+        assert!(!doc3.feather_selection(4));
+    }
+
+    #[test]
+    fn grow_and_shrink_track_bounds() {
+        let mut doc = selected_rect(20, 20, (5, 5, 14, 14));
+        assert!(doc.grow_selection(2));
+        assert_eq!(doc.selection, Some((3, 3, 16, 16)));
+        assert!(doc.selection_pixel_count() > 100);
+        assert!(doc.grow_selection(-2));
+        assert_eq!(doc.selection, Some((5, 5, 14, 14)));
+        assert_eq!(doc.selection_pixel_count(), 100);
+        // Shrinking to nothing clears everything.
+        assert!(!doc.grow_selection(-50));
+        assert!(doc.selection.is_none() && doc.selection_mask.is_none());
+        // Zero on nothing stays nothing.
+        assert!(!doc.grow_selection(0));
+        let mut doc2 = Document::new(8, 8);
+        assert!(!doc2.grow_selection(3));
+    }
+
+    #[test]
+    fn smooth_fills_pinholes_keeps_solids() {
+        let mut doc = Document::new(12, 12);
+        doc.selection_mask = Some(vec![255u8; 144]);
+        doc.selection_mask.as_mut().unwrap()[5 * 12 + 5] = 0;
+        assert!(doc.smooth_selection());
+        // Single-pixel hole heals (blur r2 keeps it over threshold).
+        assert_eq!(doc.selection_mask.clone().unwrap()[5 * 12 + 5], 255);
+        // Solid rects survive smoothing byte-identical in the interior.
+        let mut doc2 = selected_rect(20, 20, (5, 5, 14, 14));
+        assert!(doc2.smooth_selection());
+        assert_eq!(doc2.selection_mask.clone().unwrap()[(10 * 20 + 10) as usize], 255);
+        let mut doc3 = Document::new(8, 8);
+        assert!(!doc3.smooth_selection());
+    }
+
+    #[test]
+    fn invert_flips_to_full_canvas_complement() {
+        let mut doc = selected_rect(10, 10, (2, 2, 5, 5));
+        assert!(doc.invert_selection());
+        let m = doc.selection_mask.clone().unwrap();
+        assert_eq!(m[(3 * 10 + 3) as usize], 0);
+        assert_eq!(m[0], 255);
+        assert_eq!(doc.selection, Some((0, 0, 9, 9)));
+        assert_eq!(doc.selection_pixel_count(), 100 - 16);
+        let mut doc2 = Document::new(8, 8);
+        assert!(!doc2.invert_selection());
+    }
+
+    #[test]
+    fn opaque_selects_painted_pixels() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(10, 10);
+        let brush = Brush { size: 3.0, softness: 0.0, opacity: 1.0, ..Default::default() };
+        doc.dab(&brush, Color::rgb(255, 0, 0), 2.5, 2.5);
+        assert!(doc.select_opaque(8));
+        let n = doc.selection_pixel_count();
+        assert!(n > 0 && n < 100, "{n}");
+        // Bounds hug the dab.
+        let (x0, y0, x1, y1) = doc.selection.unwrap();
+        assert!(x1 - x0 <= 4 && y1 - y0 <= 4);
+        // Untouched layers clear the selection.
+        let mut doc2 = Document::new(8, 8);
+        assert!(!doc2.select_opaque(8));
+        assert!(doc2.selection.is_none());
+    }
+
+    #[test]
+    fn stroke_paints_only_the_edge() {
+        use crate::brush::{Brush, Color};
+        let mut doc = selected_rect(12, 12, (2, 2, 7, 7));
+        let brush = Brush { size: 1.0, softness: 0.0, opacity: 1.0, ..Default::default() };
+        doc.checkpoint();
+        assert!(doc.stroke_selection(&brush, Color::rgb(0, 255, 0), 1));
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 12 + x) * 4) as usize + 3];
+        // Edge pixels painted, deep interior untouched.
+        assert!(at(&doc, 2, 4) > 0);
+        assert!(at(&doc, 7, 7) > 0);
+        assert_eq!(at(&doc, 4, 4), 0);
+        assert_eq!(at(&doc, 0, 0), 0);
+        // One undo step removes the whole outline.
+        assert!(doc.undo());
+        assert_eq!(at(&doc, 2, 4), 0);
+        // No selection, no paint.
+        let mut doc2 = Document::new(8, 8);
+        assert!(!doc2.stroke_selection(&brush, Color::rgb(0, 255, 0), 1));
+    }
+
+    #[test]
+    fn feathered_masks_partially_apply_paint_and_tone() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(20, 20);
+        doc.selection = Some((5, 5, 14, 14));
+        assert!(doc.feather_selection(3));
+        // A ramp pixel just outside the old edge carries partial coverage.
+        let m = doc.selection_mask.clone().unwrap();
+        let ramp = m[(4 * 20 + 10) as usize];
+        // Tone applies proportionally through the ramp.
+        doc.checkpoint();
+        doc.adjust_tone(0, 100, 1.0);
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 20 + x) * 4) as usize];
+        assert_eq!(at(&doc, 10, 10), 100);
+        let edge = at(&doc, 10, 4);
+        if ramp > 0 {
+            assert!(edge > 0 && edge < 100, "{edge} ramp {ramp}");
+        } else {
+            assert_eq!(edge, 0);
+        }
+        assert_eq!(at(&doc, 0, 0), 0);
+        // Dabs fade through the same ramp.
+        let mut doc2 = Document::new(20, 20);
+        doc2.selection = Some((5, 5, 14, 14));
+        assert!(doc2.feather_selection(3));
+        let brush = Brush { size: 1.0, softness: 0.0, opacity: 1.0, ..Default::default() };
+        doc2.dab(&brush, Color::rgb(255, 255, 255), 10.5, 4.5);
+        let a = doc2.layers[0].pixels[((4 * 20 + 10) * 4) as usize + 3];
+        let ramp2 = doc2.selection_mask.clone().unwrap()[(4 * 20 + 10) as usize];
+        if ramp2 > 0 {
+            assert!(a > 0 && a < 255, "{a} ramp {ramp2}");
+        } else {
+            assert_eq!(a, 0);
+        }
     }
 }

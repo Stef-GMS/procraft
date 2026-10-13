@@ -18,7 +18,7 @@ pub use animation::{
 };
 pub use brush::{open_brush_library, presets, save_brush_library, Brush, BrushPreset, BrushTip, Color, DabDynamics, ShapePoly, Stroke, MAX_LIBRARY_BRUSHES, MAX_TIP_SIDE};
 pub use document::{BlendMode, Document, Layer, PaintTarget, SymmetryMode};
-pub use guides::{GuideKind, Guides, VP_BOUND};
+pub use guides::{AssistLine, GuideKind, Guides, ASSIST_DEADZONE, VP_BOUND};
 pub use palette::{analogous, complementary, hsl_to_rgb, import_gpl_file, import_gpl_text, open_palette, rgb_to_hsl, save_palette, starter_palette, triadic, Palette, PaletteSet, MAX_PALETTES, MAX_PALETTE_COLORS};
 pub use probrush::{export_tip_png, import_brush_file, ImportedBrush};
 pub use psd::{open_psd, save_psd};

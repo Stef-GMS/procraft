@@ -55,9 +55,33 @@ pub struct Guides {
 /// Vanishing-point coordinate bound (matches the layer-offset clamp: far
 /// off-canvas is fine, infinities are not).
 pub const VP_BOUND: f32 = 16384.0;
+/// Stroke travel under this (canvas px) never locks a constraint: taps
+/// and dots paint free even with Drawing Assist on.
+pub const ASSIST_DEADZONE: f32 = 4.0;
 
 fn default_vps(w: f32, h: f32) -> [(f32, f32); 2] {
     [(w * 0.5 - w * 0.75, h * 0.5), (w * 0.5 + w * 0.75, h * 0.5)]
+}
+
+/// A locked drawing constraint: paint projects onto the line through
+/// `through` along unit `dir` (Drawing Assist).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AssistLine {
+    pub through: (f32, f32),
+    pub dir: (f32, f32),
+}
+
+impl AssistLine {
+    fn new(through: (f32, f32), dir: (f32, f32)) -> Self {
+        let len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(f32::EPSILON);
+        Self { through, dir: (dir.0 / len, dir.1 / len) }
+    }
+
+    /// Closest point on the line (strokes ride this while locked).
+    pub fn project(self, x: f32, y: f32) -> (f32, f32) {
+        let t = (x - self.through.0) * self.dir.0 + (y - self.through.1) * self.dir.1;
+        (self.through.0 + t * self.dir.0, self.through.1 + t * self.dir.1)
+    }
 }
 
 impl Default for Guides {
@@ -116,6 +140,73 @@ impl Guides {
     /// Forget custom vanishing points (back to canvas-size defaults).
     pub fn reset_vps(&mut self) {
         self.vp = None;
+    }
+
+    /// Lock a Drawing Assist constraint for a stroke from `start` toward
+    /// `pos`: the nearest perspective ray for 1/2-point, the dominant grid
+    /// axis for square, the dominant lattice direction for isometric.
+    /// Returns `None` (paint free) for Off, for taps inside the deadzone,
+    /// and for perspective starts parked on a vanishing point (no ray to
+    /// pick until the stroke leaves it).
+    pub fn assist_lock(self, w: f32, h: f32, start: (f32, f32), pos: (f32, f32)) -> Option<AssistLine> {
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        match self.kind {
+            GuideKind::Off => None,
+            GuideKind::Square => {
+                let (dx, dy) = (pos.0 - start.0, pos.1 - start.1);
+                if dx.hypot(dy) < ASSIST_DEADZONE {
+                    return None;
+                }
+                Some(if dx.abs() >= dy.abs() {
+                    AssistLine::new(start, (1.0, 0.0))
+                } else {
+                    AssistLine::new(start, (0.0, 1.0))
+                })
+            }
+            GuideKind::Isometric => {
+                let (dx, dy) = (pos.0 - start.0, pos.1 - start.1);
+                if dx.hypot(dy) < ASSIST_DEADZONE {
+                    return None;
+                }
+                // Undirected lattice families: verticals plus the ±30° pair.
+                let dirs = [(0.0f32, 1.0f32), (0.8660254, 0.5), (0.8660254, -0.5)];
+                let len = dx.hypot(dy).max(f32::EPSILON);
+                let (ux, uy) = (dx / len, dy / len);
+                let mut best = dirs[0];
+                let mut best_dot = -1.0f32;
+                for d in dirs {
+                    let dot = (ux * d.0 + uy * d.1).abs();
+                    if dot > best_dot {
+                        best_dot = dot;
+                        best = d;
+                    }
+                }
+                Some(AssistLine::new(start, best))
+            }
+            GuideKind::OnePoint | GuideKind::TwoPoint => {
+                let t = self.snap_px_clamped();
+                let mut best: Option<(f32, AssistLine)> = None;
+                for (cx, cy) in self.vp_list(w, h) {
+                    let (dx, dy) = (pos.0 - cx, pos.1 - cy);
+                    let r = dx.hypot(dy);
+                    if r <= t {
+                        continue; // parked on the VP: no ray yet
+                    }
+                    let ang = dy.atan2(dx);
+                    let nearest = (ang / RAY_STEP).round() * RAY_STEP;
+                    let arc = (nearest - ang).abs() * r;
+                    if best.map_or(true, |(ba, _)| arc < ba) {
+                        best = Some((
+                            arc,
+                            AssistLine::new((cx, cy), (nearest.cos(), nearest.sin())),
+                        ));
+                    }
+                }
+                best.map(|(_, line)| line)
+            }
+        }
     }
 
     /// Snap a canvas point to the active guides. Returns the point
@@ -432,5 +523,63 @@ mod tests {
         guides.set_vp(1, 30.0, 30.0, 200.0, 200.0);
         assert_eq!(guides.vp_list(200.0, 200.0), vec![(100.0, 100.0)]);
         assert_eq!(guides.vp.unwrap()[1], (30.0, 30.0));
+    }
+
+    #[test]
+    fn assist_line_projects_onto_itself() {
+        let line = AssistLine::new((1.0, 2.0), (0.0, 3.0));
+        assert_eq!(line.dir, (0.0, 1.0));
+        assert_eq!(line.project(5.0, 7.0), (1.0, 7.0));
+        assert_eq!(line.project(1.0, -4.0), (1.0, -4.0));
+    }
+
+    #[test]
+    fn assist_locks_to_the_nearest_ray() {
+        let guides = g(GuideKind::OnePoint);
+        // East of the VP, drifting north: locks the east (0-degree) ray.
+        let lock = guides.assist_lock(200.0, 200.0, (150.0, 100.0), (160.0, 104.0)).unwrap();
+        assert_eq!(lock.through, (100.0, 100.0));
+        assert!((lock.dir.0 - 1.0).abs() < 0.01 && lock.dir.1.abs() < 0.01);
+        // Riding the lock collapses y back to the horizon.
+        assert_eq!(lock.project(170.0, 130.0), (170.0, 100.0));
+        // Parked on the VP: no ray to pick, paint stays free.
+        assert_eq!(guides.assist_lock(200.0, 200.0, (100.0, 100.0), (102.0, 101.0)), None);
+        // Off guides never lock.
+        assert_eq!(g(GuideKind::Off).assist_lock(200.0, 200.0, (10.0, 10.0), (90.0, 90.0)), None);
+    }
+
+    #[test]
+    fn assist_locks_grid_axes_past_deadzone() {
+        let guides = g(GuideKind::Square);
+        // Taps inside the deadzone paint free (dots stay dots).
+        assert_eq!(guides.assist_lock(200.0, 200.0, (50.0, 50.0), (52.0, 51.0)), None);
+        // Dominant axis wins, locked through the stroke start.
+        let h = guides.assist_lock(200.0, 200.0, (50.0, 50.0), (80.0, 56.0)).unwrap();
+        assert_eq!(h.through, (50.0, 50.0));
+        assert_eq!(h.dir, (1.0, 0.0));
+        assert_eq!(h.project(90.0, 99.0), (90.0, 50.0));
+        let v = guides.assist_lock(200.0, 200.0, (50.0, 50.0), (54.0, 90.0)).unwrap();
+        assert_eq!(v.dir, (0.0, 1.0));
+    }
+
+    #[test]
+    fn assist_locks_iso_lattice_directions() {
+        let guides = g(GuideKind::Isometric);
+        assert_eq!(guides.assist_lock(200.0, 200.0, (50.0, 50.0), (51.0, 51.0)), None);
+        // Straight down: the vertical family.
+        let v = guides.assist_lock(200.0, 200.0, (50.0, 50.0), (52.0, 90.0)).unwrap();
+        assert!(v.dir.0.abs() < 0.01 && (v.dir.1 - 1.0).abs() < 0.01);
+        // Along +30 degrees: that diagonal family (cos30, sin30).
+        let d = guides.assist_lock(200.0, 200.0, (50.0, 50.0), (120.0, 90.0)).unwrap();
+        assert!((d.dir.0 - 0.8660254).abs() < 0.01 && (d.dir.1 - 0.5).abs() < 0.01);
+        assert_eq!(d.through, (50.0, 50.0));
+    }
+
+    #[test]
+    fn assist_follows_custom_vps() {
+        let mut guides = g(GuideKind::OnePoint);
+        guides.set_vp(0, 40.0, 160.0, 200.0, 200.0);
+        let lock = guides.assist_lock(200.0, 200.0, (100.0, 160.0), (120.0, 162.0)).unwrap();
+        assert_eq!(lock.through, (40.0, 160.0));
     }
 }

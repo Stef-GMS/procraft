@@ -861,6 +861,215 @@ impl Document {
         }
         (Some(to), travelled - dist)
     }
+
+    /// Advance a smudge stroke: pick up color under the dab and push it
+    /// along the path (wet-mixer lite). `strength` 0..=1 scales the mix and
+    /// multiplies with `pressure`; size/spacing/softness/roundness come from
+    /// the brush, color/opacity/grain do not apply. The finger (running
+    /// pickup color) resets when `from` is `None` (stroke start paints one
+    /// dab at `to`). Returns the leftover distance plus the new endpoint
+    /// for chaining. Call [`Document::checkpoint`] once when the stroke
+    /// starts. Color layers only: on a mask target this is a documented
+    /// no-op (the app steers there with a status hint).
+    pub fn smudge_to(
+        &mut self,
+        brush: &Brush,
+        strength: f32,
+        pressure: f32,
+        from: Option<(f32, f32)>,
+        to: (f32, f32),
+        leftover: f32,
+    ) -> (Option<(f32, f32)>, f32) {
+        if from.is_none() {
+            self.smudge_finger = None;
+        }
+        let size = brush.resolve_size(pressure, 0.0);
+        let eff = (strength * pressure.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        let step = (size * brush.spacing).max(1.0);
+        let Some((sx, sy)) = from else {
+            let (ox, oy) = scatter_offset(brush, to.0, to.1, size);
+            self.smudge_dab(brush, eff, to.0 + ox, to.1 + oy, size);
+            return (Some(to), 0.0);
+        };
+        let (dx, dy) = (to.0 - sx, to.1 - sy);
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist <= 0.0 {
+            return (from, leftover);
+        }
+        let mut travelled = leftover;
+        while travelled <= dist {
+            let t = travelled / dist;
+            let (x, y) = (sx + dx * t, sy + dy * t);
+            let (ox, oy) = scatter_offset(brush, x, y, size);
+            self.smudge_dab(brush, eff, x + ox, y + oy, size);
+            travelled += step;
+        }
+        (Some(to), travelled - dist)
+    }
+
+    /// One smudge dab through the symmetry mirrors (deduped like paint
+    /// dabs); mask-target no-op lives here so the walker stays simple.
+    fn smudge_dab(&mut self, brush: &Brush, strength: f32, x: f32, y: f32, size: f32) {
+        if strength <= 0.0 || size <= 0.0 {
+            return;
+        }
+        if self.paint_target != super::document::PaintTarget::Color {
+            return;
+        }
+        let (ccx, ccy) = self.symmetry_center_px();
+        let pts = self
+            .symmetry
+            .mirrored_points(self.symmetry_segments, ccx, ccy, x, y);
+        let mut done: Vec<(f32, f32)> = Vec::with_capacity(4);
+        for (mx, my) in pts {
+            if done
+                .iter()
+                .any(|&(dx, dy)| (dx - mx).abs() < 0.001 && (dy - my).abs() < 0.001)
+            {
+                continue;
+            }
+            done.push((mx, my));
+            self.smudge_dab_resolved(brush, strength, mx, my, size);
+        }
+    }
+
+    /// Smudge one dab: average the destination disc into the finger, then
+    /// mix the finger back over it (falloff-weighted, selection-weighted).
+    /// Straight-channel lerp, alpha included, so paint spreads honestly.
+    fn smudge_dab_resolved(&mut self, brush: &Brush, strength: f32, x: f32, y: f32, size: f32) {
+        let (w_u32, h_u32) = (self.w, self.h);
+        let radius = (size * 0.5).max(0.5);
+        if self.layers.get(self.active).is_none() {
+            return;
+        }
+        if x + radius < 0.0
+            || y + radius < 0.0
+            || x - radius >= w_u32 as f32
+            || y - radius >= h_u32 as f32
+        {
+            return;
+        }
+        let x0 = (x - radius).floor().max(0.0) as u32;
+        let y0 = (y - radius).floor().max(0.0) as u32;
+        let x1 = (x + radius).ceil().min(w_u32 as f32 - 1.0).max(0.0) as u32;
+        let y1 = (y + radius).ceil().min(h_u32 as f32 - 1.0).max(0.0) as u32;
+        self.mark_dirty(x0, y0, x1, y1);
+        let selection = self.selection;
+        let active = self.active;
+        if active >= self.layers.len() {
+            return;
+        }
+        let mask = self.selection_mask.as_deref();
+        let w = w_u32;
+        let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
+        let bh = h_u32 as i32;
+        // Pickup: the core pixel biased with a little disc average. Pure
+        // core is noisy on texture, pure average dilutes a hard dot to
+        // nothing on the first dab; the blend smears strongly and still
+        // depletes as fresh ground dilutes the disc share.
+        let mut sum = [0f32; 4];
+        let mut count = 0f32;
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                let (lx, ly) = (px as i32 - lox, py as i32 - loy);
+                if lx < 0 || ly < 0 || lx >= w as i32 || ly >= bh {
+                    continue;
+                }
+                let o = ((ly as u32 * w + lx as u32) * 4) as usize;
+                let Some(pxs) = self.layers[active].pixels.get(o..o + 4) else {
+                    continue;
+                };
+                for c in 0..4 {
+                    sum[c] += pxs[c] as f32;
+                }
+                count += 1.0;
+            }
+        }
+        if count <= 0.0 {
+            return;
+        }
+        let avg = [
+            sum[0] / count,
+            sum[1] / count,
+            sum[2] / count,
+            sum[3] / count,
+        ];
+        let (clx, cly) = (x.round() as i32 - lox, y.round() as i32 - loy);
+        let core = if clx >= 0 && cly >= 0 && clx < w as i32 && cly < bh {
+            let o = ((cly as u32 * w + clx as u32) * 4) as usize;
+            self.layers[active]
+                .pixels
+                .get(o..o + 4)
+                .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32])
+        } else {
+            None
+        };
+        let pickup = match core {
+            Some(c) => [
+                c[0] * 0.75 + avg[0] * 0.25,
+                c[1] * 0.75 + avg[1] * 0.25,
+                c[2] * 0.75 + avg[2] * 0.25,
+                c[3] * 0.75 + avg[3] * 0.25,
+            ],
+            None => avg,
+        };
+        let finger = match self.smudge_finger {
+            Some(f) => [
+                f[0] + (pickup[0] - f[0]) * 0.5,
+                f[1] + (pickup[1] - f[1]) * 0.5,
+                f[2] + (pickup[2] - f[2]) * 0.5,
+                f[3] + (pickup[3] - f[3]) * 0.5,
+            ],
+            None => pickup,
+        };
+        self.smudge_finger = Some(finger);
+        // Deposit: lerp destination toward the finger under the falloff.
+        let edge = brush.softness.clamp(0.0, 1.0);
+        let round = brush.roundness.clamp(0.1, 1.0);
+        let layer = &mut self.layers[active];
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                if let Some((sx0, sy0, sx1, sy1)) = selection {
+                    if px < sx0 || px > sx1 || py < sy0 || py > sy1 {
+                        continue;
+                    }
+                }
+                if let Some(m) = mask {
+                    if m.get((py * w + px) as usize).copied().unwrap_or(0) == 0 {
+                        continue;
+                    }
+                }
+                let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+                let (u, v) = (dx, dy / round);
+                let d = (u * u + v * v).sqrt() / radius;
+                if d > 1.0 {
+                    continue;
+                }
+                let falloff = if d <= 1.0 - edge {
+                    1.0
+                } else {
+                    1.0 - (d - (1.0 - edge)) / edge.max(0.001)
+                };
+                let k = (falloff.clamp(0.0, 1.0) * strength * Self::sel_k(mask, w, px, py))
+                    .clamp(0.0, 1.0);
+                if k <= 0.0 {
+                    continue;
+                }
+                let (lx, ly) = (px as i32 - lox, py as i32 - loy);
+                if lx < 0 || ly < 0 || lx >= w as i32 || ly >= bh {
+                    continue;
+                }
+                let o = ((ly as u32 * w + lx as u32) * 4) as usize;
+                if o + 3 >= layer.pixels.len() {
+                    continue;
+                }
+                for (d, f) in layer.pixels[o..o + 4].iter_mut().zip(finger.iter()) {
+                    let v = *d as f32;
+                    *d = (v + (*f - v) * k).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
 }
 
 /// Deterministic scatter offset for a dab center: uniform in
@@ -2267,5 +2476,81 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&many).unwrap()).unwrap();
         assert!(open_brush_library(&path).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Byte offset of pixel (x, y) on a w-wide canvas (test helper).
+    fn pxo(w: u32, x: u32, y: u32) -> usize {
+        ((y * w + x) * 4) as usize
+    }
+
+    fn smudge_brush() -> Brush {
+        Brush {
+            size: 5.0,
+            softness: 0.0,
+            spacing: 0.2,
+            ..Brush::default()
+        }
+    }
+
+    #[test]
+    fn smudge_drags_color_down_the_stroke() {
+        let mut doc = Document::new(16, 4);
+        // Solid red dot at (2, 1).
+        doc.layers[0].pixels[pxo(16, 2, 1)] = 255;
+        doc.layers[0].pixels[pxo(16, 2, 1) + 3] = 255;
+        let brush = smudge_brush();
+        let (last, left) = doc.smudge_to(&brush, 1.0, 1.0, None, (2.0, 1.0), 0.0);
+        assert!(last == Some((2.0, 1.0)) && left == 0.0);
+        let (_, _) = doc.smudge_to(&brush, 1.0, 1.0, last, (12.0, 1.0), left);
+        let at = |x: u32| doc.layers[0].pixels[pxo(16, x, 1)];
+        // Red travelled right; the source faded as the finger left it.
+        assert!(at(8) > 40, "mid-stroke red = {}", at(8));
+        assert!(at(2) < 255, "source faded = {}", at(2));
+    }
+
+    #[test]
+    fn smudge_zero_strength_is_a_noop() {
+        let mut doc = Document::new(8, 8);
+        doc.layers[0].pixels[pxo(8, 4, 4)] = 200;
+        let before = doc.layers[0].pixels.clone();
+        let brush = smudge_brush();
+        doc.smudge_to(&brush, 0.0, 1.0, None, (4.0, 4.0), 0.0);
+        doc.smudge_to(&brush, 1.0, 0.0, None, (4.0, 4.0), 0.0);
+        assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
+    fn smudge_finger_resets_each_stroke() {
+        let mut doc = Document::new(16, 4);
+        doc.layers[0].pixels[pxo(16, 2, 1)] = 255;
+        doc.layers[0].pixels[pxo(16, 2, 1) + 3] = 255;
+        let brush = smudge_brush();
+        // First stroke picks up red at (2,1).
+        doc.smudge_to(&brush, 1.0, 1.0, None, (2.0, 1.0), 0.0);
+        // Second stroke starts on empty black: a shared finger would
+        // drag red in from the first stroke.
+        doc.smudge_to(&brush, 1.0, 1.0, None, (12.0, 1.0), 0.0);
+        let at = |x: u32| doc.layers[0].pixels[pxo(16, x, 1)];
+        assert_eq!(at(12), 0);
+    }
+
+    #[test]
+    fn smudge_honors_rect_selection() {
+        let mut doc = Document::new(16, 4);
+        // Left half solid red, right half transparent.
+        for x in 0..8u32 {
+            doc.layers[0].pixels[pxo(16, x, 1)] = 255;
+            doc.layers[0].pixels[pxo(16, x, 1) + 3] = 255;
+        }
+        // Only the left half is selected; smudge across the whole row.
+        doc.selection = Some((0, 1, 7, 1));
+        let brush = smudge_brush();
+        let (last, left) = doc.smudge_to(&brush, 1.0, 1.0, None, (0.0, 1.0), 0.0);
+        doc.smudge_to(&brush, 1.0, 1.0, last, (15.0, 1.0), left);
+        // Unselected half stays transparent (no red dragged across).
+        for x in 8..16u32 {
+            let o = pxo(16, x, 1);
+            assert_eq!(doc.layers[0].pixels[o + 3], 0, "x={x}");
+        }
     }
 }

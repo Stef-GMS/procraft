@@ -47,6 +47,7 @@ fn latest_touch_force(ctx: &egui::Context) -> Option<f32> {
 enum Tool {
     Brush,
     Eraser,
+    Smudge,
     Select,
     Lasso,
     Fill,
@@ -224,6 +225,7 @@ struct ProCraftApp {
     stroke_painted: bool,
     fill_tolerance: u8,
     fill_preview: Option<FillPreview>,
+    smudge_strength: f32,
     filter_preview: Option<FilterPreview>,
     sel_feather: u32,
     sel_grow: i32,
@@ -335,6 +337,7 @@ impl ProCraftApp {
             stroke_painted: false,
             fill_tolerance: 32,
             fill_preview: None,
+            smudge_strength: 0.5,
             filter_preview: None,
             sel_feather: 4,
             sel_grow: 4,
@@ -1418,6 +1421,7 @@ impl eframe::App for ProCraftApp {
             });
             ui.radio_value(&mut self.tool, Tool::Brush, "✏ Brush");
             ui.radio_value(&mut self.tool, Tool::Eraser, "⌫ Eraser");
+            ui.radio_value(&mut self.tool, Tool::Smudge, "💧 Smudge");
             ui.radio_value(&mut self.tool, Tool::Select, "⬚ Select");
             ui.radio_value(&mut self.tool, Tool::Lasso, "◌ Lasso");
             ui.radio_value(&mut self.tool, Tool::Fill, "◧ Fill");
@@ -1427,6 +1431,10 @@ impl eframe::App for ProCraftApp {
             if self.tool == Tool::Fill {
                 stepped_slider(ui, &mut self.fill_tolerance, 0..=255, 1.0, "Tolerance");
                 ui.label("Tap fills; hold + drag sideways to sweep tolerance.");
+            }
+            if self.tool == Tool::Smudge {
+                stepped_slider(ui, &mut self.smudge_strength, 0.0..=1.0, 0.05, "Strength");
+                ui.label("Drag to push paint around (color layers).");
             }
             if self.tool == Tool::Shapes {
                 ui.horizontal_wrapped(|ui| {
@@ -3398,6 +3406,50 @@ impl eframe::App for ProCraftApp {
                     }
                     self.painting = false;
                     self.last = None;
+                    return;
+                }
+
+                if self.tool == Tool::Smudge {
+                    // Finger-paint mixing: pick up color and push it along
+                    // the path (mask layers steer here with a hint; the
+                    // engine treats them as a no-op).
+                    if resp.drag_started() && !gesture {
+                        self.doc.checkpoint();
+                        self.painting = true;
+                        self.stroke_painted = false;
+                        // Smudging edits the current frame: pause playback so
+                        // the viewed frame never goes stale mid-stroke.
+                        if self.anim_playing {
+                            self.anim_playing = false;
+                            self.status = "Paused for smudging.".to_string();
+                        } else if self.doc.paint_target == PaintTarget::Mask {
+                            self.status = "Smudge works on color layers.".to_string();
+                        }
+                        self.last = None;
+                        self.leftover = 0.0;
+                    }
+                    if self.painting && resp.dragged() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            let (x, y) = clamp_pt(x, y);
+                            let pressure = latest_touch_force(&ctx).unwrap_or(1.0);
+                            let (last, leftover) = self.doc.smudge_to(
+                                &self.brush,
+                                self.smudge_strength,
+                                pressure,
+                                self.last,
+                                (x, y),
+                                self.leftover,
+                            );
+                            self.last = last;
+                            self.leftover = leftover;
+                            self.stroke_painted = true;
+                        }
+                    }
+                    if resp.drag_stopped() {
+                        self.painting = false;
+                        self.last = None;
+                    }
                     return;
                 }
 

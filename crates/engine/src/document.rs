@@ -329,6 +329,9 @@ pub struct Document {
     /// Saved to v8 project files.
     pub groups: Vec<LayerGroup>,
     next_group_id: u32,
+    /// Running pickup color for the smudge stroke (straight RGBA f32s);
+    /// reset on every stroke start, never saved.
+    pub(crate) smudge_finger: Option<[f32; 4]>,
 }
 
 /// History cap: at most 32 steps per stack (backstop)…
@@ -374,6 +377,7 @@ impl Document {
             redo_bytes: 0,
             groups: Vec::new(),
             next_group_id: 1,
+            smudge_finger: None,
         }
     }
 
@@ -400,6 +404,7 @@ impl Document {
             redo_bytes: 0,
             groups: Vec::new(),
             next_group_id: 1,
+            smudge_finger: None,
         }
     }
     /// Mirror center in canvas pixels (canvas middle when never moved).
@@ -2232,6 +2237,7 @@ impl Document {
             redo_bytes: 0,
             groups,
             next_group_id,
+            smudge_finger: None,
         })
     }
 }

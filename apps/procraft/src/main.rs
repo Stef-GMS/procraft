@@ -235,6 +235,8 @@ struct ProCraftApp {
     filt_sharpen: f32,
     renaming: Option<usize>,
     renaming_text: String,
+    group_renaming: Option<u32>,
+    group_name_edit: String,
     preset_textures: Vec<TextureHandle>,
     view_mask: bool,
     show_tools: bool,
@@ -344,6 +346,8 @@ impl ProCraftApp {
             filt_sharpen: 0.0,
             renaming: None,
             renaming_text: String::new(),
+            group_renaming: None,
+            group_name_edit: String::new(),
             preset_textures: Vec::new(),
             view_mask: false,
             show_tools: true,
@@ -1994,11 +1998,142 @@ impl eframe::App for ProCraftApp {
                     }
                 }
             });
+            if ui.button("New group").clicked() {
+                let name = format!("Group {}", self.doc.groups.len() + 1);
+                self.doc.new_group(name.clone());
+                self.ghost_dirty = true;
+                self.status = format!("{name} created.");
+            }
             let mut remove = None;
             let mut select = None;
             let mut touched = false;
-            for (i, layer) in self.doc.layers.iter_mut().enumerate().rev() {
+            let mut grp_collapse = None;
+            let mut grp_eye = None;
+            let mut grp_add = None;
+            let mut grp_ungroup = None;
+            let mut grp_rename_commit: Option<(u32, String)> = None;
+            // Ancestor chains (top-down group ids) per layer, computed up
+            // front so the row loop can read them without borrowing.
+            let chains: Vec<Vec<u32>> = (0..self.doc.layers.len())
+                .map(|i| {
+                    let mut up = Vec::new();
+                    let mut seen = Vec::new();
+                    let mut g = self.doc.layers[i].group;
+                    while let Some(id) = g {
+                        if seen.contains(&id) {
+                            break;
+                        }
+                        seen.push(id);
+                        let Some(gr) = self.doc.groups.iter().find(|x| x.id == id) else {
+                            break;
+                        };
+                        up.push(id);
+                        g = gr.parent;
+                    }
+                    up.reverse();
+                    up
+                })
+                .collect();
+            let is_collapsed = |doc: &Document, id: u32| {
+                doc.groups
+                    .iter()
+                    .find(|g| g.id == id)
+                    .is_some_and(|g| g.collapsed)
+            };
+            let mut printed: Vec<u32> = Vec::new();
+            for i in (0..self.doc.layers.len()).rev() {
+                let chain = chains[i].clone();
+                for (d, gid) in chain.iter().enumerate() {
+                    if printed.contains(gid) {
+                        continue;
+                    }
+                    // Headers parked under a collapsed ancestor stay hidden
+                    // with their subtree.
+                    if chain[..d].iter().any(|a| is_collapsed(&self.doc, *a)) {
+                        continue;
+                    }
+                    printed.push(*gid);
+                    let (gname, gvis, gcollapsed) = match self.doc.groups.iter().find(|g| g.id == *gid) {
+                        Some(g) => (g.name.clone(), g.visible, g.collapsed),
+                        None => continue,
+                    };
+                    ui.horizontal(|ui| {
+                        ui.add_space(d as f32 * 12.0);
+                        if ui
+                            .small_button(if gcollapsed { "+" } else { "−" })
+                            .on_hover_text(if gcollapsed { "Expand group" } else { "Collapse group" })
+                            .clicked()
+                        {
+                            grp_collapse = Some(*gid);
+                        }
+                        let mut vis = gvis;
+                        if ui
+                            .toggle_value(&mut vis, "👁")
+                            .on_hover_text("Toggle group visibility")
+                            .changed()
+                        {
+                            grp_eye = Some(*gid);
+                        }
+                        if Some(*gid) == self.group_renaming {
+                            let resp =
+                                ui.text_edit_singleline(&mut self.group_name_edit);
+                            if !resp.has_focus() {
+                                resp.request_focus();
+                            }
+                            let enter =
+                                ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
+                            let mut commit = resp.lost_focus() || enter;
+                            let mut cancel = false;
+                            if ui.add_sized([44.0, 28.0], egui::Button::new("✓")).clicked() {
+                                commit = true;
+                            }
+                            if ui.add_sized([44.0, 28.0], egui::Button::new("✕")).clicked() {
+                                cancel = true;
+                            }
+                            if commit && !cancel {
+                                let name = std::mem::take(&mut self.group_name_edit);
+                                grp_rename_commit = Some((
+                                    *gid,
+                                    if name.trim().is_empty() {
+                                        gname.clone()
+                                    } else {
+                                        name
+                                    },
+                                ));
+                            }
+                            if commit || cancel {
+                                self.group_renaming = None;
+                                self.group_name_edit.clear();
+                            }
+                        } else {
+                            if ui.selectable_label(false, &gname).clicked() {
+                                self.group_renaming = Some(*gid);
+                                self.group_name_edit = gname.clone();
+                            }
+                        }
+                        if ui
+                            .small_button("+Add")
+                            .on_hover_text("Move active layer into this group")
+                            .clicked()
+                        {
+                            grp_add = Some(*gid);
+                        }
+                        if ui
+                            .small_button("Ungroup")
+                            .on_hover_text("Disband group (keeps layers)")
+                            .clicked()
+                        {
+                            grp_ungroup = Some(*gid);
+                        }
+                    });
+                }
+                if chain.iter().any(|id| is_collapsed(&self.doc, *id)) {
+                    continue;
+                }
+                let depth = chain.len();
+                let layer = &mut self.doc.layers[i];
                 ui.horizontal(|ui| {
+                    ui.add_space(depth as f32 * 12.0);
                     let mut vis = layer.visible;
                     if ui
                         .toggle_value(&mut vis, "👁")
@@ -2066,6 +2201,44 @@ impl eframe::App for ProCraftApp {
                 self.doc.active = i;
                 // A fresh full upload (matters for the mask viewer).
                 self.doc.mark_full_dirty();
+                if !self.doc.is_layer_shown(i) {
+                    self.status = "Active layer is in a hidden group.".to_string();
+                }
+            }
+            if let Some(gid) = grp_collapse {
+                let cur = self
+                    .doc
+                    .groups
+                    .iter()
+                    .find(|g| g.id == gid)
+                    .is_some_and(|g| g.collapsed);
+                self.doc.set_group_collapsed(gid, !cur);
+            }
+            if let Some(gid) = grp_eye {
+                let cur = self
+                    .doc
+                    .groups
+                    .iter()
+                    .find(|g| g.id == gid)
+                    .is_none_or(|g| g.visible);
+                self.doc.set_group_visible(gid, !cur);
+                self.ghost_dirty = true;
+                self.doc.mark_full_dirty();
+            }
+            if let Some(gid) = grp_add {
+                let active = self.doc.active;
+                self.doc.move_layer_into_group(active, Some(gid));
+                self.ghost_dirty = true;
+                self.status = "Active layer moved into the group.".to_string();
+            }
+            if let Some(gid) = grp_ungroup {
+                self.doc.ungroup(gid);
+                self.ghost_dirty = true;
+                self.doc.mark_full_dirty();
+                self.status = "Group disbanded (layers kept).".to_string();
+            }
+            if let Some((gid, name)) = grp_rename_commit {
+                self.doc.rename_group(gid, name);
             }
             if touched {
                 self.ghost_dirty = true;

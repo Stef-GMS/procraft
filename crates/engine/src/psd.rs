@@ -164,7 +164,7 @@ pub fn save_psd(path: &std::path::Path, doc: &Document) -> Result<(), String> {
         records.extend_from_slice(&blend_key(layer.blend));
         records.push((layer.opacity.clamp(0.0, 1.0) * 255.0).round() as u8);
         records.push(u8::from(layer.clip));
-        records.push(if layer.visible { 0 } else { 0x02 });
+        records.push(if doc.is_layer_shown(index) { 0 } else { 0x02 });
         records.push(0); // filler
                          // Extra data: mask section + empty blending ranges + name.
         let mut extra = Vec::new();
@@ -261,6 +261,7 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
             clip: false,
             ox: 0,
             oy: 0,
+            group: None,
         });
     } else {
         // The crate lists bottom-first, matching our order.
@@ -285,6 +286,7 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
                 clip: !pl.is_clipping_mask(),
                 ox: 0,
                 oy: 0,
+                group: None,
             });
             if layers.len() >= 256 {
                 break;

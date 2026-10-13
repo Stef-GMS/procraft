@@ -48,7 +48,7 @@ pub fn visible_frames(doc: &Document) -> Vec<usize> {
     doc.layers
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.visible)
+        .filter(|(i, _)| doc.is_layer_shown(*i))
         .map(|(i, _)| i)
         .collect()
 }
@@ -147,12 +147,12 @@ pub fn clamp_frame(doc: &Document, pos: usize) -> Option<usize> {
 pub fn prev_frame(doc: &Document, index: usize) -> Option<usize> {
     (0..index.min(doc.layers.len()))
         .rev()
-        .find(|&i| doc.layers[i].visible)
+        .find(|&i| doc.is_layer_shown(i))
 }
 
 /// Nearest visible layer strictly above `index` (onion: next frame).
 pub fn next_frame(doc: &Document, index: usize) -> Option<usize> {
-    ((index + 1)..doc.layers.len()).find(|&i| doc.layers[i].visible)
+    ((index + 1)..doc.layers.len()).find(|&i| doc.is_layer_shown(i))
 }
 
 /// Render one frame: the layer (Normal blend, opacity + reveal mask
@@ -322,6 +322,7 @@ pub fn import_gif_document(bytes: &[u8]) -> Result<(Document, u32), String> {
             clip: false,
             ox: 0,
             oy: 0,
+            group: None,
         });
         if layers.len() > MAX_GIF_FRAMES {
             return Err(format!("too many frames (max {MAX_GIF_FRAMES})"));
@@ -355,7 +356,7 @@ pub fn export_gif_ext(
         .layers
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.visible)
+        .filter(|(i, _)| doc.is_layer_shown(*i))
         .map(|(i, _)| i)
         .collect();
     if frames.is_empty() {

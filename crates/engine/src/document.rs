@@ -227,6 +227,22 @@ pub struct Layer {
     /// it. Saved to v6 project files (older versions read 0).
     pub ox: i32,
     pub oy: i32,
+    /// Owning layer group (id into [`Document::groups`); `None` lives at
+    /// the top level. Saved to v8 project files (older versions read none).
+    pub group: Option<u32>,
+}
+
+/// A named layer container: visibility (and collapse) apply to the whole
+/// subtree. Ids are monotonic per document and never reused while a group
+/// with that id exists; removal leaves gaps, which open/ops tolerate.
+#[derive(Clone, Debug)]
+pub struct LayerGroup {
+    pub id: u32,
+    pub name: String,
+    pub visible: bool,
+    pub collapsed: bool,
+    /// Parent group id for nesting; `None` lives at the top level.
+    pub parent: Option<u32>,
 }
 
 impl Layer {
@@ -241,6 +257,7 @@ impl Layer {
             clip: false,
             ox: 0,
             oy: 0,
+            group: None,
         }
     }
 
@@ -308,6 +325,10 @@ pub struct Document {
     redo: Vec<UndoEntry>,
     undo_bytes: usize,
     redo_bytes: usize,
+    /// Layer groups (presentation only: paint/masks still address layers).
+    /// Saved to v8 project files.
+    pub groups: Vec<LayerGroup>,
+    next_group_id: u32,
 }
 
 /// History cap: at most 32 steps per stack (backstop)…
@@ -351,6 +372,8 @@ impl Document {
             redo: Vec::new(),
             undo_bytes: 0,
             redo_bytes: 0,
+            groups: Vec::new(),
+            next_group_id: 1,
         }
     }
 
@@ -375,6 +398,8 @@ impl Document {
             redo: Vec::new(),
             undo_bytes: 0,
             redo_bytes: 0,
+            groups: Vec::new(),
+            next_group_id: 1,
         }
     }
     /// Mirror center in canvas pixels (canvas middle when never moved).
@@ -451,6 +476,131 @@ impl Document {
         let layer = self.layers.remove(from);
         self.layers.insert(to, layer);
         self.active = to;
+        self.mark_full_dirty();
+    }
+
+    /// Look up a group by id.
+    pub fn group(&self, id: u32) -> Option<&LayerGroup> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    fn group_mut(&mut self, id: u32) -> Option<&mut LayerGroup> {
+        self.groups.iter_mut().find(|g| g.id == id)
+    }
+
+    /// True when the layer and every ancestor group are visible (what
+    /// compositing, playback, export and onion paths must honor instead of
+    /// the bare layer flag).
+    pub fn is_layer_shown(&self, index: usize) -> bool {
+        let Some(layer) = self.layers.get(index) else {
+            return false;
+        };
+        if !layer.visible {
+            return false;
+        }
+        let mut parent = layer.group;
+        // Bounded walk: a corrupt parent cycle can never hang compositing.
+        let mut guard = self.groups.len().saturating_add(1);
+        while let Some(id) = parent {
+            if guard == 0 {
+                break;
+            }
+            guard -= 1;
+            let Some(g) = self.group(id) else {
+                break;
+            };
+            if !g.visible {
+                return false;
+            }
+            parent = g.parent;
+        }
+        true
+    }
+
+    /// Create an empty top-level group and return its id. Structural like
+    /// add/remove layer: not undoable, marks the view dirty.
+    pub fn new_group(&mut self, name: String) -> u32 {
+        // Ids start at 1; 0 always reads as "no group".
+        let id = self.next_group_id.max(1);
+        self.next_group_id = id.saturating_add(1).max(1);
+        self.groups.push(LayerGroup {
+            id,
+            name,
+            visible: true,
+            collapsed: false,
+            parent: None,
+        });
+        self.mark_full_dirty();
+        id
+    }
+
+    pub fn rename_group(&mut self, id: u32, name: String) {
+        if let Some(g) = self.group_mut(id) {
+            g.name = name;
+        }
+    }
+
+    pub fn set_group_visible(&mut self, id: u32, visible: bool) {
+        if let Some(g) = self.group_mut(id) {
+            g.visible = visible;
+        }
+        self.mark_full_dirty();
+    }
+
+    pub fn set_group_collapsed(&mut self, id: u32, collapsed: bool) {
+        if let Some(g) = self.group_mut(id) {
+            g.collapsed = collapsed;
+        }
+    }
+
+    /// Move a layer into a group (or to the top level with `None`),
+    /// keeping group members contiguous: the layer lands next to the
+    /// group's current members (topmost side).
+    pub fn move_layer_into_group(&mut self, index: usize, group: Option<u32>) {
+        if index >= self.layers.len() {
+            return;
+        }
+        if let Some(id) = group {
+            if self.group(id).is_none() {
+                return;
+            }
+        }
+        let mut layer = self.layers.remove(index);
+        layer.group = group;
+        let at = match group {
+            None => self.layers.len(),
+            Some(id) => self
+                .layers
+                .iter()
+                .rposition(|l| l.group == Some(id))
+                .map_or(self.layers.len(), |p| p + 1),
+        };
+        // `active` tracked the removed layer: follow it to its new home.
+        self.layers.insert(at, layer);
+        self.active = at;
+        self.mark_full_dirty();
+    }
+
+    /// Disband a group: member layers (and subgroups) move up one level,
+    /// the group row disappears. Contents always survive (no destructive
+    /// group delete in v1).
+    pub fn ungroup(&mut self, id: u32) {
+        let Some(pos) = self.groups.iter().position(|g| g.id == id) else {
+            return;
+        };
+        let parent = self.groups[pos].parent;
+        self.groups.remove(pos);
+        for layer in self.layers.iter_mut() {
+            if layer.group == Some(id) {
+                layer.group = parent;
+            }
+        }
+        for g in self.groups.iter_mut() {
+            if g.parent == Some(id) {
+                g.parent = parent;
+            }
+        }
+        self.active = self.active.min(self.layers.len().saturating_sub(1));
         self.mark_full_dirty();
     }
 
@@ -549,8 +699,8 @@ impl Document {
         // Opaque content composited so far (layers only, not the page):
         // clipping masks intersect against it.
         let mut below_a = 0.0f32;
-        for layer in &self.layers {
-            if !layer.visible || layer.opacity <= 0.0 {
+        for (li, layer) in self.layers.iter().enumerate() {
+            if !self.is_layer_shown(li) || layer.opacity <= 0.0 {
                 continue;
             }
             // Buffer content sits at the layer offset; off-canvas parts of
@@ -794,7 +944,7 @@ impl Document {
             return false;
         }
         let src = self.layers[index].clone();
-        let sa_base = if src.visible {
+        let sa_base = if self.is_layer_shown(index) {
             src.opacity.clamp(0.0, 1.0)
         } else {
             0.0
@@ -1625,12 +1775,12 @@ impl Document {
 
     /// Save the full project (layers, opacity, blend, background, symmetry)
     /// to a `.procraft` file: magic + little-endian records, zlib-compressed
-    /// pixels. Version 7 adds the mirror center (v1-v6 files still open;
-    /// old app versions cleanly refuse v7 files at the magic).
+    /// pixels. Version 8 adds layer groups (v1-v7 files still open with no
+    /// groups; old app versions cleanly refuse v8 files at the magic).
     pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        f.write_all(b"PCRAFT07").map_err(|e| e.to_string())?;
+        f.write_all(b"PCRAFT08").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes())
             .map_err(|e| e.to_string())?;
         f.write_all(&self.h.to_le_bytes())
@@ -1662,6 +1812,31 @@ impl Document {
                 f.write_all(&[0u8]).map_err(|e| e.to_string())?;
             }
         }
+        // v8 stores the layer-group table (count + records); older files
+        // read an empty table.
+        f.write_all(&(self.groups.len() as u32).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        for g in &self.groups {
+            f.write_all(&g.id.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            match g.parent {
+                Some(p) => {
+                    f.write_all(&[1u8]).map_err(|e| e.to_string())?;
+                    f.write_all(&p.to_le_bytes()).map_err(|e| e.to_string())?;
+                }
+                None => {
+                    f.write_all(&[0u8]).map_err(|e| e.to_string())?;
+                }
+            }
+            let name = g.name.as_bytes();
+            f.write_all(&(name.len() as u32).to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            f.write_all(name).map_err(|e| e.to_string())?;
+            f.write_all(&[u8::from(g.visible)])
+                .map_err(|e| e.to_string())?;
+            f.write_all(&[u8::from(g.collapsed)])
+                .map_err(|e| e.to_string())?;
+        }
         for layer in &self.layers {
             let name = layer.name.as_bytes();
             f.write_all(&(name.len() as u32).to_le_bytes())
@@ -1691,6 +1866,16 @@ impl Document {
                 .map_err(|e| e.to_string())?;
             f.write_all(&layer.oy.to_le_bytes())
                 .map_err(|e| e.to_string())?;
+            // v8 stores the owning group (flag + id); older files read none.
+            match layer.group {
+                Some(id) => {
+                    f.write_all(&[1u8]).map_err(|e| e.to_string())?;
+                    f.write_all(&id.to_le_bytes()).map_err(|e| e.to_string())?;
+                }
+                None => {
+                    f.write_all(&[0u8]).map_err(|e| e.to_string())?;
+                }
+            }
             let expect = (self.w * self.h * 4) as usize;
             if layer.pixels.len() != expect {
                 return Err("layer has wrong pixel size".to_string());
@@ -1738,7 +1923,8 @@ impl Document {
             Ok(head)
         };
         let magic = take(8)?.to_vec();
-        let v7 = magic == b"PCRAFT07";
+        let v8 = magic == b"PCRAFT08";
+        let v7 = v8 || magic == b"PCRAFT07";
         let v6 = v7 || magic == b"PCRAFT06";
         let v5 = v6 || magic == b"PCRAFT05";
         let v4 = v5 || magic == b"PCRAFT04";
@@ -1823,6 +2009,67 @@ impl Document {
         } else {
             None
         };
+        // v8 appends the layer-group table after the mirror center;
+        // older files read an empty table. Unknown parents sanitize to
+        // top-level so corrupt ids can never orphan a group.
+        let mut groups = Vec::new();
+        if v8 {
+            let gcount = u32::from_le_bytes(
+                take(4)?[..4]
+                    .try_into()
+                    .map_err(|_| "bad group count".to_string())?,
+            ) as usize;
+            if gcount > 256 {
+                return Err("project has bad group count".to_string());
+            }
+            let mut seen = Vec::new();
+            for _ in 0..gcount {
+                let id = u32::from_le_bytes(
+                    take(4)?[..4]
+                        .try_into()
+                        .map_err(|_| "bad group id".to_string())?,
+                );
+                if id == 0 || seen.contains(&id) {
+                    return Err("project has bad group id".to_string());
+                }
+                seen.push(id);
+                let parent = if take(1)?[0] == 0 {
+                    None
+                } else {
+                    Some(u32::from_le_bytes(
+                        take(4)?[..4]
+                            .try_into()
+                            .map_err(|_| "bad group parent".to_string())?,
+                    ))
+                };
+                let name_len = u32::from_le_bytes(
+                    take(4)?[..4]
+                        .try_into()
+                        .map_err(|_| "bad group name".to_string())?,
+                ) as usize;
+                if name_len > 512 {
+                    return Err("project has bad group name".to_string());
+                }
+                let name = String::from_utf8(take(name_len)?.to_vec())
+                    .map_err(|_| "bad group name".to_string())?;
+                let visible = take(1)?[0] != 0;
+                let collapsed = take(1)?[0] != 0;
+                groups.push(LayerGroup {
+                    id,
+                    name,
+                    visible,
+                    collapsed,
+                    parent,
+                });
+            }
+            for g in groups.iter_mut() {
+                if let Some(p) = g.parent {
+                    if !seen.contains(&p) {
+                        g.parent = None;
+                    }
+                }
+            }
+        }
         let mut layers = Vec::new();
         for _ in 0..count {
             let name_len = u32::from_le_bytes(
@@ -1873,6 +2120,21 @@ impl Document {
                 (ox, oy)
             } else {
                 (0, 0)
+            };
+            // v8 appends the owning group (flag + id) after the offset;
+            // older files read top-level. Unknown ids sanitize to none.
+            let group = if v8 {
+                if take(1)?[0] == 0 {
+                    None
+                } else {
+                    Some(u32::from_le_bytes(
+                        take(4)?[..4]
+                            .try_into()
+                            .map_err(|_| "bad layer group".to_string())?,
+                    ))
+                }
+            } else {
+                None
             };
             let expect = (w * h * 4) as usize;
             let pixels = if v4 {
@@ -1926,6 +2188,10 @@ impl Document {
             } else {
                 None
             };
+            // Unknown group ids sanitize to top-level so a corrupt byte
+            // can never orphan a layer.
+            let known = groups.iter().map(|g| g.id).collect::<Vec<_>>();
+            let group = group.filter(|id| known.contains(id));
             layers.push(Layer {
                 name,
                 visible,
@@ -1936,11 +2202,17 @@ impl Document {
                 clip,
                 ox,
                 oy,
+                group,
             });
         }
         if !cur.is_empty() {
             return Err("project has trailing data".to_string());
         }
+        let next_group_id = groups
+            .iter()
+            .map(|g| g.id)
+            .max()
+            .map_or(1, |m| m.saturating_add(1).max(1));
         Ok(Document {
             w,
             h,
@@ -1958,6 +2230,8 @@ impl Document {
             redo: Vec::new(),
             undo_bytes: 0,
             redo_bytes: 0,
+            groups,
+            next_group_id,
         })
     }
 }
@@ -2009,6 +2283,146 @@ mod tests {
         // Undo still works after a redo.
         assert!(doc.undo());
         assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn group_hide_conceals_members_in_flatten() {
+        let mut doc = Document::new(2, 1);
+        doc.layers[0].pixels = vec![255, 0, 0, 255, 255, 0, 0, 255];
+        doc.add_layer("top".to_string());
+        doc.layers[1].pixels = vec![0, 0, 255, 255, 0, 0, 255, 255];
+        let g = doc.new_group("G".to_string());
+        doc.move_layer_into_group(1, Some(g));
+        assert!(doc.is_layer_shown(1));
+        doc.set_group_visible(g, false);
+        assert!(!doc.is_layer_shown(1));
+        assert!(doc.is_layer_shown(0));
+        // Top pixel falls through to the red layer below.
+        assert_eq!(&doc.flatten()[0..4], &[255, 0, 0, 255]);
+        doc.set_group_visible(g, true);
+        assert_eq!(&doc.flatten()[0..4], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn nested_groups_need_every_level_visible() {
+        let mut doc = Document::new(1, 1);
+        let outer = doc.new_group("outer".to_string());
+        let inner = doc.new_group("inner".to_string());
+        doc.groups
+            .iter_mut()
+            .find(|g| g.id == inner)
+            .unwrap()
+            .parent = Some(outer);
+        doc.move_layer_into_group(0, Some(inner));
+        assert!(doc.is_layer_shown(0));
+        doc.set_group_visible(inner, false);
+        assert!(!doc.is_layer_shown(0));
+        doc.set_group_visible(inner, true);
+        doc.set_group_visible(outer, false);
+        assert!(!doc.is_layer_shown(0));
+    }
+
+    #[test]
+    fn ungroup_spills_members_up_one_level() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        let outer = doc.new_group("outer".to_string());
+        let inner = doc.new_group("inner".to_string());
+        doc.groups
+            .iter_mut()
+            .find(|g| g.id == inner)
+            .unwrap()
+            .parent = Some(outer);
+        doc.move_layer_into_group(0, Some(inner));
+        doc.move_layer_into_group(0, Some(outer));
+        doc.ungroup(inner);
+        assert!(doc.group(inner).is_none());
+        assert_eq!(doc.layers[0].group, Some(outer));
+        assert_eq!(doc.layers[1].group, Some(outer));
+        doc.ungroup(outer);
+        assert!(doc.groups.is_empty());
+        assert!(doc.layers.iter().all(|l| l.group.is_none()));
+    }
+
+    #[test]
+    fn move_into_group_lands_adjacent() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        doc.add_layer("c".to_string());
+        let g = doc.new_group("G".to_string());
+        // Bottom layer joins the group: inserted at the top end.
+        doc.move_layer_into_group(0, Some(g));
+        assert_eq!(doc.layers[2].name, "Layer 1");
+        assert_eq!(doc.layers[2].group, Some(g));
+        assert_eq!(doc.active, 2);
+        // Unknown groups and indices are ignored.
+        doc.move_layer_into_group(0, Some(999));
+        assert!(doc.layers[0].group.is_none());
+        doc.move_layer_into_group(99, Some(g));
+        assert_eq!(doc.layers.len(), 3);
+    }
+
+    #[test]
+    fn v8_roundtrip_keeps_groups() {
+        let mut doc = Document::new(2, 1);
+        let g = doc.new_group("Sketch".to_string());
+        doc.set_group_visible(g, false);
+        doc.move_layer_into_group(0, Some(g));
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v8.pcraft");
+        doc.save_project(&path).unwrap();
+        let head = std::fs::read(&path).unwrap();
+        assert_eq!(&head[..8], b"PCRAFT08");
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.groups.len(), 1);
+        assert_eq!(back.groups[0].name, "Sketch");
+        assert!(!back.groups[0].visible);
+        assert_eq!(back.layers[0].group, Some(g));
+        assert!(!back.is_layer_shown(0));
+        // Ids keep increasing after a reload (no reuse).
+        let mut back = back;
+        let g2 = back.new_group("More".to_string());
+        assert!(g2 > g);
+    }
+
+    #[test]
+    fn v7_project_opens_groupless() {
+        // Hand-build a minimal version-7 file (center flag, no groups).
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v7-compat.pcraft");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT07");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // Symmetry off.
+        buf.extend_from_slice(&[6]);
+        buf.extend_from_slice(&[0]); // No mirror center.
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]);
+        buf.extend_from_slice(&[0]);
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&[9u8; 2 * 4]).unwrap();
+        let packed = enc.finish().unwrap();
+        buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&packed);
+        buf.extend_from_slice(&[0]); // No mask.
+        std::fs::write(&path, &buf).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(back.groups.is_empty());
+        assert!(back.layers[0].group.is_none());
+        assert!(back.is_layer_shown(0));
+        assert_eq!(back.layers[0].pixels, vec![9u8; 8]);
     }
 
     #[test]
@@ -2148,7 +2562,7 @@ mod tests {
         let path = dir.join("procraft-v6.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT07");
+        assert_eq!(&head[..8], b"PCRAFT08");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].blend, BlendMode::Difference);
@@ -2871,7 +3285,7 @@ mod tests {
             meta.len()
         );
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT07");
+        assert_eq!(&head[..8], b"PCRAFT08");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].pixels, doc.layers[0].pixels);

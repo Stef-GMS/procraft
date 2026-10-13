@@ -153,6 +153,23 @@ impl Theme {
             }
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+            Theme::Paper => "paper",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "dark" => Some(Theme::Dark),
+            "light" => Some(Theme::Light),
+            "paper" => Some(Theme::Paper),
+            _ => None,
+        }
+    }
 }
 
 /// Append `.ext` when the chosen path has none (rfd doesn't force it).
@@ -196,6 +213,10 @@ struct ProCraftApp {
     sel_current: Option<(f32, f32)>,
     lasso_points: Vec<(f32, f32)>,
     lasso_poly: Vec<(f32, f32)>,
+    /// Cached mask-edge points for marching ants, rebuilt when
+    /// `sel_edges_dirty` (set at every selection-mutating site).
+    sel_edges: Vec<(u32, u32)>,
+    sel_edges_dirty: bool,
     fill_tolerance: u8,
     fill_preview: Option<FillPreview>,
     filter_preview: Option<FilterPreview>,
@@ -280,7 +301,7 @@ impl ProCraftApp {
             }
         }
         cc.egui_ctx.set_fonts(fonts);
-        Self {
+        let mut app = Self {
             doc: Document::new(1280, 800),
             brush: Brush::default(),
             color: [30, 144, 255],
@@ -301,6 +322,8 @@ impl ProCraftApp {
             sel_current: None,
             lasso_points: Vec::new(),
             lasso_poly: Vec::new(),
+            sel_edges: Vec::new(),
+            sel_edges_dirty: true,
             fill_tolerance: 32,
             fill_preview: None,
             filter_preview: None,
@@ -365,7 +388,30 @@ impl ProCraftApp {
             status:
                 "Drag on the canvas to paint. Ctrl+Z undoes, Ctrl+Y redoes, Esc clears selection."
                     .to_string(),
+        };
+        // Restore disk-persisted UI state (theme, panels, zoom); defaults
+        // stand when nothing was saved yet.
+        if let Some(storage) = cc.storage {
+            if let Some(name) = storage.get_string("theme") {
+                if let Some(theme) = Theme::from_str(&name) {
+                    app.theme = theme;
+                }
+            }
+            if let Some(v) = storage.get_string("show_tools") {
+                app.show_tools = v == "1";
+            }
+            if let Some(v) = storage.get_string("show_layers") {
+                app.show_layers = v == "1";
+            }
+            if let Some(v) = storage.get_string("zoom") {
+                if let Ok(z) = v.parse::<f32>() {
+                    if z.is_finite() && z > 0.0 {
+                        app.zoom = z;
+                    }
+                }
+            }
         }
+        app
     }
 
     fn base_brush(&self) -> Brush {
@@ -377,6 +423,56 @@ impl ProCraftApp {
 
     fn current_color(&self) -> Color {
         Color::rgb(self.color[0], self.color[1], self.color[2])
+    }
+
+    /// Rebuild the cached mask-edge points for marching ants. Rect-only
+    /// selections contribute their perimeter; masks contribute pixels on
+    /// the nonzero boundary (feather fringe included, so the crawl shows
+    /// the true extent). Runs once per selection change, not per frame.
+    fn rebuild_sel_edges(&mut self) {
+        self.sel_edges.clear();
+        let (w, h) = (self.doc.w, self.doc.h);
+        if w == 0 || h == 0 {
+            return;
+        }
+        if let Some(mask) = self.doc.selection_mask.as_deref() {
+            if mask.len() != (w * h) as usize {
+                return;
+            }
+            let at = |x: u32, y: u32| mask[(y * w + x) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    if at(x, y) == 0 {
+                        continue;
+                    }
+                    let edge = x == 0
+                        || y == 0
+                        || x + 1 == w
+                        || y + 1 == h
+                        || at(x - 1, y) == 0
+                        || at(x + 1, y) == 0
+                        || at(x, y - 1) == 0
+                        || at(x, y + 1) == 0;
+                    if edge {
+                        self.sel_edges.push((x, y));
+                    }
+                }
+            }
+        } else if let Some((x0, y0, x1, y1)) = self.doc.selection {
+            let (x1, y1) = (x1.min(w - 1), y1.min(h - 1));
+            for x in x0..=x1 {
+                self.sel_edges.push((x, y0));
+                if y1 != y0 {
+                    self.sel_edges.push((x, y1));
+                }
+            }
+            for y in y0 + 1..y1 {
+                self.sel_edges.push((x0, y));
+                if x1 != x0 {
+                    self.sel_edges.push((x1, y));
+                }
+            }
+        }
     }
 
     /// Upload only what changed since the last frame (no-op when clean).
@@ -763,8 +859,8 @@ fn vp_handle_pos(rect: egui::Rect, z: f32, vx: f32, vy: f32) -> (egui::Pos2, boo
     (egui::Pos2::new(cx, cy), true)
 }
 
-/// Slider with −/+ micro-step buttons (touch-sized nudges for values a
-/// finger drag overshoots). `step` is in value units; endpoints clamp.
+/// Slider with −/+ step buttons (34x24 targets for touch use; `step`
+/// is in value units, endpoints clamp).
 fn stepped_slider<Num: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     value: &mut Num,
@@ -775,11 +871,11 @@ fn stepped_slider<Num: egui::emath::Numeric>(
     let lo = range.start().to_f64();
     let hi = range.end().to_f64();
     ui.horizontal(|ui| {
-        if ui.small_button("−").clicked() {
+        if ui.add_sized([34.0, 24.0], egui::Button::new("−")).clicked() {
             *value = Num::from_f64((value.to_f64() - step).clamp(lo, hi));
         }
         ui.add(egui::Slider::new(value, range).text(text));
-        if ui.small_button("+").clicked() {
+        if ui.add_sized([34.0, 24.0], egui::Button::new("+")).clicked() {
             *value = Num::from_f64((value.to_f64() + step).clamp(lo, hi));
         }
     });
@@ -886,7 +982,46 @@ fn paint_path(painter: &egui::Painter, pts: &[egui::Pos2], close: bool) {
     }
 }
 
+/// Marching ants along mask edges: dark dots everywhere, light dots on a
+/// moving subset (classic two-tone crawl). `to_screen` maps canvas pixels.
+fn paint_mask_edges(
+    painter: &egui::Painter,
+    edges: &[(u32, u32)],
+    to_screen: impl Fn(u32, u32) -> egui::Pos2,
+    time: f64,
+) {
+    let tick = (time * 28.0 / 3.0) as usize;
+    for &(x, y) in edges.iter() {
+        let p = to_screen(x, y);
+        let r = egui::Rect::from_center_size(p, egui::Vec2::splat(2.5));
+        painter.rect_filled(r, 0.0, Color32::BLACK);
+    }
+    for (i, &(x, y)) in edges.iter().enumerate() {
+        if (i + tick) % 12 < 6 {
+            let p = to_screen(x, y);
+            let r = egui::Rect::from_center_size(p, egui::Vec2::splat(1.5));
+            painter.rect_filled(r, 0.0, Color32::WHITE);
+        }
+    }
+}
+
 impl eframe::App for ProCraftApp {
+    /// Persist UI state to disk (theme, panel visibility, zoom). Window
+    /// rect and panel widths persist via eframe once `persistence_path`
+    /// is set in `main`.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string("theme", self.theme.as_str().to_string());
+        storage.set_string(
+            "show_tools",
+            if self.show_tools { "1" } else { "0" }.to_string(),
+        );
+        storage.set_string(
+            "show_layers",
+            if self.show_layers { "1" } else { "0" }.to_string(),
+        );
+        storage.set_string("zoom", self.zoom.to_string());
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.theme_applied != Some(self.theme) {
             ui.ctx().set_visuals(self.theme.visuals());
@@ -928,6 +1063,7 @@ impl eframe::App for ProCraftApp {
             self.sel_current = None;
             self.lasso_points.clear();
             self.lasso_poly.clear();
+            self.sel_edges_dirty = true;
         }
         // Keep frames coming while painting, selecting, lassoing, moving,
         // shaping, or marching ants.
@@ -1202,6 +1338,8 @@ impl eframe::App for ProCraftApp {
             let ink = Color::rgb(self.color[0], self.color[1], self.color[2]);
             egui::Window::new("Text")
                 .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .resizable(false)
                 .collapsible(false)
                 .show(ui.ctx(), |ui| {
                     ui.label("Click the canvas to move the anchor, then Render.");
@@ -1244,9 +1382,10 @@ impl eframe::App for ProCraftApp {
             self.text_open = open;
         }
 
-        // Fresh id per width era ("tools" -> "tools-wide" -> here): eframe
-        // persists panel widths by id, so a new id starts at `default_size`
-        // while any saved width stays buried under the old id. No max clamp:
+        // Fresh id per width era ("tools" -> "tools-wide" -> here): panel
+        // widths persist by id (see `persistence_path` in `main`), so a new
+        // id starts at `default_size` while any saved width stays buried
+        // under the old id. No max clamp:
         // the panel stays freely resizable, it just starts compact (swatch
         // grids wrap to ~3 rows, page gets the room).
         if self.show_tools {
@@ -1285,12 +1424,21 @@ impl eframe::App for ProCraftApp {
                     stepped_slider(ui, &mut self.shape_sides, 3..=12, 1.0, "Sides");
                 }
             }
-            if ui.button("Clear selection").clicked() {
+            let has_selection = self.doc.selection.is_some() || self.doc.selection_mask.is_some();
+            ui.separator();
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Clear selection"))
+                .clicked()
+            {
                 self.doc.clear_selection();
                 self.lasso_poly.clear();
+                self.sel_edges_dirty = true;
                 self.status = "Selection cleared.".to_string();
             }
             ui.collapsing("Selection Studio", |ui| {
+                if !has_selection {
+                    ui.label("No selection yet — drag Marquee/Lasso on the canvas, or Select opaque.");
+                }
                 stepped_slider(ui, &mut self.sel_feather, 0..=32, 1.0, "Feather px");
                 if ui.button("Apply feather").clicked() {
                     if self.doc.feather_selection(self.sel_feather) {
@@ -1298,14 +1446,16 @@ impl eframe::App for ProCraftApp {
                     } else {
                         self.status = "No selection to feather.".to_string();
                     }
+                    self.sel_edges_dirty = true;
                 }
                 stepped_slider(ui, &mut self.sel_grow, -32..=32, 1.0, "Grow px");
                 if ui.button("Apply grow").clicked() {
                     if self.doc.grow_selection(self.sel_grow) {
                         self.status = format!("Grown ({} px).", self.doc.selection_pixel_count());
                     } else {
-                        self.status = "No selection left.".to_string();
+                        self.status = "No selection to grow.".to_string();
                     }
+                    self.sel_edges_dirty = true;
                 }
                 if ui.button("Smooth").clicked() {
                     if self.doc.smooth_selection() {
@@ -1313,6 +1463,7 @@ impl eframe::App for ProCraftApp {
                     } else {
                         self.status = "No selection to smooth.".to_string();
                     }
+                    self.sel_edges_dirty = true;
                 }
                 if ui.button("Invert").clicked() {
                     if self.doc.invert_selection() {
@@ -1320,6 +1471,7 @@ impl eframe::App for ProCraftApp {
                     } else {
                         self.status = "No selection to invert.".to_string();
                     }
+                    self.sel_edges_dirty = true;
                 }
                 stepped_slider(ui, &mut self.sel_opaque_t, 0..=255, 1.0, "Opacity >");
                 if ui.button("Select opaque").clicked() {
@@ -1328,6 +1480,7 @@ impl eframe::App for ProCraftApp {
                     } else {
                         self.status = "Layer is empty.".to_string();
                     }
+                    self.sel_edges_dirty = true;
                 }
                 stepped_slider(ui, &mut self.sel_stroke_w, 1..=16, 1.0, "Outline px");
                 if ui.button("Paint outline").clicked() {
@@ -1794,8 +1947,9 @@ impl eframe::App for ProCraftApp {
         });
         } // end show_tools
 
-        // Fresh id (not "layers"): eframe persists panel widths to disk, and the
-        // old narrow width would otherwise override `default_size` forever.
+        // Fresh id (not "layers"): panel widths persist to disk by id (see
+        // `persistence_path` in `main`), and the old narrow width would
+        // otherwise override `default_size` forever.
         if self.show_layers {
             egui::Panel::right("layers-wide").default_size(280.0).show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1833,7 +1987,11 @@ impl eframe::App for ProCraftApp {
             for (i, layer) in self.doc.layers.iter_mut().enumerate().rev() {
                 ui.horizontal(|ui| {
                     let mut vis = layer.visible;
-                    if ui.checkbox(&mut vis, "").changed() {
+                    if ui
+                        .toggle_value(&mut vis, "👁")
+                        .on_hover_text("Toggle layer visibility")
+                        .changed()
+                    {
                         layer.visible = vis;
                         touched = true;
                     }
@@ -1850,10 +2008,10 @@ impl eframe::App for ProCraftApp {
                         let enter = ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
                         let mut commit = resp.lost_focus() || enter;
                         let mut cancel = false;
-                        if ui.add_sized([36.0, 22.0], egui::Button::new("✓")).clicked() {
+                        if ui.add_sized([44.0, 28.0], egui::Button::new("✓")).clicked() {
                             commit = true;
                         }
-                        if ui.add_sized([36.0, 22.0], egui::Button::new("✕")).clicked() {
+                        if ui.add_sized([44.0, 28.0], egui::Button::new("✕")).clicked() {
                             cancel = true;
                         }
                         if commit && !cancel {
@@ -1877,7 +2035,10 @@ impl eframe::App for ProCraftApp {
                             self.renaming_text = layer.name.clone();
                         }
                     }
-                    if ui.small_button("del").clicked() {
+                    if ui
+                        .add_sized([44.0, 24.0], egui::Button::new("del"))
+                        .clicked()
+                    {
                         remove = Some(i);
                     }
                     if layer.mask.is_some() {
@@ -2467,6 +2628,23 @@ impl eframe::App for ProCraftApp {
                         .collect();
                     paint_path(ui.painter(), &pts, true);
                 }
+                // Mask-edge marching ants on every tool: the cached edges
+                // rebuild only when the selection changed (dirty flag).
+                if self.sel_edges_dirty {
+                    self.rebuild_sel_edges();
+                    self.sel_edges_dirty = false;
+                }
+                if self.doc.selection_mask.is_some() && !self.sel_edges.is_empty() {
+                    let t = ctx.input(|i| i.time);
+                    paint_mask_edges(
+                        ui.painter(),
+                        &self.sel_edges,
+                        |x, y| {
+                            egui::Pos2::new(rect.min.x + x as f32 * z, rect.min.y + y as f32 * z)
+                        },
+                        t,
+                    );
+                }
 
                 // Eyedropper: Alt-click samples the composited canvas color
                 // into the brush on any tool (Alt held blocks painting).
@@ -2583,23 +2761,45 @@ impl eframe::App for ProCraftApp {
                                 self.doc.selection = Some((x0, y0, x1, y1));
                                 self.doc.selection_mask = None;
                                 self.lasso_poly.clear();
+                                self.sel_edges_dirty = true;
                                 self.status =
                                     format!("Selected {}x{} px.", x1 - x0 + 1, y1 - y0 + 1);
                             } else {
                                 self.doc.clear_selection();
+                                self.sel_edges_dirty = true;
                             }
                         }
                         self.sel_anchor = None;
                         self.sel_current = None;
                     }
-                    // Live rubber band + committed marching ants.
+                    // Live rubber band + committed marching ants (mask edges
+                    // when a graduated mask exists, bbox rect otherwise).
                     let band = match (self.sel_anchor, self.sel_current) {
                         (Some(a), Some(b)) => Some((a, b)),
                         _ => self.doc.selection.map(|(x0, y0, x1, y1)| {
                             ((x0 as f32, y0 as f32), ((x1 + 1) as f32, (y1 + 1) as f32))
                         }),
                     };
-                    if let Some(((ax, ay), (bx, by))) = band {
+                    if self.sel_anchor.is_none() && self.doc.selection_mask.is_some() {
+                        if self.sel_edges_dirty {
+                            self.rebuild_sel_edges();
+                            self.sel_edges_dirty = false;
+                        }
+                        if !self.sel_edges.is_empty() {
+                            let t = ctx.input(|i| i.time);
+                            paint_mask_edges(
+                                ui.painter(),
+                                &self.sel_edges,
+                                |x, y| {
+                                    egui::Pos2::new(
+                                        rect.min.x + x as f32 * z,
+                                        rect.min.y + y as f32 * z,
+                                    )
+                                },
+                                t,
+                            );
+                        }
+                    } else if let Some(((ax, ay), (bx, by))) = band {
                         let (x0, x1) = if ax <= bx { (ax, bx) } else { (bx, ax) };
                         let (y0, y1) = if ay <= by { (ay, by) } else { (by, ay) };
                         let r = egui::Rect::from_min_max(
@@ -2665,6 +2865,7 @@ impl eframe::App for ProCraftApp {
                             self.doc.clear_selection();
                             self.lasso_poly.clear();
                         }
+                        self.sel_edges_dirty = true;
                         self.lasso_points.clear();
                     }
                     self.painting = false;
@@ -3121,8 +3322,23 @@ fn main() {
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(icon);
     }
+    // Disk persistence for window rect, panel widths (by panel id), and
+    // the UI state saved in `App::save` (theme, panels, zoom).
+    #[cfg(not(target_os = "ios"))]
+    let persistence_path = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        .map(|mut dir| {
+            dir.push("procraft");
+            let _ = std::fs::create_dir_all(&dir);
+            dir.push("ui.json");
+            dir
+        });
+    #[cfg(target_os = "ios")]
+    let persistence_path = None;
     let options = eframe::NativeOptions {
         viewport,
+        persistence_path,
         ..Default::default()
     };
     let _ = eframe::run_native(

@@ -221,6 +221,9 @@ struct ProCraftApp {
     /// Canvas pan offset in screen px (two-finger drag on touch; the
     /// desktop scrolls the view with the wheel instead).
     view_offset: egui::Vec2,
+    /// Canvas rotation in radians (two-finger twist on touch, slider on
+    /// desktop). View-only like zoom/pan: paint math stays axis-aligned.
+    view_angle: f32,
     /// A stroke applied at least one dab (guards pinch-cancel revert).
     stroke_painted: bool,
     fill_tolerance: u8,
@@ -334,6 +337,7 @@ impl ProCraftApp {
             sel_edges: Vec::new(),
             sel_edges_dirty: true,
             view_offset: egui::Vec2::ZERO,
+            view_angle: 0.0,
             stroke_painted: false,
             fill_tolerance: 32,
             fill_preview: None,
@@ -950,11 +954,55 @@ fn downsample_half(full: &[u8], w: usize, h: usize) -> ColorImage {
     ColorImage::from_rgba_unmultiplied([hw, hh], &px)
 }
 
-/// Marching-ants rectangle: dark base line plus moving light dashes.
-fn paint_selection(painter: &egui::Painter, rect: egui::Rect, time: f64) {
+/// Rotate a screen point about a center (view rotation).
+fn rot_pt(p: egui::Pos2, c: egui::Pos2, ang: f32) -> egui::Pos2 {
+    let (s, co) = ang.sin_cos();
+    let (dx, dy) = (p.x - c.x, p.y - c.y);
+    egui::Pos2::new(c.x + dx * co - dy * s, c.y + dx * s + dy * co)
+}
+
+/// Inverse of [`rot_pt`] (screen back to the unrotated view).
+fn unrot_pt(p: egui::Pos2, c: egui::Pos2, ang: f32) -> egui::Pos2 {
+    rot_pt(p, c, -ang)
+}
+
+/// Textured quad for a rotated canvas view: `corners` are TL, TR, BR, BL
+/// with matching unit UVs, tinted (egui has no canvas transform, so the
+/// texture stays axis-aligned and the quad does the rotating).
+fn paint_textured_quad(
+    painter: &egui::Painter,
+    tex: egui::TextureId,
+    corners: [egui::Pos2; 4],
+    tint: Color32,
+) {
+    let uvs = [
+        egui::Pos2::new(0.0, 0.0),
+        egui::Pos2::new(1.0, 0.0),
+        egui::Pos2::new(1.0, 1.0),
+        egui::Pos2::new(0.0, 1.0),
+    ];
+    let mut mesh = egui::Mesh::with_texture(tex);
+    for (pos, uv) in corners.iter().zip(uvs) {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: *pos,
+            uv,
+            color: tint,
+        });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(mesh);
+}
+
+/// Marching-ants quad (a rectangle in an unrotated view): dark base line
+/// plus moving light dashes along the four corners in order.
+fn paint_selection(painter: &egui::Painter, corners: [egui::Pos2; 4], time: f64) {
     let dark = Color32::BLACK;
     let light = Color32::WHITE;
-    painter.rect_stroke(rect, 0.0, (1.5, dark), egui::StrokeKind::Outside);
+    for w in corners.windows(2) {
+        painter.line_segment([w[0], w[1]], (1.5, dark));
+    }
+    painter.line_segment([corners[3], corners[0]], (1.5, dark));
     let dash = 7.0;
     let gap = 5.0;
     let period = dash + gap;
@@ -973,10 +1021,10 @@ fn paint_selection(painter: &egui::Painter, rect: egui::Rect, time: f64) {
         }
         offset = (offset + len) % period;
     };
-    draw_dashed(rect.left_top(), rect.right_top());
-    draw_dashed(rect.right_top(), rect.right_bottom());
-    draw_dashed(rect.right_bottom(), rect.left_bottom());
-    draw_dashed(rect.left_bottom(), rect.left_top());
+    for w in corners.windows(2) {
+        draw_dashed(w[0], w[1]);
+    }
+    draw_dashed(corners[3], corners[0]);
 }
 
 /// Freehand path overlay: dark base plus light top, visible on any art.
@@ -1313,6 +1361,13 @@ impl eframe::App for ProCraftApp {
                 if ui.button("Fit").clicked() {
                     self.zoom = 0.0; // recomputed in the canvas view
                     self.view_offset = egui::Vec2::ZERO;
+                    self.view_angle = 0.0;
+                }
+                let mut deg = self.view_angle.to_degrees();
+                stepped_slider(ui, &mut deg, -180.0..=180.0, 1.0, "Rotate°");
+                self.view_angle = deg.to_radians();
+                if ui.button("Reset rotation").clicked() {
+                    self.view_angle = 0.0;
                 }
                 if ui.button("ⓘ About").clicked() {
                     self.show_about = !self.show_about;
@@ -2647,6 +2702,14 @@ impl eframe::App for ProCraftApp {
                     self.view_offset.x = self.view_offset.x.clamp(-cw + 60.0, avail.x - 60.0);
                     self.view_offset.y = self.view_offset.y.clamp(-ch + 60.0, avail.y - 60.0);
                 }
+                // Two-finger twist rotates the view about the canvas
+                // center (paint math stays axis-aligned).
+                if m.rotation_delta != 0.0 {
+                    self.view_angle += m.rotation_delta;
+                    if self.view_angle.abs() < 0.003 {
+                        self.view_angle = 0.0;
+                    }
+                }
             }
             // A gesture aborts any in-progress stroke or drag so pinching
             // never paints, selects, moves, or grabs. A partially painted
@@ -2681,14 +2744,32 @@ impl eframe::App for ProCraftApp {
                 // Pan applies to the drawn canvas and every overlay/mapping
                 // below (sizes are translation-invariant).
                 let rect = rect.translate(self.view_offset);
-                ui.painter().image(
+                // Rotation about the view center: canvas (x, y) maps through
+                // the unrotated rect, then spins into place.
+                let ang = self.view_angle;
+                let cc = rect.center();
+                let to_screen = |x: f32, y: f32| {
+                    rot_pt(
+                        egui::Pos2::new(rect.min.x + x * z, rect.min.y + y * z),
+                        cc,
+                        ang,
+                    )
+                };
+                paint_textured_quad(
+                    ui.painter(),
                     tex,
-                    rect,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                    [
+                        to_screen(0.0, 0.0),
+                        to_screen(w, 0.0),
+                        to_screen(w, h),
+                        to_screen(0.0, h),
+                    ],
                     Color32::WHITE,
                 );
-                let to_canvas =
-                    |pos: egui::Pos2| ((pos.x - rect.min.x) / z, (pos.y - rect.min.y) / z);
+                let to_canvas = |pos: egui::Pos2| {
+                    let q = unrot_pt(pos, cc, ang);
+                    ((q.x - rect.min.x) / z, (q.y - rect.min.y) / z)
+                };
                 let clamp_pt = |x: f32, y: f32| (x.clamp(0.0, w - 1.0), y.clamp(0.0, h - 1.0));
                 // Mirror axis overlay so the symmetry center is visible.
                 let axis_color = Color32::from_rgba_unmultiplied(220, 40, 40, 180);
@@ -2696,18 +2777,12 @@ impl eframe::App for ProCraftApp {
                     ui.painter().line_segment([a, b], (1.0, axis_color));
                 };
                 let (scx, scy) = self.doc.symmetry_center_px();
-                let center = egui::Pos2::new(rect.min.x + scx * z, rect.min.y + scy * z);
+                let center = to_screen(scx, scy);
                 let vline = || {
-                    axis(
-                        egui::Pos2::new(center.x, rect.min.y),
-                        egui::Pos2::new(center.x, rect.max.y),
-                    )
+                    axis(to_screen(scx, -8.0), to_screen(scx, h + 8.0));
                 };
                 let hline = || {
-                    axis(
-                        egui::Pos2::new(rect.min.x, center.y),
-                        egui::Pos2::new(rect.max.x, center.y),
-                    )
+                    axis(to_screen(-8.0, scy), to_screen(w + 8.0, scy));
                 };
                 match self.doc.symmetry {
                     SymmetryMode::Off => {}
@@ -2723,14 +2798,15 @@ impl eframe::App for ProCraftApp {
                         for k in 0..n {
                             let (s, c) = (k as f32 * std::f32::consts::PI / n as f32).sin_cos();
                             let dir = egui::Vec2::new(c * reach, s * reach);
-                            axis(center - dir, center + dir);
+                            axis(rot_pt(center + dir, cc, ang), rot_pt(center - dir, cc, ang));
                         }
                     }
                 }
                 // Mirror-center handle (draggable while Move center is
                 // armed; off-canvas parks on the edge like VP handles).
                 if self.doc.symmetry != SymmetryMode::Off {
-                    let (p, parked) = vp_handle_pos(rect, z, scx, scy);
+                    let (p0, parked) = vp_handle_pos(rect, z, scx, scy);
+                    let p = rot_pt(p0, cc, ang);
                     if parked {
                         let r = 10.0;
                         let diamond = vec![
@@ -2761,13 +2837,8 @@ impl eframe::App for ProCraftApp {
                     let alpha = (self.guides.opacity.clamp(0.05, 1.0) * 255.0).round() as u8;
                     let gc = Color32::from_rgba_unmultiplied(70, 130, 200, alpha);
                     for [x0, y0, x1, y1] in self.guides.overlay_lines(w, h) {
-                        ui.painter().line_segment(
-                            [
-                                egui::Pos2::new(rect.min.x + x0 * z, rect.min.y + y0 * z),
-                                egui::Pos2::new(rect.min.x + x1 * z, rect.min.y + y1 * z),
-                            ],
-                            (1.0, gc),
-                        );
+                        ui.painter()
+                            .line_segment([to_screen(x0, y0), to_screen(x1, y1)], (1.0, gc));
                     }
                 }
                 // Drawing Assist: the engaged lock draws bright while the
@@ -2777,10 +2848,7 @@ impl eframe::App for ProCraftApp {
                     let (tx, ty) = lock.through;
                     let (dx, dy) = (lock.dir.0 * reach, lock.dir.1 * reach);
                     ui.painter().line_segment(
-                        [
-                            egui::Pos2::new(rect.min.x + (tx - dx) * z, rect.min.y + (ty - dy) * z),
-                            egui::Pos2::new(rect.min.x + (tx + dx) * z, rect.min.y + (ty + dy) * z),
-                        ],
+                        [to_screen(tx - dx, ty - dy), to_screen(tx + dx, ty + dy)],
                         (1.5, Color32::from_rgb(255, 200, 60)),
                     );
                 }
@@ -2790,7 +2858,8 @@ impl eframe::App for ProCraftApp {
                 // stay reachable.
                 if matches!(self.guides.kind, GuideKind::OnePoint | GuideKind::TwoPoint) {
                     for (i, (vx, vy)) in self.guides.vp_list(w, h).iter().enumerate() {
-                        let (p, parked) = vp_handle_pos(rect, z, *vx, *vy);
+                        let (p0, parked) = vp_handle_pos(rect, z, *vx, *vy);
+                        let p = rot_pt(p0, cc, ang);
                         let grabbed = self.vp_grab == Some(i);
                         if parked {
                             let r = 10.0;
@@ -2823,21 +2892,37 @@ impl eframe::App for ProCraftApp {
                 // the page as frames change).
                 if self.anim_assist && self.onion && !self.view_mask && !self.anim_playing {
                     self.refresh_ghosts(&ctx);
-                    let full =
-                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0));
                     if let Some(tex) = &self.ghost_prev {
-                        ui.painter()
-                            .image(tex.id(), rect, full, Color32::from_rgb(255, 130, 130));
+                        paint_textured_quad(
+                            ui.painter(),
+                            tex.id(),
+                            [
+                                to_screen(0.0, 0.0),
+                                to_screen(w, 0.0),
+                                to_screen(w, h),
+                                to_screen(0.0, h),
+                            ],
+                            Color32::from_rgb(255, 130, 130),
+                        );
                     }
                     if let Some(tex) = &self.ghost_next {
-                        ui.painter()
-                            .image(tex.id(), rect, full, Color32::from_rgb(130, 165, 255));
+                        paint_textured_quad(
+                            ui.painter(),
+                            tex.id(),
+                            [
+                                to_screen(0.0, 0.0),
+                                to_screen(w, 0.0),
+                                to_screen(w, h),
+                                to_screen(0.0, h),
+                            ],
+                            Color32::from_rgb(130, 165, 255),
+                        );
                     }
                 }
                 // Text anchor crosshair while placing type.
                 if self.tool == Tool::Text {
                     if let Some((ax, ay)) = self.text_anchor {
-                        let p = egui::Pos2::new(rect.min.x + ax * z, rect.min.y + ay * z);
+                        let p = to_screen(ax, ay);
                         for (color, width) in [(Color32::BLACK, 3.0), (Color32::WHITE, 1.5)] {
                             ui.painter().line_segment(
                                 [
@@ -2863,7 +2948,7 @@ impl eframe::App for ProCraftApp {
                     let pts: Vec<egui::Pos2> = self
                         .lasso_poly
                         .iter()
-                        .map(|&(x, y)| egui::Pos2::new(rect.min.x + x * z, rect.min.y + y * z))
+                        .map(|&(x, y)| to_screen(x, y))
                         .collect();
                     paint_path(ui.painter(), &pts, true);
                 }
@@ -2878,9 +2963,7 @@ impl eframe::App for ProCraftApp {
                     paint_mask_edges(
                         ui.painter(),
                         &self.sel_edges,
-                        |x, y| {
-                            egui::Pos2::new(rect.min.x + x as f32 * z, rect.min.y + y as f32 * z)
-                        },
+                        |x, y| to_screen(x as f32, y as f32),
                         t,
                     );
                 }
@@ -2914,7 +2997,8 @@ impl eframe::App for ProCraftApp {
                             let mut best: Option<(usize, f32)> = None;
                             for (i, (vx, vy)) in self.guides.vp_list(w, h).iter().enumerate() {
                                 // Parked edge markers grab exactly where drawn.
-                                let (p, _) = vp_handle_pos(rect, z, *vx, *vy);
+                                let (p0, _) = vp_handle_pos(rect, z, *vx, *vy);
+                                let p = rot_pt(p0, cc, ang);
                                 let d = (p.x - pos.x).hypot(p.y - pos.y);
                                 if best.is_none_or(|(_, bd)| d < bd) {
                                     best = Some((i, d));
@@ -2948,7 +3032,8 @@ impl eframe::App for ProCraftApp {
                     if resp.drag_started() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let (scx, scy) = self.doc.symmetry_center_px();
-                            let (p, _) = vp_handle_pos(rect, z, scx, scy);
+                            let (p0, _) = vp_handle_pos(rect, z, scx, scy);
+                            let p = rot_pt(p0, cc, ang);
                             if (p.x - pos.x).hypot(p.y - pos.y) <= 28.0 {
                                 self.sym_grab = true;
                             }
@@ -3029,23 +3114,23 @@ impl eframe::App for ProCraftApp {
                             paint_mask_edges(
                                 ui.painter(),
                                 &self.sel_edges,
-                                |x, y| {
-                                    egui::Pos2::new(
-                                        rect.min.x + x as f32 * z,
-                                        rect.min.y + y as f32 * z,
-                                    )
-                                },
+                                |x, y| to_screen(x as f32, y as f32),
                                 t,
                             );
                         }
                     } else if let Some(((ax, ay), (bx, by))) = band {
                         let (x0, x1) = if ax <= bx { (ax, bx) } else { (bx, ax) };
                         let (y0, y1) = if ay <= by { (ay, by) } else { (by, ay) };
-                        let r = egui::Rect::from_min_max(
-                            egui::Pos2::new(rect.min.x + x0 * z, rect.min.y + y0 * z),
-                            egui::Pos2::new(rect.min.x + x1 * z, rect.min.y + y1 * z),
+                        paint_selection(
+                            ui.painter(),
+                            [
+                                to_screen(x0, y0),
+                                to_screen(x1, y0),
+                                to_screen(x1, y1),
+                                to_screen(x0, y1),
+                            ],
+                            ctx.input(|i| i.time),
                         );
-                        paint_selection(ui.painter(), r, ctx.input(|i| i.time));
                     }
                     self.painting = false;
                     self.last = None;
@@ -3079,7 +3164,7 @@ impl eframe::App for ProCraftApp {
                         let pts: Vec<egui::Pos2> = self
                             .lasso_points
                             .iter()
-                            .map(|&(x, y)| egui::Pos2::new(rect.min.x + x * z, rect.min.y + y * z))
+                            .map(|&(x, y)| to_screen(x, y))
                             .collect();
                         paint_path(ui.painter(), &pts, true);
                     }
@@ -3234,17 +3319,16 @@ impl eframe::App for ProCraftApp {
                     if let (Some((ax, ay)), Some((bx, by))) =
                         (self.shape_anchor, self.shape_current)
                     {
-                        let r = egui::Rect::from_min_max(
-                            egui::Pos2::new(
-                                rect.min.x + ax.min(bx) * z,
-                                rect.min.y + ay.min(by) * z,
-                            ),
-                            egui::Pos2::new(
-                                rect.min.x + ax.max(bx) * z,
-                                rect.min.y + ay.max(by) * z,
-                            ),
+                        paint_selection(
+                            ui.painter(),
+                            [
+                                to_screen(ax.min(bx), ay.min(by)),
+                                to_screen(ax.max(bx), ay.min(by)),
+                                to_screen(ax.max(bx), ay.max(by)),
+                                to_screen(ax.min(bx), ay.max(by)),
+                            ],
+                            ctx.input(|i| i.time),
                         );
-                        paint_selection(ui.painter(), r, ctx.input(|i| i.time));
                     }
                     if resp.drag_stopped() {
                         if let (Some((ax, ay)), Some((bx, by))) =

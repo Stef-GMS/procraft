@@ -12,20 +12,20 @@ people touch daily. Ranked by user-visible value per effort.
 - Batch 1 (PC check #1): M23–M27. Batch 2 (PC check #2 + iPad check #1):
   M28–M32 (exact slice decided at M27).
 
-## Batch 1: M23–M27
+## Batch 1: M23–M27 (done, awaiting PC check #1)
 
-- [ ] **M23 — Layer groups + group ops.** Model (nested groups with
-  visible flag), panel tree UI (collapse, rename, visibility, disband),
-  project-file persistence with backward-compat open. Deferred: group
-  opacity, PSD group round-trip (documented gaps).
-- [ ] **M24 — Smudge tool.** Finger/glove smear riding existing dab
-  machinery (pick-up + push mixing), strength slider.
-- [ ] **M25 — Canvas rotate.** Rotation gesture + slider + reset; overlays
-  and mapping follow (same pattern as pan offset).
-- [ ] **M26 — Finger-tap gestures.** Two-finger tap = undo, three-finger
-  tap = redo (standard muscle memory).
-- [ ] **M27 — Autosave + crash recovery.** Periodic snapshot to a recovery
-  file, restore prompt on launch. **→ PC checkpoint #1.**
+- [x] **M23 — Layer groups + group ops.** Nested model with effective
+  visibility, panel tree (collapse/eye/rename/+Add/Ungroup), v8 format
+  with v1–v7 compat open. Deferred: group opacity, PSD group round-trip.
+- [x] **M24 — Smudge tool.** Core-biased finger pickup, stroke walker,
+  Strength slider, mask-target hint.
+- [x] **M25 — Canvas rotate.** Twist gesture + slider/Reset, GPU-rotated
+  mesh view, all overlays mapped (ants march rotated edges).
+- [x] **M26 — Finger-tap gestures.** Two-finger tap undo, three-finger
+  tap redo (clean quick release only).
+- [x] **M27 — Autosave + crash recovery.** Silent v8 snapshot every
+  120 s, centered Recover/Discard prompt, cleared on save/load/clean
+  exit. **→ PC checkpoint #1 (you are here).**
 
 ## P0 backlog (batches 2–3)
 

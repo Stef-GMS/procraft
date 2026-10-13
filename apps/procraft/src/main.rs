@@ -238,6 +238,11 @@ struct ProCraftApp {
     stroke_painted: bool,
     /// Multi-finger tap in progress (two = undo, three = redo on release).
     tap_track: Option<TapTrack>,
+    /// Autosave recovery file (v8 project snapshot every 120 s) plus the
+    /// last write time and whether to offer it at startup.
+    recovery_path: std::path::PathBuf,
+    last_autosave: f64,
+    recovery_offer: bool,
     fill_tolerance: u8,
     fill_preview: Option<FillPreview>,
     smudge_strength: f32,
@@ -325,6 +330,17 @@ impl ProCraftApp {
             }
         }
         cc.egui_ctx.set_fonts(fonts);
+        // Autosave recovery lives next to the UI state (created eagerly
+        // so a crash in the first two minutes still offers recovery only
+        // if a snapshot actually landed).
+        let mut dir = std::env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        dir.push("procraft");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.push("recovery.pcraft");
+        let recovery_path = dir;
         let mut app = Self {
             doc: Document::new(1280, 800),
             brush: Brush::default(),
@@ -352,6 +368,9 @@ impl ProCraftApp {
             view_angle: 0.0,
             stroke_painted: false,
             tap_track: None,
+            recovery_path: recovery_path.clone(),
+            last_autosave: 0.0,
+            recovery_offer: std::path::Path::new(&recovery_path).exists(),
             fill_tolerance: 32,
             fill_preview: None,
             smudge_strength: 0.5,
@@ -619,6 +638,7 @@ impl ProCraftApp {
             PendingOpen::Project => match Document::open_project(&path) {
                 Ok(doc) => {
                     self.doc = doc;
+                    self.clear_recovery();
                     self.texture = None;
                     self.lasso_points.clear();
                     self.lasso_poly.clear();
@@ -629,6 +649,7 @@ impl ProCraftApp {
             PendingOpen::Psd => match open_psd(&path) {
                 Ok(doc) => {
                     self.doc = doc;
+                    self.clear_recovery();
                     self.texture = None;
                     self.lasso_points.clear();
                     self.lasso_poly.clear();
@@ -851,6 +872,7 @@ impl ProCraftApp {
     /// playback so the first frame shows at once.
     fn adopt_gif(&mut self, doc: Document, fps: u32) {
         self.doc = doc;
+        self.clear_recovery();
         self.anim_fps = fps;
         self.anim_assist = true;
         self.anim_playing = false;
@@ -860,6 +882,12 @@ impl ProCraftApp {
         self.texture = None;
         self.lasso_points.clear();
         self.lasso_poly.clear();
+    }
+
+    /// Best-effort delete of the autosave recovery file (after an explicit
+    /// save, load, or clean exit — anything that makes it stale).
+    fn clear_recovery(&self) {
+        let _ = std::fs::remove_file(&self.recovery_path);
     }
 }
 
@@ -1083,7 +1111,11 @@ fn paint_mask_edges(
 impl eframe::App for ProCraftApp {
     /// Persist UI state to disk (theme, panel visibility, zoom). Window
     /// rect and panel widths persist via eframe once `persistence_path`
-    /// is set in `main`.
+    /// is set in `main`. Runs on clean exit (and iOS backgrounding), so
+    /// the recovery file is dropped here: anything still on disk next
+    /// launch means the session actually crashed. (iOS caveat: background
+    /// suspension also clears it, so a later kill loses the tail — the
+    /// 120 s cadence bounds that window.)
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("theme", self.theme.as_str().to_string());
         storage.set_string(
@@ -1095,6 +1127,7 @@ impl eframe::App for ProCraftApp {
             if self.show_layers { "1" } else { "0" }.to_string(),
         );
         storage.set_string("zoom", self.zoom.to_string());
+        self.clear_recovery();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1174,6 +1207,18 @@ impl eframe::App for ProCraftApp {
                         }
                         _ => {}
                     }
+                }
+            }
+        }
+        // Autosave: silent v8 snapshot every 120 s (unconditional — a few
+        // ms on typical canvases, and no change can slip through dirty
+        // tracking). Failures surface once in the status line.
+        {
+            let now = ui.ctx().input(|i| i.time);
+            if now - self.last_autosave >= 120.0 {
+                self.last_autosave = now;
+                if let Err(e) = self.doc.save_project(&self.recovery_path) {
+                    self.status = format!("Autosave failed: {e}");
                 }
             }
         }
@@ -1303,6 +1348,7 @@ impl eframe::App for ProCraftApp {
                         match self.doc.save_project(&path) {
                             Ok(()) => {
                                 self.status = format!("Project saved {}", path.display());
+                                self.clear_recovery();
                                 #[cfg(target_os = "ios")]
                                 rfd::ios_share_file(&path);
                             }
@@ -1319,6 +1365,7 @@ impl eframe::App for ProCraftApp {
                         match Document::open_project(&path) {
                             Ok(doc) => {
                                 self.doc = doc;
+                                self.clear_recovery();
                                 self.texture = None;
                                 self.lasso_points.clear();
                                 self.lasso_poly.clear();
@@ -1364,6 +1411,7 @@ impl eframe::App for ProCraftApp {
                         match open_psd(&path) {
                             Ok(doc) => {
                                 self.doc = doc;
+                                self.clear_recovery();
                                 self.texture = None;
                                 self.lasso_points.clear();
                                 self.lasso_poly.clear();
@@ -1424,6 +1472,47 @@ impl eframe::App for ProCraftApp {
                 }
             });
         });
+
+        // Recovery prompt: a previous session died with unsaved work.
+        if self.recovery_offer {
+            let mut open = self.recovery_offer;
+            egui::Window::new("Unsaved work found")
+                .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .resizable(false)
+                .collapsible(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("The last session ended without saving. Recover the autosave?");
+                    ui.horizontal(|ui| {
+                        if ui.button("Recover").clicked() {
+                            match Document::open_project(&self.recovery_path) {
+                                Ok(doc) => {
+                                    self.doc = doc;
+                                    self.texture = None;
+                                    self.ghost_dirty = true;
+                                    self.anim_playing = false;
+                                    self.anim_shown = None;
+                                    self.lasso_points.clear();
+                                    self.lasso_poly.clear();
+                                    self.sel_edges_dirty = true;
+                                    self.status = "Recovered autosave.".to_string();
+                                }
+                                Err(e) => {
+                                    self.clear_recovery();
+                                    self.status = format!("Recovery file was corrupt ({e}).");
+                                }
+                            }
+                            self.recovery_offer = false;
+                        }
+                        if ui.button("Discard").clicked() {
+                            self.clear_recovery();
+                            self.recovery_offer = false;
+                            self.status = "Recovery discarded.".to_string();
+                        }
+                    });
+                });
+            self.recovery_offer = open;
+        }
 
         // About box: version, builder, home page, updates. Version comes
         // from the workspace Cargo.toml at compile time, so release bumps

@@ -9,11 +9,12 @@ use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptio
 #[cfg(target_os = "ios")]
 use rfd_shim as rfd;
 use procraft_engine::{
-    BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides, PaintTarget, Palette,
-    ShapePoly, SymmetryMode, MAX_ANIM_FPS, MAX_LIBRARY_BRUSHES, MAX_PALETTE_COLORS, MIN_ANIM_FPS, analogous,
-    clamp_frame, complementary, export_gif, export_tip_png, import_brush_file, import_gpl_file, next_frame,
-    onion_ghost, open_brush_library, open_palette, open_psd, prev_frame, rasterize_frame,
-    rasterize_frame_region, save_brush_library, save_palette, save_psd, starter_palette, triadic, MIN_TEXT_PX,
+    BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides, LoopMode, PaintTarget,
+    Palette, PaletteSet, ShapePoly, SymmetryMode, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_LIBRARY_BRUSHES,
+    MAX_PALETTES, MAX_PALETTE_COLORS, MIN_ANIM_FPS, MIN_ANIM_HOLD, analogous, clamp_frame, complementary,
+    export_gif_ext, export_tip_png, import_brush_file, import_gif_document, import_gpl_file, next_frame, onion_ghost,
+    open_brush_library, open_palette, open_psd, prev_frame, rasterize_frame, rasterize_frame_region,
+    save_brush_library, save_palette, save_psd, starter_palette, step_playback_visible, triadic, MIN_TEXT_PX,
 };
 
 /// Latest Apple Pencil / touch pressure (0.0..=1.0) seen in this frame's
@@ -92,6 +93,28 @@ impl ShapeKind {
     }
 }
 
+/// Live ColorDrop preview: the pre-fill layer snapshot plus the drag
+/// geometry, so each tolerance update restores and re-fills from the same
+/// seed (one undo step for the whole gesture).
+struct FillPreview {
+    layer: usize,
+    seed: (u32, u32),
+    pixels: Vec<u8>,
+    start_x: f32,
+    start_tol: u8,
+    applied: u8,
+}
+
+/// Live filter preview baseline: scrubbing a filter slider restores these
+/// pixels then re-applies the slider value, so a whole preview gesture
+/// costs one undo step instead of compounding per change.
+struct FilterPreview {
+    /// 0 = tone, 1 = blur, 2 = sharpen.
+    kind: u8,
+    layer: usize,
+    pixels: Vec<u8>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Theme {
     Dark,
@@ -108,6 +131,7 @@ enum PendingOpen {
     Psd,
     Brushes,
     Palette,
+    Gif,
 }
 
 impl Theme {
@@ -167,6 +191,8 @@ struct ProCraftApp {
     lasso_points: Vec<(f32, f32)>,
     lasso_poly: Vec<(f32, f32)>,
     fill_tolerance: u8,
+    fill_preview: Option<FillPreview>,
+    filter_preview: Option<FilterPreview>,
     filt_brightness: i32,
     filt_contrast: f32,
     filt_blur: i32,
@@ -184,8 +210,14 @@ struct ProCraftApp {
     preview_theme: Option<Theme>,
     custom_brushes: Vec<BrushPreset>,
     new_brush_name: String,
-    custom_colors: Vec<[u8; 3]>,
+    palettes: PaletteSet,
+    pal_renaming: bool,
+    pal_name_edit: String,
     guides: Guides,
+    vp_move: bool,
+    vp_grab: Option<usize>,
+    sym_move: bool,
+    sym_grab: bool,
     // Animation Assist: layers are frames (bottom-to-top), the active
     // layer is the current frame. Ghost handles are half-res overlays,
     // rebuilt when the neighbor pair changes or `ghost_dirty` is set by
@@ -194,6 +226,9 @@ struct ProCraftApp {
     anim_assist: bool,
     anim_playing: bool,
     anim_fps: u32,
+    anim_loop: LoopMode,
+    anim_hold: u32,
+    anim_fwd: bool,
     anim_last_t: f64,
     anim_shown: Option<usize>,
     onion: bool,
@@ -254,6 +289,8 @@ impl ProCraftApp {
             lasso_points: Vec::new(),
             lasso_poly: Vec::new(),
             fill_tolerance: 32,
+            fill_preview: None,
+            filter_preview: None,
             filt_brightness: 0,
             filt_contrast: 100.0,
             filt_blur: 0,
@@ -271,11 +308,20 @@ impl ProCraftApp {
             preview_theme: None,
             custom_brushes: Vec::new(),
             new_brush_name: String::new(),
-            custom_colors: Vec::new(),
+            palettes: PaletteSet::new(),
+            pal_renaming: false,
+            pal_name_edit: String::new(),
             guides: Guides::default(),
+            vp_move: false,
+            vp_grab: None,
+            sym_move: false,
+            sym_grab: false,
             anim_assist: false,
             anim_playing: false,
             anim_fps: 12,
+            anim_loop: LoopMode::Forward,
+            anim_hold: 1,
+            anim_fwd: true,
             anim_last_t: 0.0,
             anim_shown: None,
             onion: true,
@@ -444,6 +490,21 @@ impl ProCraftApp {
                 Ok(pal) => self.status = self.absorb_colors(pal, &path),
                 Err(e) => self.status = format!("Palette import failed: {e}"),
             },
+            PendingOpen::Gif => match std::fs::read(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|b| import_gif_document(&b))
+            {
+                Ok((doc, fps)) => {
+                    self.status = format!(
+                        "GIF imported {} ({} frames, {} fps).",
+                        path.display(),
+                        doc.layers.len(),
+                        fps
+                    );
+                    self.adopt_gif(doc, fps);
+                }
+                Err(e) => self.status = format!("GIF import failed: {e}"),
+            },
         }
     }
 
@@ -546,21 +607,139 @@ impl ProCraftApp {
         format!("Imported {added} brushes from {}.", path.display())
     }
 
-    /// Append an imported palette's swatches, skipping exact duplicates
-    /// (shared by desktop Import and the iOS picker resolve path).
+    /// Append an imported palette's swatches to the active palette,
+    /// skipping exact duplicates (shared by desktop Import and the iOS
+    /// picker resolve path).
     fn absorb_colors(&mut self, pal: Palette, path: &std::path::Path) -> String {
         let mut added = 0;
-        for c in pal.colors {
-            if self.custom_colors.len() >= MAX_PALETTE_COLORS {
-                break;
-            }
-            if !self.custom_colors.contains(&c) {
-                self.custom_colors.push(c);
-                added += 1;
+        if let Some(active) = self.palettes.active_mut() {
+            for c in pal.colors {
+                if active.colors.len() >= MAX_PALETTE_COLORS {
+                    break;
+                }
+                if !active.colors.contains(&c) {
+                    active.colors.push(c);
+                    added += 1;
+                }
             }
         }
         format!("Imported {added} swatches from {}.", path.display())
     }
+
+    /// Scrub a filter slider with a live preview: checkpoint + snapshot on
+    /// first touch, then restore-and-reapply on every change, so the whole
+    /// gesture is one undo step and values never compound. `kind` selects
+    /// the baseline slot (0 = tone, 1 = blur, 2 = sharpen); a changed
+    /// layer (or mismatched pixels after undo/layer edits) restarts it.
+    fn filter_scrub(&mut self, kind: u8, apply: impl Fn(&mut Document, usize)) {
+        let layer = self.doc.active;
+        let fresh = match &self.filter_preview {
+            Some(fp) => {
+                fp.kind != kind
+                    || fp.layer != layer
+                    || self.doc.layers.get(layer).map_or(true, |l| l.pixels.len() != fp.pixels.len())
+            }
+            None => true,
+        };
+        if fresh {
+            self.doc.checkpoint();
+            match self.doc.layers.get(layer) {
+                Some(l) => {
+                    self.filter_preview =
+                        Some(FilterPreview { kind, layer, pixels: l.pixels.clone() });
+                }
+                None => {
+                    self.filter_preview = None;
+                    return;
+                }
+            }
+        }
+        if let Some(fp) = self.filter_preview.take() {
+            if self.doc.layers.get(fp.layer).is_some() {
+                if let Some(l) = self.doc.layers.get_mut(fp.layer) {
+                    l.pixels = fp.pixels.clone();
+                }
+                apply(&mut self.doc, fp.layer);
+                self.filter_preview = Some(fp);
+            }
+        }
+    }
+
+    /// Adopt an imported GIF as the document (one layer per frame, active
+    /// on frame 1): enables Assist and resets the view, ghosts and
+    /// playback so the first frame shows at once.
+    fn adopt_gif(&mut self, doc: Document, fps: u32) {
+        self.doc = doc;
+        self.anim_fps = fps;
+        self.anim_assist = true;
+        self.anim_playing = false;
+        self.anim_fwd = true;
+        self.anim_shown = None;
+        self.ghost_dirty = true;
+        self.texture = None;
+        self.lasso_points.clear();
+        self.lasso_poly.clear();
+    }
+}
+
+/// Screen position of a vanishing-point handle: the true point when it is
+/// on-canvas, otherwise clamped to the canvas edge (with a margin) so
+/// off-canvas VPs — like the 2-point defaults — stay visible and grabbable.
+/// Returns the position plus whether it was clamped.
+fn vp_handle_pos(rect: egui::Rect, z: f32, vx: f32, vy: f32) -> (egui::Pos2, bool) {
+    let p = egui::Pos2::new(rect.min.x + vx * z, rect.min.y + vy * z);
+    if rect.contains(p) {
+        return (p, false);
+    }
+    // Clamp into the rect with a finger-sized margin; degenerate tiny
+    // rects fall back to the center instead of panicking in `clamp`.
+    let m = 14.0;
+    let (lo_x, hi_x) = (rect.min.x + m, rect.max.x - m);
+    let (lo_y, hi_y) = (rect.min.y + m, rect.max.y - m);
+    let cx = if lo_x <= hi_x {
+        p.x.clamp(lo_x, hi_x)
+    } else {
+        (rect.min.x + rect.max.x) * 0.5
+    };
+    let cy = if lo_y <= hi_y {
+        p.y.clamp(lo_y, hi_y)
+    } else {
+        (rect.min.y + rect.max.y) * 0.5
+    };
+    (egui::Pos2::new(cx, cy), true)
+}
+
+/// Slider with −/+ micro-step buttons (touch-sized nudges for values a
+/// finger drag overshoots). `step` is in value units; endpoints clamp.
+fn stepped_slider<Num: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+    step: f64,
+    text: &str,
+) {
+    let lo = range.start().to_f64();
+    let hi = range.end().to_f64();
+    ui.horizontal(|ui| {
+        if ui.small_button("−").clicked() {
+            *value = Num::from_f64((value.to_f64() - step).clamp(lo, hi));
+        }
+        ui.add(egui::Slider::new(value, range).text(text));
+        if ui.small_button("+").clicked() {
+            *value = Num::from_f64((value.to_f64() + step).clamp(lo, hi));
+        }
+    });
+}
+
+/// Swatch grid at full height (never an inner scroller — the panel's own
+/// scroll handles overflow, and separate scrollers with no explicit ids
+/// share one scroll offset). Wrap width is pinned to 8 swatches per row
+/// so Starter always lands 3x8 at any panel width.
+fn swatch_grid(ui: &mut egui::Ui, mut add_contents: impl FnMut(&mut egui::Ui)) {
+    ui.scope(|ui| {
+        ui.set_max_width(8.0 * 27.0 + 8.0);
+        add_contents(ui);
+    });
 }
 
 /// One clickable swatch: applies the color. Returns the response for
@@ -701,9 +880,18 @@ impl eframe::App for ProCraftApp {
             ui.ctx().request_repaint();
             let now = ui.ctx().input(|i| i.time);
             let fps = self.anim_fps.clamp(MIN_ANIM_FPS, MAX_ANIM_FPS);
-            if now - self.anim_last_t >= 1.0 / fps as f64 {
+            let hold = self.anim_hold.clamp(MIN_ANIM_HOLD, MAX_ANIM_HOLD);
+            if now - self.anim_last_t >= hold as f64 / fps as f64 {
                 self.anim_last_t = now;
-                self.doc.active = (self.doc.active + 1) % self.doc.layers.len();
+                // Visible frames only, so playback matches the GIF export.
+                let (next, fwd) = step_playback_visible(
+                    &self.doc,
+                    self.doc.active,
+                    self.anim_fwd,
+                    self.anim_loop,
+                );
+                self.doc.active = next;
+                self.anim_fwd = fwd;
             }
         }
 
@@ -908,6 +1096,7 @@ impl eframe::App for ProCraftApp {
         if self.show_about {
             egui::Window::new("About ProCraft")
                 .open(&mut self.show_about)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .resizable(false)
                 .collapsible(false)
                 .show(ui.ctx(), |ui| {
@@ -942,9 +1131,7 @@ impl eframe::App for ProCraftApp {
                             .desired_rows(3)
                             .hint_text("Type here (Enter = new line)"),
                     );
-                    ui.add(
-                        egui::Slider::new(&mut self.text_size, MIN_TEXT_PX..=128.0).text("Size px"),
-                    );
+                    stepped_slider(ui, &mut self.text_size, MIN_TEXT_PX..=128.0, 1.0, "Size px");
                     ui.horizontal(|ui| {
                         if ui.button("Render").clicked() {
                             match self.text_anchor {
@@ -973,10 +1160,13 @@ impl eframe::App for ProCraftApp {
             self.text_open = open;
         }
 
-        // Fresh id (not "tools"): eframe persists panel widths to disk, and the
-        // old narrow width would otherwise override `default_size` forever.
+        // Fresh id per width era ("tools" -> "tools-wide" -> here): eframe
+        // persists panel widths by id, so a new id starts at `default_size`
+        // while any saved width stays buried under the old id. No max clamp:
+        // the panel stays freely resizable, it just starts compact (swatch
+        // grids wrap to ~3 rows, page gets the room).
         if self.show_tools {
-        egui::Panel::left("tools-wide").default_size(300.0).show(ui, |ui| {
+        egui::Panel::left("tools-compact").default_size(240.0).show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Tool");
@@ -995,7 +1185,8 @@ impl eframe::App for ProCraftApp {
             ui.radio_value(&mut self.tool, Tool::Shapes, "○ Shapes");
             ui.radio_value(&mut self.tool, Tool::Text, "T Text");
             if self.tool == Tool::Fill {
-                ui.add(egui::Slider::new(&mut self.fill_tolerance, 0..=255).text("Tolerance"));
+                stepped_slider(ui, &mut self.fill_tolerance, 0..=255, 1.0, "Tolerance");
+                ui.label("Tap fills; hold + drag sideways to sweep tolerance.");
             }
             if self.tool == Tool::Shapes {
                 ui.horizontal_wrapped(|ui| {
@@ -1007,7 +1198,7 @@ impl eframe::App for ProCraftApp {
                     ui.checkbox(&mut self.shape_fill, "Fill");
                 }
                 if self.shape_kind == ShapeKind::Polygon {
-                    ui.add(egui::Slider::new(&mut self.shape_sides, 3..=12).text("Sides"));
+                    stepped_slider(ui, &mut self.shape_sides, 3..=12, 1.0, "Sides");
                 }
             }
             if ui.button("Clear selection").clicked() {
@@ -1188,7 +1379,7 @@ impl eframe::App for ProCraftApp {
             ui.heading("Color");
             ui.horizontal(|ui| {
                 ui.label("Picker size:");
-                ui.add(egui::Slider::new(&mut self.picker_size, 140.0..=420.0).text("px"));
+                stepped_slider(ui, &mut self.picker_size, 140.0..=420.0, 5.0, "px");
             });
             let mut c = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
             // The SV square + hue strip size themselves from `slider_width`,
@@ -1207,44 +1398,107 @@ impl eframe::App for ProCraftApp {
             ui.separator();
             ui.heading("Swatches");
             ui.label("Starter (click applies):");
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
-                for rgb in starter_palette().colors {
-                    let resp = swatch_button(ui, rgb, self.color == rgb);
-                    if resp.clicked() {
-                        self.color = rgb;
-                    }
-                }
-            });
-            ui.label("My colors (click applies, right-click removes):");
-            if self.custom_colors.is_empty() {
-                ui.label("Empty — store the current color with +.");
-            } else {
-                let mut remove = None;
+            swatch_grid(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
-                    for (idx, rgb) in self.custom_colors.iter().enumerate() {
-                        let resp = swatch_button(ui, *rgb, self.color == *rgb);
+                    for rgb in starter_palette().colors {
+                        let resp = swatch_button(ui, rgb, self.color == rgb);
                         if resp.clicked() {
-                            self.color = *rgb;
-                        }
-                        if resp.secondary_clicked() {
-                            remove = Some(idx);
+                            self.color = rgb;
                         }
                     }
                 });
+            });
+            // Wrapped (not horizontal): long palette names must fold here
+            // instead of forcing the whole panel wider.
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Palettes:");
+                let n = self.palettes.palettes.len();
+                if ui.button("◀").clicked() && n > 0 {
+                    self.palettes.set_active((self.palettes.active + n - 1) % n);
+                }
+                let (pname, pcount) = self
+                    .palettes
+                    .active()
+                    .map(|p| (p.name.clone(), p.colors.len()))
+                    .unwrap_or_else(|| ("-".to_string(), 0));
+                ui.label(format!("{pname} ({}/{} · {} swatches)", self.palettes.active + 1, n, pcount));
+                if ui.button("▶").clicked() && n > 0 {
+                    self.palettes.set_active((self.palettes.active + 1) % n);
+                }
+                if ui.add_enabled(n < MAX_PALETTES, egui::Button::new("+ New")).clicked() {
+                    let name = self.palettes.unique_name("Palette");
+                    match self.palettes.add(&name) {
+                        Ok(_) => self.status = format!("Palette {name} added."),
+                        Err(e) => self.status = format!("Palette not added: {e}"),
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if !self.pal_renaming {
+                    if ui.button("Rename").clicked() {
+                        self.pal_name_edit =
+                            self.palettes.active().map(|p| p.name.clone()).unwrap_or_default();
+                        self.pal_renaming = true;
+                    }
+                    if ui.button("Delete").clicked() {
+                        let idx = self.palettes.active;
+                        let name =
+                            self.palettes.active().map(|p| p.name.clone()).unwrap_or_default();
+                        self.palettes.remove(idx);
+                        self.status = format!("Palette {name} deleted.");
+                    }
+                } else {
+                    ui.text_edit_singleline(&mut self.pal_name_edit);
+                    if ui.button("Save").clicked() {
+                        let idx = self.palettes.active;
+                        let edit = self.pal_name_edit.clone();
+                        match self.palettes.rename(idx, &edit) {
+                            Ok(()) => {
+                                self.pal_renaming = false;
+                                self.status = format!("Palette renamed {edit}.");
+                            }
+                            Err(e) => self.status = format!("Rename failed: {e}"),
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.pal_renaming = false;
+                    }
+                }
+            });
+            ui.label("Active palette (click applies, right-click removes):");
+            let swatches =
+                self.palettes.active().map(|p| p.colors.clone()).unwrap_or_default();
+            if swatches.is_empty() {
+                ui.label("Empty — store the current color with +.");
+            } else {
+                let mut remove = None;
+                swatch_grid(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                        for (idx, rgb) in swatches.iter().enumerate() {
+                            let resp = swatch_button(ui, *rgb, self.color == *rgb);
+                            if resp.clicked() {
+                                self.color = *rgb;
+                            }
+                            if resp.secondary_clicked() {
+                                remove = Some(idx);
+                            }
+                        }
+                    });
+                });
                 if let Some(idx) = remove {
-                    self.custom_colors.remove(idx);
+                    self.palettes.remove_color(idx);
                 }
             }
             ui.horizontal(|ui| {
                 if ui.button("+ Current").clicked() {
-                    if self.custom_colors.contains(&self.color) {
+                    if swatches.contains(&self.color) {
                         self.status = "That color is already stored.".to_string();
-                    } else if self.custom_colors.len() >= MAX_PALETTE_COLORS {
+                    } else if swatches.len() >= MAX_PALETTE_COLORS {
                         self.status = format!("Swatch set is full ({MAX_PALETTE_COLORS}).");
                     } else {
-                        self.custom_colors.push(self.color);
+                        let _ = self.palettes.push_color(self.color);
                         self.status = "Color stored.".to_string();
                     }
                 }
@@ -1274,7 +1528,10 @@ impl eframe::App for ProCraftApp {
                         .save_file()
                     {
                         let path = ensure_extension(path, "pcpalette");
-                        let pal = Palette { name: "My colors".to_string(), colors: self.custom_colors.clone() };
+                        let pal = self.palettes.active().cloned().unwrap_or(Palette {
+                            name: "My colors".to_string(),
+                            colors: Vec::new(),
+                        });
                         match save_palette(&path, &pal) {
                             Ok(()) => {
                                 self.status = format!("Palette saved {}", path.display());
@@ -1286,49 +1543,51 @@ impl eframe::App for ProCraftApp {
                     }
                 }
                 if ui.button("Clear").clicked() {
-                    self.custom_colors.clear();
-                    self.status = "Swatch set cleared.".to_string();
+                    self.palettes.clear_active();
+                    self.status = "Active palette cleared.".to_string();
                 }
             });
             ui.label("Harmony of the current color (click applies):");
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
-                let cur = self.color;
-                let mut harmonies = vec![complementary(cur)];
-                harmonies.extend(triadic(cur));
-                harmonies.extend(analogous(cur));
-                for rgb in harmonies {
-                    if swatch_button(ui, rgb, self.color == rgb).clicked() {
-                        self.color = rgb;
+            swatch_grid(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                    let cur = self.color;
+                    let mut harmonies = vec![complementary(cur)];
+                    harmonies.extend(triadic(cur));
+                    harmonies.extend(analogous(cur));
+                    for rgb in harmonies {
+                        if swatch_button(ui, rgb, self.color == rgb).clicked() {
+                            self.color = rgb;
+                        }
                     }
-                }
+                });
             });
             ui.separator();
-            ui.add(egui::Slider::new(&mut self.brush.size, 1.0..=200.0).text("Size"));
-            ui.add(egui::Slider::new(&mut self.brush.opacity, 0.05..=1.0).text("Opacity"));
-            ui.add(egui::Slider::new(&mut self.brush.softness, 0.0..=1.0).text("Softness"));
-            ui.add(egui::Slider::new(&mut self.brush.spacing, 0.05..=1.0).text("Spacing"));
+            stepped_slider(ui, &mut self.brush.size, 1.0..=200.0, 1.0, "Size");
+            stepped_slider(ui, &mut self.brush.opacity, 0.05..=1.0, 0.05, "Opacity");
+            stepped_slider(ui, &mut self.brush.softness, 0.0..=1.0, 0.05, "Softness");
+            stepped_slider(ui, &mut self.brush.spacing, 0.05..=1.0, 0.05, "Spacing");
             ui.collapsing("Pressure (touch / Pencil)", |ui| {
-                ui.add(egui::Slider::new(&mut self.brush.pressure_size, 0.0..=1.0).text("Size"));
-                ui.add(egui::Slider::new(&mut self.brush.pressure_opacity, 0.0..=1.0).text("Opacity"));
+                stepped_slider(ui, &mut self.brush.pressure_size, 0.0..=1.0, 0.05, "Size");
+                stepped_slider(ui, &mut self.brush.pressure_opacity, 0.0..=1.0, 0.05, "Opacity");
                 ui.label("Mouse has no pressure sensor: it paints at full pressure.");
             });
             ui.collapsing("Velocity", |ui| {
-                ui.add(egui::Slider::new(&mut self.brush.velocity_size, 0.0..=1.0).text("Thin"));
-                ui.add(egui::Slider::new(&mut self.brush.velocity_opacity, 0.0..=1.0).text("Fade"));
+                stepped_slider(ui, &mut self.brush.velocity_size, 0.0..=1.0, 0.05, "Thin");
+                stepped_slider(ui, &mut self.brush.velocity_opacity, 0.0..=1.0, 0.05, "Fade");
                 ui.label("Fast moves thin and fade (this is the old Dynamics, split).");
             });
             ui.collapsing("Texture", |ui| {
-                ui.add(egui::Slider::new(&mut self.brush.grain, 0.0..=1.0).text("Grain"));
-                ui.add(egui::Slider::new(&mut self.brush.grain_scale, 0.25..=4.0).text("Grain size"));
+                stepped_slider(ui, &mut self.brush.grain, 0.0..=1.0, 0.05, "Grain");
+                stepped_slider(ui, &mut self.brush.grain_scale, 0.25..=4.0, 0.05, "Grain size");
             });
             ui.collapsing("Dab shape", |ui| {
-                ui.add(egui::Slider::new(&mut self.brush.roundness, 0.1..=1.0).text("Roundness"));
+                stepped_slider(ui, &mut self.brush.roundness, 0.1..=1.0, 0.05, "Roundness");
                 ui.checkbox(&mut self.brush.angle_follow, "Follow direction");
-                ui.add(egui::Slider::new(&mut self.brush.scatter, 0.0..=1.0).text("Scatter"));
+                stepped_slider(ui, &mut self.brush.scatter, 0.0..=1.0, 0.05, "Scatter");
             });
             ui.collapsing("Smoothing", |ui| {
-                ui.add(egui::Slider::new(&mut self.brush.stabilizer, 0.0..=1.0).text("Stabilizer"));
+                stepped_slider(ui, &mut self.brush.stabilizer, 0.0..=1.0, 0.05, "Stabilizer");
             });
             ui.separator();
             ui.heading("Page");
@@ -1345,26 +1604,45 @@ impl eframe::App for ProCraftApp {
             }
             ui.separator();
             ui.heading("Guides");
+            let mut kind_changed = false;
             ui.horizontal_wrapped(|ui| {
                 for k in GuideKind::ALL {
-                    ui.radio_value(&mut self.guides.kind, k, k.name());
+                    if ui.radio_value(&mut self.guides.kind, k, k.name()).changed() {
+                        kind_changed = true;
+                    }
                 }
             });
+            if kind_changed {
+                self.vp_move = false;
+                self.vp_grab = None;
+            }
             if self.guides.kind != GuideKind::Off {
                 match self.guides.kind {
                     GuideKind::Square | GuideKind::Isometric => {
-                        ui.add(egui::Slider::new(&mut self.guides.spacing, 8.0..=256.0).text("Spacing"));
+                        stepped_slider(ui, &mut self.guides.spacing, 8.0..=256.0, 1.0, "Spacing");
                     }
                     GuideKind::OnePoint | GuideKind::TwoPoint => {
-                        ui.label("Vanishing points are fixed in this version.");
+                        if ui.checkbox(&mut self.vp_move, "Move VPs (drag handles on canvas)").changed()
+                        {
+                            self.vp_grab = None;
+                            self.status = if self.vp_move {
+                                "Drag a handle; off-canvas VPs park as diamonds on the edge. Painting pauses while armed.".to_string()
+                            } else {
+                                "Vanishing-point move off.".to_string()
+                            };
+                        }
+                        if ui.button("Reset VPs").clicked() {
+                            self.guides.reset_vps();
+                            self.status = "Vanishing points reset to defaults.".to_string();
+                        }
                     }
                     GuideKind::Off => {}
                 }
                 ui.checkbox(&mut self.guides.snap, "Snap while painting");
                 if self.guides.snap {
-                    ui.add(egui::Slider::new(&mut self.guides.snap_px, 2.0..=32.0).text("Snap range (px)"));
+                    stepped_slider(ui, &mut self.guides.snap_px, 2.0..=32.0, 1.0, "Snap range (px)");
                 }
-                ui.add(egui::Slider::new(&mut self.guides.opacity, 0.05..=1.0).text("Opacity"));
+                stepped_slider(ui, &mut self.guides.opacity, 0.05..=1.0, 0.05, "Opacity");
             }
             if self.doc.selection_mask.is_some() {
                 ui.separator();
@@ -1488,7 +1766,7 @@ impl eframe::App for ProCraftApp {
             if let Some(layer) = self.doc.layers.get_mut(self.doc.active) {
                 ui.label(format!("Opacity: {}", layer.name));
                 let before = layer.opacity;
-                ui.add(egui::Slider::new(&mut layer.opacity, 0.0..=1.0).text(""));
+                stepped_slider(ui, &mut layer.opacity, 0.0..=1.0, 0.05, "");
                 let mut blend = layer.blend;
                 let mut moved = 0;
                 egui::ComboBox::from_label("Blend")
@@ -1589,6 +1867,7 @@ impl eframe::App for ProCraftApp {
                     } else {
                         self.anim_assist = true;
                         self.anim_playing = true;
+                        self.anim_fwd = true;
                         self.anim_last_t = ui.ctx().input(|i| i.time);
                         self.texture = None;
                         self.ghost_dirty = true;
@@ -1610,15 +1889,21 @@ impl eframe::App for ProCraftApp {
                         self.doc.mark_full_dirty();
                     }
                 });
-                ui.add(egui::Slider::new(&mut self.anim_fps, MIN_ANIM_FPS..=MAX_ANIM_FPS).text("FPS"));
+                stepped_slider(ui, &mut self.anim_fps, MIN_ANIM_FPS..=MAX_ANIM_FPS, 1.0, "FPS");
+                ui.horizontal(|ui| {
+                    ui.label("Loop:");
+                    for m in LoopMode::ALL {
+                        ui.radio_value(&mut self.anim_loop, m, m.name());
+                    }
+                });
+                stepped_slider(ui, &mut self.anim_hold, MIN_ANIM_HOLD..=MAX_ANIM_HOLD, 1.0, "Hold");
                 if ui.checkbox(&mut self.onion, "Onion skin").changed() {
                     self.ghost_dirty = true;
                 }
                 if self.onion {
-                    if ui
-                        .add(egui::Slider::new(&mut self.onion_amount, 0.05..=0.8).text("Amount"))
-                        .changed()
-                    {
+                    let before = self.onion_amount;
+                    stepped_slider(ui, &mut self.onion_amount, 0.05..=0.8, 0.05, "Amount");
+                    if self.onion_amount != before {
                         self.ghost_dirty = true;
                     }
                 }
@@ -1626,15 +1911,29 @@ impl eframe::App for ProCraftApp {
                     if let Some(path) = rfd::FileDialog::new().add_filter("GIF image", &["gif"]).save_file()
                     {
                         let path = ensure_extension(path, "gif");
-                        match export_gif(&self.doc, self.anim_fps) {
+                        match export_gif_ext(&self.doc, self.anim_fps, self.anim_loop, self.anim_hold) {
                             Ok(bytes) => match std::fs::write(&path, &bytes) {
                                 Ok(()) => {
                                     let shown =
                                         self.doc.layers.iter().filter(|l| l.visible).count();
-                                    self.status = format!(
-                                        "GIF saved {} ({} frames, hidden skipped).",
-                                        path.display(),
+                                    let exported = if self.anim_loop == LoopMode::PingPong && shown > 2
+                                    {
+                                        2 * shown - 2
+                                    } else {
                                         shown
+                                    };
+                                    let extra = match (self.anim_loop, self.anim_hold) {
+                                        (LoopMode::PingPong, 1) => ", ping-pong".to_string(),
+                                        (LoopMode::Forward, h) if h > 1 => format!(", hold ×{h}"),
+                                        (LoopMode::PingPong, h) => {
+                                            format!(", ping-pong, hold ×{h}")
+                                        }
+                                        _ => String::new(),
+                                    };
+                                    self.status = format!(
+                                        "GIF saved {} ({} frames, hidden skipped{extra}).",
+                                        path.display(),
+                                        exported
                                     );
                                     #[cfg(target_os = "ios")]
                                     rfd::ios_share_file(&path);
@@ -1643,6 +1942,35 @@ impl eframe::App for ProCraftApp {
                             },
                             Err(e) => self.status = format!("GIF export failed: {e}"),
                         }
+                    }
+                }
+                if ui.button("Import GIF").clicked() {
+                    #[cfg(not(target_os = "ios"))]
+                    if let Some(path) = rfd::FileDialog::new().add_filter("GIF image", &["gif"]).pick_file()
+                    {
+                        match std::fs::read(&path)
+                            .map_err(|e| e.to_string())
+                            .and_then(|b| import_gif_document(&b))
+                        {
+                            Ok((doc, fps)) => {
+                                self.status = format!(
+                                    "GIF imported {} ({} frames, {} fps).",
+                                    path.display(),
+                                    doc.layers.len(),
+                                    fps
+                                );
+                                self.adopt_gif(doc, fps);
+                            }
+                            Err(e) => self.status = format!("GIF import failed: {e}"),
+                        }
+                    }
+                    #[cfg(target_os = "ios")]
+                    {
+                        let _ = rfd::FileDialog::new()
+                            .add_filter("GIF image", &["gif"])
+                            .pick_file();
+                        self.pending_open = Some(PendingOpen::Gif);
+                        self.status = "Pick GIF…".to_string();
                     }
                 }
             }
@@ -1684,38 +2012,88 @@ impl eframe::App for ProCraftApp {
             ui.heading("Symmetry");
             for m in SymmetryMode::ALL {
                 if ui.radio_value(&mut self.doc.symmetry, m, m.name()).changed() {
+                    self.sym_move = false;
+                    self.sym_grab = false;
                     self.status = format!("Symmetry: {}.", m.name());
                 }
             }
+            if self.doc.symmetry != SymmetryMode::Off {
+                if ui.checkbox(&mut self.sym_move, "Move center (drag it on canvas)").changed() {
+                    self.sym_grab = false;
+                    self.status = if self.sym_move {
+                        "Drag the mirror center; painting pauses while armed.".to_string()
+                    } else {
+                        "Mirror-center move off.".to_string()
+                    };
+                }
+                if ui.button("Reset center").clicked() {
+                    self.doc.reset_symmetry_center();
+                    self.status = "Mirror center reset to canvas middle.".to_string();
+                }
+            }
             if self.doc.symmetry == SymmetryMode::Kaleidoscope {
-                ui.add(
-                    egui::Slider::new(&mut self.doc.symmetry_segments, 2..=16).text("Segments"),
-                );
+                stepped_slider(ui, &mut self.doc.symmetry_segments, 2..=16, 1.0, "Segments");
             }
             ui.separator();
             ui.heading("Filters");
-            ui.label("Active layer. Selections mask filters.");
-            ui.add(egui::Slider::new(&mut self.filt_brightness, -100..=100).text("Brightness"));
-            ui.add(egui::Slider::new(&mut self.filt_contrast, 0.0..=200.0).text("Contrast %"));
+            ui.label("Active layer. Sliders preview live; Apply keeps. Selections mask filters.");
+            // Tone previews live from a snapshot (one undo step); Apply
+            // keeps the preview, or applies once when nothing is pending.
+            let tone_before = (self.filt_brightness, self.filt_contrast);
+            stepped_slider(ui, &mut self.filt_brightness, -100..=100, 1.0, "Brightness");
+            stepped_slider(ui, &mut self.filt_contrast, 0.0..=200.0, 1.0, "Contrast %");
+            if (self.filt_brightness, self.filt_contrast) != tone_before {
+                let (b, c) = (self.filt_brightness, self.filt_contrast);
+                self.filter_scrub(0, move |doc, layer| {
+                    doc.adjust_tone(layer, (b as f32 * 2.55).round() as i32, c / 100.0);
+                });
+                self.status = "Previewing tone — Apply to keep.".to_string();
+            }
             if ui.button("Apply tone").clicked() {
-                self.doc.checkpoint();
-                self.doc.adjust_tone(
-                    self.doc.active,
-                    (self.filt_brightness as f32 * 2.55).round() as i32,
-                    self.filt_contrast / 100.0,
-                );
+                if self.filter_preview.as_ref().map_or(true, |fp| fp.kind != 0) {
+                    let (b, c) = (self.filt_brightness, self.filt_contrast);
+                    self.doc.checkpoint();
+                    self.doc.adjust_tone(
+                        self.doc.active,
+                        (b as f32 * 2.55).round() as i32,
+                        c / 100.0,
+                    );
+                }
+                self.filter_preview = None;
                 self.status = "Tone applied.".to_string();
             }
-            ui.add(egui::Slider::new(&mut self.filt_blur, 0..=25).text("Blur"));
+            let blur_before = self.filt_blur;
+            stepped_slider(ui, &mut self.filt_blur, 0..=25, 1.0, "Blur");
+            if self.filt_blur != blur_before {
+                let r = self.filt_blur.max(0) as u32;
+                self.filter_scrub(1, move |doc, layer| {
+                    doc.blur_layer(layer, r);
+                });
+                self.status = "Previewing blur — Apply to keep.".to_string();
+            }
             if ui.button("Apply blur").clicked() {
-                self.doc.checkpoint();
-                self.doc.blur_layer(self.doc.active, self.filt_blur.max(0) as u32);
+                if self.filter_preview.as_ref().map_or(true, |fp| fp.kind != 1) {
+                    self.doc.checkpoint();
+                    self.doc.blur_layer(self.doc.active, self.filt_blur.max(0) as u32);
+                }
+                self.filter_preview = None;
                 self.status = "Blur applied.".to_string();
             }
-            ui.add(egui::Slider::new(&mut self.filt_sharpen, 0.0..=200.0).text("Sharpen %"));
+            let sharp_before = self.filt_sharpen;
+            stepped_slider(ui, &mut self.filt_sharpen, 0.0..=200.0, 1.0, "Sharpen %");
+            if self.filt_sharpen != sharp_before {
+                let s = self.filt_sharpen / 100.0;
+                self.filter_scrub(2, move |doc, layer| {
+                    doc.sharpen_layer(layer, s);
+                });
+                self.status = "Previewing sharpen — Apply to keep.".to_string();
+            }
             if ui.button("Apply sharpen").clicked() {
-                self.doc.checkpoint();
-                self.doc.sharpen_layer(self.doc.active, self.filt_sharpen / 100.0);
+                if self.filter_preview.as_ref().map_or(true, |fp| fp.kind != 2) {
+                    self.doc.checkpoint();
+                    self.doc.sharpen_layer(self.doc.active, self.filt_sharpen / 100.0);
+                }
+                self.filter_preview = None;
                 self.status = "Sharpen applied.".to_string();
             }
         });
@@ -1755,6 +2133,12 @@ impl eframe::App for ProCraftApp {
             if self.zoom <= 0.0 {
                 self.zoom = (avail.x / w).min(avail.y / h).clamp(0.1, 8.0);
             }
+            // Pinch-to-zoom (iOS touch; Ctrl+wheel on desktop): no-op when
+            // the backend reports no gesture.
+            let pinch = ui.ctx().input(|i| i.zoom_delta());
+            if (pinch - 1.0).abs() > f32::EPSILON {
+                self.zoom = (self.zoom * pinch).clamp(0.1, 8.0);
+            }
             let z = self.zoom;
             egui::ScrollArea::both().show(ui, |ui| {
                 let (rect, resp) =
@@ -1775,7 +2159,8 @@ impl eframe::App for ProCraftApp {
                 let axis = |a: egui::Pos2, b: egui::Pos2| {
                     ui.painter().line_segment([a, b], (1.0, axis_color));
                 };
-                let center = egui::Pos2::new(rect.min.x + w * z * 0.5, rect.min.y + h * z * 0.5);
+                let (scx, scy) = self.doc.symmetry_center_px();
+                let center = egui::Pos2::new(rect.min.x + scx * z, rect.min.y + scy * z);
                 let vline = || {
                     axis(
                         egui::Pos2::new(center.x, rect.min.y),
@@ -1806,6 +2191,31 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                 }
+                // Mirror-center handle (draggable while Move center is
+                // armed; off-canvas parks on the edge like VP handles).
+                if self.doc.symmetry != SymmetryMode::Off {
+                    let (p, parked) = vp_handle_pos(rect, z, scx, scy);
+                    if parked {
+                        let r = 10.0;
+                        let diamond = vec![
+                            p + egui::Vec2::new(0.0, -r),
+                            p + egui::Vec2::new(r, 0.0),
+                            p + egui::Vec2::new(0.0, r),
+                            p + egui::Vec2::new(-r, 0.0),
+                        ];
+                        let red = Color32::from_rgb(220, 60, 60);
+                        ui.painter().add(egui::Shape::closed_line(diamond, (3.0, red)));
+                        ui.painter().circle_filled(p, 2.0, Color32::WHITE);
+                    } else {
+                        let (fill, r) = if self.sym_move {
+                            (Color32::from_rgb(220, 60, 60), if self.sym_grab { 11.0 } else { 9.0 })
+                        } else {
+                            (Color32::from_rgb(220, 60, 60), 6.0)
+                        };
+                        ui.painter().circle_filled(p, r, fill);
+                        ui.painter().circle_stroke(p, r, (2.0, Color32::WHITE));
+                    }
+                }
                 // Drawing guides overlay: view-assist only, never baked in.
                 if self.guides.kind != GuideKind::Off {
                     let alpha = (self.guides.opacity.clamp(0.05, 1.0) * 255.0).round() as u8;
@@ -1818,6 +2228,36 @@ impl eframe::App for ProCraftApp {
                             ],
                             (1.0, gc),
                         );
+                    }
+                }
+                // Vanishing-point handles for perspective guides (draggable
+                // while Move VPs is armed in the Guides panel). Off-canvas
+                // VPs park as hollow diamonds on the canvas edge so they
+                // stay reachable.
+                if matches!(self.guides.kind, GuideKind::OnePoint | GuideKind::TwoPoint) {
+                    for (i, (vx, vy)) in self.guides.vp_list(w, h).iter().enumerate() {
+                        let (p, parked) = vp_handle_pos(rect, z, *vx, *vy);
+                        let grabbed = self.vp_grab == Some(i);
+                        if parked {
+                            let r = 10.0;
+                            let diamond = vec![
+                                p + egui::Vec2::new(0.0, -r),
+                                p + egui::Vec2::new(r, 0.0),
+                                p + egui::Vec2::new(0.0, r),
+                                p + egui::Vec2::new(-r, 0.0),
+                            ];
+                            let amber = Color32::from_rgb(255, 200, 60);
+                            ui.painter().add(egui::Shape::closed_line(diamond, (3.0, amber)));
+                            ui.painter().circle_filled(p, 2.0, Color32::WHITE);
+                        } else {
+                            let (fill, r) = if self.vp_move {
+                                (Color32::from_rgb(255, 200, 60), if grabbed { 11.0 } else { 9.0 })
+                            } else {
+                                (Color32::from_rgb(70, 130, 200), 6.0)
+                            };
+                            ui.painter().circle_filled(p, r, fill);
+                            ui.painter().circle_stroke(p, r, (2.0, Color32::WHITE));
+                        }
                     }
                 }
                 // Onion skins over the current frame (assist only, not in
@@ -1878,6 +2318,73 @@ impl eframe::App for ProCraftApp {
                                 );
                             }
                         }
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                }
+
+                // Vanishing-point dragging (armed in the Guides panel):
+                // grabs pause painting and move the nearest handle.
+                if self.vp_move
+                    && matches!(self.guides.kind, GuideKind::OnePoint | GuideKind::TwoPoint)
+                {
+                    if resp.drag_started() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let mut best: Option<(usize, f32)> = None;
+                            for (i, (vx, vy)) in
+                                self.guides.vp_list(w, h).iter().enumerate()
+                            {
+                                // Parked edge markers grab exactly where drawn.
+                                let (p, _) = vp_handle_pos(rect, z, *vx, *vy);
+                                let d = (p.x - pos.x).hypot(p.y - pos.y);
+                                if best.map_or(true, |(_, bd)| d < bd) {
+                                    best = Some((i, d));
+                                }
+                            }
+                            // Generous grab radius so off-center taps still
+                            // catch a handle; misses simply paint nothing.
+                            if let Some((i, d)) = best {
+                                if d <= 28.0 {
+                                    self.vp_grab = Some(i);
+                                }
+                            }
+                        }
+                    } else if resp.dragged() {
+                        if let (Some(i), Some(pos)) = (self.vp_grab, resp.hover_pos()) {
+                            let (x, y) = to_canvas(pos);
+                            self.guides.set_vp(i, x, y, w, h);
+                        }
+                    }
+                    if resp.drag_stopped() {
+                        self.vp_grab = None;
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                }
+
+                // Mirror-center dragging (armed in the Symmetry panel):
+                // grabs pause painting and move the axes' crossing.
+                if self.sym_move && self.doc.symmetry != SymmetryMode::Off {
+                    if resp.drag_started() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (scx, scy) = self.doc.symmetry_center_px();
+                            let (p, _) = vp_handle_pos(rect, z, scx, scy);
+                            if (p.x - pos.x).hypot(p.y - pos.y) <= 28.0 {
+                                self.sym_grab = true;
+                            }
+                        }
+                    } else if resp.dragged() {
+                        if self.sym_grab {
+                            if let Some(pos) = resp.hover_pos() {
+                                let (x, y) = to_canvas(pos);
+                                self.doc.set_symmetry_center(x, y);
+                            }
+                        }
+                    }
+                    if resp.drag_stopped() {
+                        self.sym_grab = false;
                     }
                     self.painting = false;
                     self.last = None;
@@ -1996,11 +2503,20 @@ impl eframe::App for ProCraftApp {
                 }
 
                 if self.tool == Tool::Fill {
-                    // Bucket fill at the press point (one undo step).
+                    // ColorDrop: tap fills; keep holding and drag sideways to
+                    // sweep the tolerance with a live preview (one undo step
+                    // for the whole gesture).
                     if resp.drag_started() {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
                             let (cx, cy) = clamp_pt(x, y);
+                            let layer = self.doc.active;
+                            let pixels = self
+                                .doc
+                                .layers
+                                .get(layer)
+                                .map(|l| l.pixels.clone())
+                                .unwrap_or_default();
                             self.doc.checkpoint();
                             let brush = self.base_brush();
                             let color = self.current_color();
@@ -2011,7 +2527,45 @@ impl eframe::App for ProCraftApp {
                                 cy as u32,
                                 self.fill_tolerance,
                             );
-                            self.status = "Filled.".to_string();
+                            self.fill_preview = Some(FillPreview {
+                                layer,
+                                seed: (cx as u32, cy as u32),
+                                pixels,
+                                start_x: pos.x,
+                                start_tol: self.fill_tolerance,
+                                applied: self.fill_tolerance,
+                            });
+                            self.status = format!(
+                                "Fill preview — drag sideways for tolerance ({}).",
+                                self.fill_tolerance
+                            );
+                        }
+                    } else if resp.dragged() {
+                        if let Some(mut fp) = self.fill_preview.take() {
+                            if let Some(pos) = resp.hover_pos() {
+                                let tol = (fp.start_tol as i32
+                                    + ((pos.x - fp.start_x) * 0.5) as i32)
+                                    .clamp(0, 255) as u8;
+                                if tol != fp.applied {
+                                    if let Some(layer) = self.doc.layers.get_mut(fp.layer) {
+                                        layer.pixels = fp.pixels.clone();
+                                    }
+                                    let brush = self.base_brush();
+                                    let color = self.current_color();
+                                    self.doc.flood_fill(&brush, color, fp.seed.0, fp.seed.1, tol);
+                                    fp.applied = tol;
+                                    self.fill_tolerance = tol;
+                                    self.status = format!("Fill preview — tolerance {tol}.");
+                                }
+                            }
+                            // Keep the preview alive only while its layer exists.
+                            if self.doc.layers.get(fp.layer).is_some() {
+                                self.fill_preview = Some(fp);
+                            }
+                        }
+                    } else if resp.drag_stopped() {
+                        if let Some(fp) = self.fill_preview.take() {
+                            self.status = format!("Filled (tolerance {}).", fp.applied);
                         }
                     }
                     self.painting = false;

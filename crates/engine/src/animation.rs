@@ -6,7 +6,8 @@
 //! the frame count so unhiding never renumbers). Playback state itself
 //! lives app-side; this module is pure document math plus the exporter.
 
-use super::document::Document;
+use super::document::{BlendMode, Document};
+use super::document::Layer;
 use image::{
     codecs::gif::{GifEncoder, Repeat},
     Delay, Frame, RgbaImage,
@@ -15,8 +16,99 @@ use image::{
 /// Playback/export rate bounds (fps).
 pub const MIN_ANIM_FPS: u32 = 1;
 pub const MAX_ANIM_FPS: u32 = 60;
+/// Frame-hold bounds: each frame shows for `hold` ticks (uniform, Procreate
+/// "hold"-like pacing without per-frame bookkeeping).
+pub const MIN_ANIM_HOLD: u32 = 1;
+pub const MAX_ANIM_HOLD: u32 = 8;
 /// Sanity cap on exported frames (layer counts never reach it in practice).
 pub const MAX_GIF_FRAMES: usize = 256;
+
+/// Playback loop direction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoopMode {
+    #[default]
+    Forward,
+    PingPong,
+}
+
+impl LoopMode {
+    pub const ALL: [LoopMode; 2] = [LoopMode::Forward, LoopMode::PingPong];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            LoopMode::Forward => "Forward",
+            LoopMode::PingPong => "Ping-pong",
+        }
+    }
+}
+
+/// Visible layer indices in stack order (the frame sequence): hidden
+/// layers are skipped by playback, onion skins and GIF export alike.
+pub fn visible_frames(doc: &Document) -> Vec<usize> {
+    doc.layers
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.visible)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Playback tick over visible frames only, so what plays matches what the
+/// GIF exporter writes. A hidden or deleted current frame (manually
+/// selected mid-playback) joins the sequence in the travel direction;
+/// fully-hidden documents hold their position instead of panicking.
+pub fn step_playback_visible(doc: &Document, pos: usize, fwd: bool, mode: LoopMode) -> (usize, bool) {
+    let vis = visible_frames(doc);
+    if vis.is_empty() {
+        return (pos, true);
+    }
+    if vis.len() == 1 {
+        return (vis[0], true);
+    }
+    if let Some(k) = vis.iter().position(|&i| i == pos) {
+        return match mode {
+            LoopMode::Forward => (vis[(k + 1) % vis.len()], true),
+            LoopMode::PingPong => {
+                if fwd {
+                    if k + 1 < vis.len() { (vis[k + 1], true) } else { (vis[k - 1], false) }
+                } else if k > 0 {
+                    (vis[k - 1], false)
+                } else {
+                    (vis[k + 1], true)
+                }
+            }
+        };
+    }
+    if fwd {
+        (vis.iter().copied().find(|&i| i > pos).unwrap_or(vis[0]), true)
+    } else {
+        (vis.iter().rev().copied().find(|&i| i < pos).unwrap_or(vis[vis.len() - 1]), false)
+    }
+}
+/// Advance one playback tick over `len` frames from `pos`: returns the next
+/// position plus the outgoing travel direction (matters only for
+/// ping-pong). Empty stacks and racing deletes (out-of-range `pos`) reset
+/// to frame 0 going forward instead of panicking.
+pub fn step_playback(len: usize, pos: usize, fwd: bool, mode: LoopMode) -> (usize, bool) {
+    if len == 0 || pos >= len {
+        return (0, true);
+    }
+    match mode {
+        LoopMode::Forward => ((pos + 1) % len, true),
+        LoopMode::PingPong => {
+            if len == 1 {
+                return (0, true);
+            }
+            if fwd {
+                if pos + 1 < len { (pos + 1, true) } else { (pos - 1, false) }
+            } else if pos > 0 {
+                (pos - 1, false)
+            } else {
+                (pos + 1, true)
+            }
+        }
+    }
+}
 
 /// Clamp a frame position into the layer stack (`None` when empty, which
 /// documents never are, but importers must not be trusted).
@@ -160,8 +252,71 @@ pub fn onion_ghost(doc: &Document, index: usize, strength: f32) -> Vec<u8> {
 /// are skipped (documented in the app status line). Errors on bad rates,
 /// fully-hidden documents, and absurd frame counts.
 pub fn export_gif(doc: &Document, fps: u32) -> Result<Vec<u8>, String> {
+    export_gif_ext(doc, fps, LoopMode::Forward, MIN_ANIM_HOLD)
+}
+
+/// Decode an animated GIF into a document: one layer per frame, bottom to
+/// top in file order, active on frame 1. Returns the document plus the
+/// first frame's rate (clamped, 12 fps fallback) so playback matches the
+/// source. Caps dimensions, frame count and input size; single-image GIFs
+/// import as one layer.
+pub fn import_gif_document(bytes: &[u8]) -> Result<(Document, u32), String> {
+    use image::{codecs::gif::GifDecoder, AnimationDecoder, ImageDecoder};
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err("gif too large (max 64MB)".to_string());
+    }
+    let dec = GifDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    let (w, h) = dec.dimensions();
+    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+        return Err("gif has bad dimensions".to_string());
+    }
+    let mut layers = Vec::new();
+    let mut fps = 12u32;
+    let mut first = true;
+    for frame in dec.into_frames() {
+        let frame = frame.map_err(|e| e.to_string())?;
+        if first {
+            first = false;
+            let (n, d) = frame.delay().numer_denom_ms();
+            if n > 0 && d > 0 {
+                fps = ((1000 * d) as f32 / n as f32).round() as u32;
+                fps = fps.clamp(MIN_ANIM_FPS, MAX_ANIM_FPS);
+            }
+        }
+        let img = frame.into_buffer();
+        if img.width() != w || img.height() != h {
+            return Err("gif has ragged frames".to_string());
+        }
+        layers.push(Layer {
+            name: format!("Frame {}", layers.len() + 1),
+            visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            pixels: img.into_raw(),
+            mask: None,
+            clip: false,
+            ox: 0,
+            oy: 0,
+        });
+        if layers.len() > MAX_GIF_FRAMES {
+            return Err(format!("too many frames (max {MAX_GIF_FRAMES})"));
+        }
+    }
+    if layers.is_empty() {
+        return Err("gif has no frames".to_string());
+    }
+    Ok((Document::from_layers(w, h, layers, 0), fps))
+}
+
+/// [`export_gif`] plus loop mode and frame hold: ping-pong appends the
+/// interior frames in reverse (no duplicated endpoints), and `hold`
+/// stretches every frame delay (`hold` ticks at `fps`).
+pub fn export_gif_ext(doc: &Document, fps: u32, mode: LoopMode, hold: u32) -> Result<Vec<u8>, String> {
     if !(MIN_ANIM_FPS..=MAX_ANIM_FPS).contains(&fps) {
         return Err(format!("bad animation rate: {fps}"));
+    }
+    if !(MIN_ANIM_HOLD..=MAX_ANIM_HOLD).contains(&hold) {
+        return Err(format!("bad frame hold: {hold}"));
     }
     if doc.w == 0 || doc.h == 0 {
         return Err("nothing to animate: empty canvas".to_string());
@@ -179,14 +334,20 @@ pub fn export_gif(doc: &Document, fps: u32) -> Result<Vec<u8>, String> {
     if frames.len() > MAX_GIF_FRAMES {
         return Err(format!("too many frames (max {MAX_GIF_FRAMES})"));
     }
+    let mut seq = frames;
+    if mode == LoopMode::PingPong && seq.len() > 2 {
+        let interior: Vec<usize> = seq[1..seq.len() - 1].iter().rev().copied().collect();
+        seq.extend(interior);
+    }
     let mut buf = Vec::new();
     {
         let mut enc = GifEncoder::new(&mut buf);
         enc.set_repeat(Repeat::Infinite).map_err(|e| e.to_string())?;
-        for idx in frames {
+        let delay = Delay::from_numer_denom_ms(1000 * hold, fps);
+        for idx in seq {
             let px = rasterize_frame(doc, idx);
             let img = RgbaImage::from_raw(doc.w, doc.h, px).ok_or("frame raster failed")?;
-            let frame = Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(1000, fps));
+            let frame = Frame::from_parts(img, 0, 0, delay);
             enc.encode_frame(frame).map_err(|e| e.to_string())?;
         }
     }
@@ -306,5 +467,114 @@ mod tests {
         doc.layers[0].visible = false;
         doc.layers[1].visible = false;
         assert!(export_gif(&doc, 12).is_err());
+    }
+
+    #[test]
+    fn playback_steps_forward_and_bounces() {
+        // Forward wraps.
+        assert_eq!(step_playback(4, 3, true, LoopMode::Forward), (0, true));
+        assert_eq!(step_playback(4, 1, true, LoopMode::Forward), (2, true));
+        // Ping-pong bounces at both ends.
+        let mut pos = 0;
+        let mut fwd = true;
+        let mut seq = vec![pos];
+        for _ in 0..8 {
+            (pos, fwd) = step_playback(3, pos, fwd, LoopMode::PingPong);
+            seq.push(pos);
+        }
+        assert_eq!(seq, vec![0, 1, 2, 1, 0, 1, 2, 1, 0]);
+        // Two frames alternate; one frame sits still.
+        assert_eq!(step_playback(2, 0, true, LoopMode::PingPong), (1, true));
+        assert_eq!(step_playback(2, 1, true, LoopMode::PingPong), (0, false));
+        assert_eq!(step_playback(2, 0, false, LoopMode::PingPong), (1, true));
+        assert_eq!(step_playback(1, 0, false, LoopMode::PingPong), (0, true));
+        // Empty stacks and racing deletes reset instead of panicking.
+        assert_eq!(step_playback(0, 0, true, LoopMode::Forward), (0, true));
+        assert_eq!(step_playback(3, 9, false, LoopMode::PingPong), (0, true));
+    }
+
+    #[test]
+    fn gif_ping_pong_reverses_the_interior() {
+        use image::{codecs::gif::GifDecoder, AnimationDecoder};
+        let mut doc = Document::new(16, 16);
+        paint_layer(&mut doc, 0, [255, 0, 0]);
+        doc.add_layer("F2".to_string());
+        paint_layer(&mut doc, 1, [0, 255, 0]);
+        doc.add_layer("F3".to_string());
+        paint_layer(&mut doc, 2, [0, 0, 255]);
+        let bytes = export_gif_ext(&doc, 12, LoopMode::PingPong, 1).unwrap();
+        let dec = GifDecoder::new(std::io::Cursor::new(&bytes[..])).unwrap();
+        let frames: Vec<_> = dec.into_frames().collect::<Result<_, _>>().unwrap();
+        // 0, 1, 2, 1: endpoints never duplicate.
+        assert_eq!(frames.len(), 4);
+        assert_eq!(&frames[0].buffer()[(0, 0)].0[0..3], &[255, 0, 0]);
+        assert_eq!(&frames[2].buffer()[(0, 0)].0[0..3], &[0, 0, 255]);
+        assert_eq!(&frames[3].buffer()[(0, 0)].0[0..3], &[0, 255, 0]);
+        // Two frames: nothing to reverse, plain pair.
+        doc.layers[2].visible = false;
+        let pair = export_gif_ext(&doc, 12, LoopMode::PingPong, 1).unwrap();
+        let dec = GifDecoder::new(std::io::Cursor::new(&pair[..])).unwrap();
+        let pframes: Vec<_> = dec.into_frames().collect::<Result<_, _>>().unwrap();
+        assert_eq!(pframes.len(), 2);
+        doc.layers[2].visible = true;
+        // Hold validates and still decodes to the same frame count.
+        assert!(export_gif_ext(&doc, 12, LoopMode::Forward, 0).is_err());
+        assert!(export_gif_ext(&doc, 12, LoopMode::Forward, 9).is_err());
+        let held = export_gif_ext(&doc, 12, LoopMode::Forward, 4).unwrap();
+        let dec = GifDecoder::new(std::io::Cursor::new(&held[..])).unwrap();
+        let hframes: Vec<_> = dec.into_frames().collect::<Result<_, _>>().unwrap();
+        assert_eq!(hframes.len(), 3);
+    }
+
+    fn three_layers() -> Document {
+        let mut doc = Document::new(8, 8);
+        doc.add_layer("F2".to_string());
+        doc.add_layer("F3".to_string());
+        doc
+    }
+
+    #[test]
+    fn playback_skips_hidden_frames() {
+        let mut doc = three_layers();
+        assert_eq!(visible_frames(&doc), vec![0, 1, 2]);
+        doc.layers[1].visible = false;
+        assert_eq!(visible_frames(&doc), vec![0, 2]);
+        // Forward cycles the visible pair; ping-pong alternates it.
+        assert_eq!(step_playback_visible(&doc, 0, true, LoopMode::Forward), (2, true));
+        assert_eq!(step_playback_visible(&doc, 2, true, LoopMode::Forward), (0, true));
+        assert_eq!(step_playback_visible(&doc, 0, true, LoopMode::PingPong), (2, true));
+        assert_eq!(step_playback_visible(&doc, 2, true, LoopMode::PingPong), (0, false));
+        assert_eq!(step_playback_visible(&doc, 0, false, LoopMode::PingPong), (2, true));
+        // A hidden current frame joins the sequence in travel direction.
+        assert_eq!(step_playback_visible(&doc, 1, true, LoopMode::Forward), (2, true));
+        assert_eq!(step_playback_visible(&doc, 1, false, LoopMode::PingPong), (0, false));
+        // One visible frame sits still; none holds position.
+        doc.layers[0].visible = false;
+        assert_eq!(step_playback_visible(&doc, 2, true, LoopMode::PingPong), (2, true));
+        doc.layers[2].visible = false;
+        assert_eq!(step_playback_visible(&doc, 1, true, LoopMode::Forward), (1, true));
+    }
+
+    #[test]
+    fn gif_import_roundtrips_frames() {
+        let mut doc = Document::new(16, 16);
+        paint_layer(&mut doc, 0, [255, 0, 0]);
+        doc.add_layer("F2".to_string());
+        paint_layer(&mut doc, 1, [0, 0, 255]);
+        let bytes = export_gif(&doc, 10).unwrap();
+        let (back, fps) = import_gif_document(&bytes).unwrap();
+        assert_eq!((back.w, back.h), (16, 16));
+        assert_eq!(back.layers.len(), 2);
+        assert_eq!(back.active, 0);
+        assert_eq!(back.layers[0].name, "Frame 1");
+        // First pixels survive the round trip (GIF palette-quantized).
+        let at = |d: &Document, i: usize| {
+            [d.layers[i].pixels[0], d.layers[i].pixels[1], d.layers[i].pixels[2]]
+        };
+        assert_eq!(at(&back, 0), [255, 0, 0]);
+        assert_eq!(at(&back, 1), [0, 0, 255]);
+        assert_eq!(fps, 10);
+        assert!(import_gif_document(b"GIF89a nope").is_err());
+        assert!(import_gif_document(&[]).is_err());
     }
 }

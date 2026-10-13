@@ -7,6 +7,8 @@
 
 /// Maximum swatches in one palette (keeps files and UI grids bounded).
 pub const MAX_PALETTE_COLORS: usize = 48;
+/// Maximum named palettes in one set (keeps the manager UI bounded).
+pub const MAX_PALETTES: usize = 16;
 
 /// A named swatch set: display name plus sRGB triples.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -15,7 +17,16 @@ pub struct Palette {
     pub colors: Vec<[u8; 3]>,
 }
 
-fn check_palette(name: &str, colors: &[[u8; 3]]) -> Result<String, String> {
+/// A named palette collection with an active selection: the multi-palette
+/// manager model. Palettes may be empty while edited (saving still
+/// validates through [`save_palette`]); names stay unique via [`PaletteSet::unique_name`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaletteSet {
+    pub palettes: Vec<Palette>,
+    pub active: usize,
+}
+
+fn check_name(name: &str) -> Result<String, String> {
     let clean = name.trim().to_string();
     if clean.is_empty() {
         return Err("palette has an empty name".to_string());
@@ -23,6 +34,140 @@ fn check_palette(name: &str, colors: &[[u8; 3]]) -> Result<String, String> {
     if clean.chars().count() > 64 {
         return Err(format!("palette name too long: {clean}"));
     }
+    Ok(clean)
+}
+
+impl PaletteSet {
+    /// One empty "My colors" palette selected (matches the old single-set UI).
+    pub fn new() -> Self {
+        Self {
+            palettes: vec![Palette { name: "My colors".to_string(), colors: Vec::new() }],
+            active: 0,
+        }
+    }
+
+    pub fn active(&self) -> Option<&Palette> {
+        self.palettes.get(self.active)
+    }
+
+    pub fn active_mut(&mut self) -> Option<&mut Palette> {
+        self.palettes.get_mut(self.active)
+    }
+
+    /// Select palette `idx`. Out-of-range selections are ignored.
+    pub fn set_active(&mut self, idx: usize) -> bool {
+        if idx < self.palettes.len() {
+            self.active = idx;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Unique display name: "Foo", "Foo (2)", ... (mirrors the brush
+    /// library so imports never collide with existing palettes).
+    pub fn unique_name(&self, base: &str) -> String {
+        let clean = base.trim();
+        let clean = if clean.is_empty() { "Palette" } else { clean };
+        if !self.palettes.iter().any(|p| p.name == clean) {
+            return clean.to_string();
+        }
+        for n in 2..=MAX_PALETTES + 2 {
+            let cand = format!("{clean} ({n})");
+            if !self.palettes.iter().any(|p| p.name == cand) {
+                return cand;
+            }
+        }
+        clean.to_string()
+    }
+
+    /// Add an empty palette, selected at once. Names are cleaned and
+    /// de-duplicated; errors on empty names and a full set.
+    pub fn add(&mut self, name: &str) -> Result<usize, String> {
+        if self.palettes.len() >= MAX_PALETTES {
+            return Err(format!("too many palettes (max {MAX_PALETTES})"));
+        }
+        let clean = check_name(name)?;
+        let name = self.unique_name(&clean);
+        self.palettes.push(Palette { name, colors: Vec::new() });
+        self.active = self.palettes.len() - 1;
+        Ok(self.active)
+    }
+
+    /// Rename palette `idx` (cleaned, must stay unique).
+    pub fn rename(&mut self, idx: usize, name: &str) -> Result<(), String> {
+        let clean = check_name(name)?;
+        if idx >= self.palettes.len() {
+            return Err("no such palette".to_string());
+        }
+        if self.palettes.iter().enumerate().any(|(i, p)| i != idx && p.name == clean) {
+            return Err(format!("palette name taken: {clean}"));
+        }
+        self.palettes[idx].name = clean;
+        Ok(())
+    }
+
+    /// Remove palette `idx`. Removing the last palette clears its colors
+    /// instead (the set never empties, so the UI always has a target).
+    pub fn remove(&mut self, idx: usize) -> bool {
+        if idx >= self.palettes.len() {
+            return false;
+        }
+        if self.palettes.len() == 1 {
+            self.palettes[0].colors.clear();
+            return true;
+        }
+        self.palettes.remove(idx);
+        if self.active > idx {
+            self.active -= 1;
+        }
+        self.active = self.active.min(self.palettes.len() - 1);
+        true
+    }
+
+    /// Store a color in the active palette: skipping exact duplicates,
+    /// honoring the per-palette cap.
+    pub fn push_color(&mut self, c: [u8; 3]) -> Result<(), String> {
+        let Some(pal) = self.active_mut() else {
+            return Err("no active palette".to_string());
+        };
+        if pal.colors.contains(&c) {
+            return Err("that color is already stored".to_string());
+        }
+        if pal.colors.len() >= MAX_PALETTE_COLORS {
+            return Err(format!("swatch set is full ({MAX_PALETTE_COLORS})"));
+        }
+        pal.colors.push(c);
+        Ok(())
+    }
+
+    /// Remove swatch `idx` from the active palette.
+    pub fn remove_color(&mut self, idx: usize) -> bool {
+        match self.active_mut() {
+            Some(pal) if idx < pal.colors.len() => {
+                pal.colors.remove(idx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Empty the active palette (keeps the palette itself).
+    pub fn clear_active(&mut self) {
+        if let Some(pal) = self.active_mut() {
+            pal.colors.clear();
+        }
+    }
+}
+
+impl Default for PaletteSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn check_palette(name: &str, colors: &[[u8; 3]]) -> Result<String, String> {
+    let clean = check_name(name)?;
     if colors.is_empty() {
         return Err("palette has no colors".to_string());
     }
@@ -290,5 +435,70 @@ mod tests {
         // Grays stay gray through every harmony.
         assert_eq!(complementary([128, 128, 128]), [128, 128, 128]);
         assert_eq!(triadic([0, 0, 0]), [[0, 0, 0], [0, 0, 0]]);
+    }
+
+    #[test]
+    fn palette_set_starts_with_my_colors() {
+        let set = PaletteSet::new();
+        assert_eq!(set.palettes.len(), 1);
+        assert_eq!(set.active, 0);
+        assert_eq!(set.active().unwrap().name, "My colors");
+        assert!(set.active().unwrap().colors.is_empty());
+    }
+
+    #[test]
+    fn palette_set_add_rename_select() {
+        let mut set = PaletteSet::new();
+        let a = set.add("Inks").unwrap();
+        assert_eq!(a, 1);
+        assert_eq!(set.active, 1);
+        // Duplicate names de-duplicate, blanks fail, the set caps out.
+        let b = set.add("Inks").unwrap();
+        assert_eq!(set.palettes[b].name, "Inks (2)");
+        assert!(set.add("   ").is_err());
+        assert!(set.set_active(0));
+        assert!(!set.set_active(99));
+        assert_eq!(set.active, 0);
+        assert!(set.rename(0, "Mine").is_ok());
+        assert_eq!(set.palettes[0].name, "Mine");
+        assert!(set.rename(0, "Inks").is_err());
+        assert!(set.rename(0, "  ").is_err());
+        assert!(set.rename(99, "X").is_err());
+        for n in 0..MAX_PALETTES {
+            let _ = set.add(&format!("P{n}"));
+        }
+        assert!(set.add("Overflow").is_err());
+    }
+
+    #[test]
+    fn palette_set_remove_never_empties() {
+        let mut set = PaletteSet::new();
+        set.push_color([1, 2, 3]).unwrap();
+        // Last palette: removal clears instead.
+        assert!(set.remove(0));
+        assert_eq!(set.palettes.len(), 1);
+        assert!(set.palettes[0].colors.is_empty());
+        // Earlier removal keeps the active palette pointed at itself.
+        set.add("A").unwrap();
+        set.add("B").unwrap();
+        assert!(set.set_active(2));
+        assert!(set.remove(0));
+        assert_eq!(set.active().unwrap().name, "B");
+        assert!(!set.remove(9));
+    }
+
+    #[test]
+    fn palette_set_colors_validate() {
+        let mut set = PaletteSet::new();
+        assert!(set.push_color([10, 20, 30]).is_ok());
+        assert!(set.push_color([10, 20, 30]).is_err());
+        assert!(set.remove_color(0));
+        assert!(!set.remove_color(0));
+        for i in 0..MAX_PALETTE_COLORS as u8 {
+            set.push_color([i, i, i]).unwrap();
+        }
+        assert!(set.push_color([1, 2, 4]).is_err());
+        set.clear_active();
+        assert!(set.active().unwrap().colors.is_empty());
     }
 }

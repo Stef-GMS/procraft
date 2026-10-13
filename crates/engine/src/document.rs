@@ -118,14 +118,14 @@ impl SymmetryMode {
 
     pub(crate) fn mirrored_points(
         self,
-        w: u32,
-        h: u32,
         segments: u8,
+        cx: f32,
+        cy: f32,
         x: f32,
         y: f32,
     ) -> Vec<(f32, f32)> {
-        let mx = w as f32 - 1.0 - x;
-        let my = h as f32 - 1.0 - y;
+        let mx = 2.0 * cx - x;
+        let my = 2.0 * cy - y;
         match self {
             SymmetryMode::Off => vec![(x, y)],
             SymmetryMode::Horizontal => vec![(x, y), (mx, y)],
@@ -134,7 +134,6 @@ impl SymmetryMode {
             SymmetryMode::Kaleidoscope => {
                 // Dihedral symmetry: rotate by k*step, mirroring on odd k.
                 let n = segments.clamp(2, 16) as usize;
-                let (cx, cy) = ((w as f32 - 1.0) * 0.5, (h as f32 - 1.0) * 0.5);
                 let (dx, dy) = (x - cx, y - cy);
                 let step = std::f32::consts::TAU / n as f32;
                 (0..n)
@@ -156,13 +155,22 @@ impl SymmetryMode {
         w: u32,
         h: u32,
         segments: u8,
+        cx: f32,
+        cy: f32,
         px: u32,
         py: u32,
     ) -> Vec<(u32, u32)> {
+        // Mirror across the center, clamped into the canvas.
+        let mirror = |v: f32, max: u32| {
+            if max == 0 {
+                0
+            } else {
+                v.round().clamp(0.0, max as f32 - 1.0) as u32
+            }
+        };
         match self {
             SymmetryMode::Kaleidoscope => {
                 let n = segments.clamp(2, 16) as usize;
-                let (cx, cy) = ((w as f32 - 1.0) * 0.5, (h as f32 - 1.0) * 0.5);
                 let (dx, dy) = (px as f32 - cx, py as f32 - cy);
                 let step = std::f32::consts::TAU / n as f32;
                 (0..n)
@@ -182,8 +190,8 @@ impl SymmetryMode {
                     .collect()
             }
             _ => {
-                let mx = w.saturating_sub(1).saturating_sub(px);
-                let my = h.saturating_sub(1).saturating_sub(py);
+                let mx = mirror(2.0 * cx - px as f32, w);
+                let my = mirror(2.0 * cy - py as f32, h);
                 match self {
                     SymmetryMode::Off => vec![(px, py)],
                     SymmetryMode::Horizontal => vec![(px, py), (mx, py)],
@@ -289,6 +297,9 @@ pub struct Document {
     pub symmetry: SymmetryMode,
     /// Kaleidoscope reflection axes, 2..=16 (only used in that mode).
     pub symmetry_segments: u8,
+    /// Mirror center in canvas pixels (`None` = canvas center). Draggable
+    /// on-canvas like guide vanishing points; saved to v7 project files.
+    pub symmetry_center: Option<(f32, f32)>,
     /// Freehand painting target (layer color or its reveal mask).
     pub paint_target: PaintTarget,
     dirty: Option<(u32, u32, u32, u32)>,
@@ -317,6 +328,7 @@ impl Document {
             selection_mask: None,
             symmetry: SymmetryMode::Off,
             symmetry_segments: 6,
+            symmetry_center: None,
             paint_target: PaintTarget::Color,
             dirty: None,
             undo: Vec::new(),
@@ -338,12 +350,31 @@ impl Document {
             selection_mask: None,
             symmetry: SymmetryMode::Off,
             symmetry_segments: 6,
+            symmetry_center: None,
             paint_target: PaintTarget::Color,
             dirty: None,
             undo: Vec::new(),
             redo: Vec::new(),
         }
     }
+    /// Mirror center in canvas pixels (canvas middle when never moved).
+    pub fn symmetry_center_px(&self) -> (f32, f32) {
+        self.symmetry_center.unwrap_or((
+            (self.w as f32 - 1.0) * 0.5,
+            (self.h as f32 - 1.0) * 0.5,
+        ))
+    }
+
+    /// Move the mirror center (clamped, like layer offsets and VPs).
+    pub fn set_symmetry_center(&mut self, x: f32, y: f32) {
+        self.symmetry_center = Some((x.clamp(-16384.0, 16384.0), y.clamp(-16384.0, 16384.0)));
+    }
+
+    /// Forget a moved mirror center (back to canvas middle).
+    pub fn reset_symmetry_center(&mut self) {
+        self.symmetry_center = None;
+    }
+
     /// Take and clear the dirty region (inclusive bounds) for partial
     /// texture uploads. `None` means nothing changed: skip the upload.
     pub fn take_dirty(&mut self) -> Option<(u32, u32, u32, u32)> {
@@ -1150,13 +1181,12 @@ impl Document {
 
     /// Save the full project (layers, opacity, blend, background, symmetry)
     /// to a `.procraft` file: magic + little-endian records, zlib-compressed
-    /// pixels. Version 5 adds per-layer masks, clipping flags and six more
-    /// blend modes (v1-v4 files still open; old app versions cleanly refuse
-    /// v5 files at the magic).
+    /// pixels. Version 7 adds the mirror center (v1-v6 files still open;
+    /// old app versions cleanly refuse v7 files at the magic).
     pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        f.write_all(b"PCRAFT06").map_err(|e| e.to_string())?;
+        f.write_all(b"PCRAFT07").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes()).map_err(|e| e.to_string())?;
         f.write_all(&self.h.to_le_bytes()).map_err(|e| e.to_string())?;
         f.write_all(&self.background).map_err(|e| e.to_string())?;
@@ -1171,6 +1201,18 @@ impl Document {
         };
         f.write_all(&[symmetry]).map_err(|e| e.to_string())?;
         f.write_all(&[self.symmetry_segments.clamp(2, 16)]).map_err(|e| e.to_string())?;
+        // v7 stores the mirror center (flag + two f32s); older files read
+        // canvas middle.
+        match self.symmetry_center {
+            Some((cx, cy)) => {
+                f.write_all(&[1u8]).map_err(|e| e.to_string())?;
+                f.write_all(&cx.to_le_bytes()).map_err(|e| e.to_string())?;
+                f.write_all(&cy.to_le_bytes()).map_err(|e| e.to_string())?;
+            }
+            None => {
+                f.write_all(&[0u8]).map_err(|e| e.to_string())?;
+            }
+        }
         for layer in &self.layers {
             let name = layer.name.as_bytes();
             f.write_all(&(name.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
@@ -1237,7 +1279,8 @@ impl Document {
             Ok(head)
         };
         let magic = take(8)?.to_vec();
-        let v6 = magic == b"PCRAFT06";
+        let v7 = magic == b"PCRAFT07";
+        let v6 = v7 || magic == b"PCRAFT06";
         let v5 = v6 || magic == b"PCRAFT05";
         let v4 = v5 || magic == b"PCRAFT04";
         let v3 = v4 || magic == b"PCRAFT03";
@@ -1272,6 +1315,28 @@ impl Document {
             if (2..=16).contains(&s) { s } else { 6 }
         } else {
             6
+        };
+        // v7 appends the mirror center (flag + two f32s); older files read
+        // canvas middle. Non-finite values fall back to the default.
+        let symmetry_center = if v7 {
+            let flag = take(1)?[0];
+            if flag == 0 {
+                None
+            } else {
+                let cx = f32::from_le_bytes(
+                    take(4)?[..4].try_into().map_err(|_| "bad symmetry center".to_string())?,
+                );
+                let cy = f32::from_le_bytes(
+                    take(4)?[..4].try_into().map_err(|_| "bad symmetry center".to_string())?,
+                );
+                if cx.is_finite() && cy.is_finite() {
+                    Some((cx.clamp(-16384.0, 16384.0), cy.clamp(-16384.0, 16384.0)))
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
         };
         let mut layers = Vec::new();
         for _ in 0..count {
@@ -1371,6 +1436,7 @@ impl Document {
             selection_mask: None,
             symmetry,
             symmetry_segments,
+            symmetry_center,
             paint_target: PaintTarget::Color,
             dirty: None,
             undo: Vec::new(),
@@ -1532,7 +1598,7 @@ mod tests {
         let path = dir.join("procraft-v6.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT06");
+        assert_eq!(&head[..8], b"PCRAFT07");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].blend, BlendMode::Difference);
@@ -1691,6 +1757,7 @@ mod tests {
         doc.layers[0].opacity = 0.5;
         doc.layers[0].blend = BlendMode::Overlay;
         doc.symmetry = SymmetryMode::Both;
+        doc.set_symmetry_center(1.5, 1.0);
         doc.add_layer("second".to_string());
         doc.layers[1].visible = false;
         let dir = std::env::temp_dir();
@@ -1708,6 +1775,7 @@ mod tests {
         assert!(!back.layers[1].visible);
         assert_eq!(back.active, 1);
         assert_eq!(back.symmetry, SymmetryMode::Both);
+        assert_eq!(back.symmetry_center, Some((1.5, 1.0)));
         assert!(Document::open_project(&dir.join("missing.pcraft")).is_err());
     }
 
@@ -1734,6 +1802,69 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!((back.w, back.h), (2, 1));
         assert_eq!(back.symmetry, SymmetryMode::Off);
+        assert_eq!(back.layers[0].pixels, vec![9u8; 8]);
+    }
+
+    #[test]
+    fn moved_mirror_center_shifts_paint() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(21, 21);
+        doc.symmetry = SymmetryMode::Horizontal;
+        // Default middle: x=2 mirrors to x=18.
+        assert!(SymmetryMode::Horizontal
+            .mirrored_pixels(21, 21, 6, 10.0, 10.0, 2, 5)
+            .contains(&(18, 5)));
+        // Moved center x=5: x=2 mirrors to x=8 instead.
+        doc.set_symmetry_center(5.0, 10.0);
+        assert_eq!(doc.symmetry_center_px(), (5.0, 10.0));
+        let brush = Brush { size: 3.0, softness: 0.0, opacity: 1.0, ..Default::default() };
+        doc.dab(&brush, Color::rgb(255, 0, 0), 2.5, 5.5);
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 21 + x) * 4 + 3) as usize];
+        assert!(at(&doc, 2, 5) > 0);
+        assert!(at(&doc, 8, 5) > 0);
+        assert_eq!(at(&doc, 18, 5), 0);
+        // Reset restores the middle; out-of-range values clamp.
+        doc.reset_symmetry_center();
+        assert_eq!(doc.symmetry_center, None);
+        doc.set_symmetry_center(1e9, -1e9);
+        assert_eq!(doc.symmetry_center, Some((16384.0, -16384.0)));
+    }
+
+    #[test]
+    fn v6_project_opens_with_centered_symmetry() {
+        // Hand-build a minimal version-6 file (no center bytes).
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v6-compat.pcraft");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT06");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[1]); // Horizontal.
+        buf.extend_from_slice(&[6]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]);
+        buf.extend_from_slice(&[0]);
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&vec![9u8; 2 * 1 * 4]).unwrap();
+        let packed = enc.finish().unwrap();
+        buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&packed);
+        buf.extend_from_slice(&[0]); // No mask.
+        std::fs::write(&path, &buf).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.symmetry, SymmetryMode::Horizontal);
+        assert_eq!(back.symmetry_center, None);
+        assert_eq!(back.symmetry_center_px(), (0.5, 0.0));
         assert_eq!(back.layers[0].pixels, vec![9u8; 8]);
     }
 
@@ -1965,7 +2096,7 @@ mod tests {
 
     #[test]
     fn kaleidoscope_segments_clamp() {
-        let at = |m: SymmetryMode, seg: u8| m.mirrored_pixels(21, 21, seg, 5, 5).len();
+        let at = |m: SymmetryMode, seg: u8| m.mirrored_pixels(21, 21, seg, 10.0, 10.0, 5, 5).len();
         assert_eq!(at(SymmetryMode::Kaleidoscope, 6), 6);
         assert_eq!(at(SymmetryMode::Kaleidoscope, 1), 2);
         assert_eq!(at(SymmetryMode::Kaleidoscope, 99), 16);
@@ -2145,7 +2276,7 @@ mod tests {
         let raw = 128usize * 128 * 4;
         assert!(meta.len() as usize * 4 < raw, "compressed {} vs raw {raw}", meta.len());
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT06");
+        assert_eq!(&head[..8], b"PCRAFT07");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].pixels, doc.layers[0].pixels);

@@ -258,7 +258,8 @@ impl Document {
         opacity: f32,
         angle: f32,
     ) {
-        let pts = self.symmetry.mirrored_points(self.w, self.h, self.symmetry_segments, x, y);
+        let (ccx, ccy) = self.symmetry_center_px();
+        let pts = self.symmetry.mirrored_points(self.symmetry_segments, ccx, ccy, x, y);
         let mut done: Vec<(f32, f32)> = Vec::with_capacity(4);
         let target = self.paint_target;
         for (mx, my) in pts {
@@ -966,7 +967,9 @@ impl Document {
     /// Paint one pixel with source-over at brush opacity, honoring selection
     /// and mirroring per [`Document::symmetry`].
     fn put(&mut self, brush: &Brush, color: Color, px: u32, py: u32) {
-        let pts = self.symmetry.mirrored_pixels(self.w, self.h, self.symmetry_segments, px, py);
+        let (ccx, ccy) = self.symmetry_center_px();
+        let pts =
+            self.symmetry.mirrored_pixels(self.w, self.h, self.symmetry_segments, ccx, ccy, px, py);
         let mut done: Vec<(u32, u32)> = Vec::with_capacity(4);
         for (mx, my) in pts {
             if done.contains(&(mx, my)) {
@@ -1273,7 +1276,8 @@ impl Document {
         };
         // Mirror the seed across symmetry axes (deduped).
         let mut seeds = Vec::with_capacity(4);
-        for (sx, sy) in self.symmetry.mirrored_pixels(w, h, self.symmetry_segments, x, y) {
+        let (ccx, ccy) = self.symmetry_center_px();
+        for (sx, sy) in self.symmetry.mirrored_pixels(w, h, self.symmetry_segments, ccx, ccy, x, y) {
             if sx < w && sy < h && self.pixel_selected(sx, sy) && !seeds.contains(&(sx, sy)) {
                 seeds.push((sx, sy));
             }
@@ -1435,6 +1439,52 @@ mod tests {
         assert_eq!(at(&doc, 1, 5), [0, 255, 0, 255]);
         assert_eq!(at(&doc, 9, 5), [0, 255, 0, 255]);
         assert_eq!(at(&doc, 5, 5), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn flood_fill_tolerance_widens_the_region() {
+        // Two near-identical reds side by side (ColorDrop-style threshold).
+        let two_tone = |doc: &mut Document| {
+            let brush = Brush { opacity: 1.0, ..Default::default() };
+            doc.fill_rect(&brush, Color::rgb(200, 0, 0), 0, 0, 4, 9);
+            doc.fill_rect(&brush, Color::rgb(206, 0, 0), 5, 0, 9, 9);
+        };
+        let at = |d: &Document, x: u32, y: u32| {
+            let o = ((y * 10 + x) * 4) as usize;
+            [d.layers[0].pixels[o], d.layers[0].pixels[o + 1], d.layers[0].pixels[o + 2]]
+        };
+        let brush = Brush { opacity: 1.0, ..Default::default() };
+        // Strict: only the seed side fills.
+        let mut tight = Document::new(10, 10);
+        two_tone(&mut tight);
+        tight.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 0);
+        assert_eq!(at(&tight, 0, 5), [0, 0, 255]);
+        assert_eq!(at(&tight, 9, 5), [206, 0, 0]);
+        // Loose: the neighbor tone joins the region.
+        let mut loose = Document::new(10, 10);
+        two_tone(&mut loose);
+        loose.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 10);
+        assert_eq!(at(&loose, 0, 5), [0, 0, 255]);
+        assert_eq!(at(&loose, 9, 5), [0, 0, 255]);
+    }
+
+    #[test]
+    fn flood_fill_restore_and_refill_matches_direct() {
+        // The ColorDrop preview loop (snapshot, restore, re-fill at a new
+        // tolerance) must equal a single direct fill at that tolerance.
+        let brush = Brush { opacity: 1.0, ..Default::default() };
+        let mut direct = Document::new(10, 10);
+        direct.fill_rect(&brush, Color::rgb(200, 0, 0), 0, 0, 4, 9);
+        direct.fill_rect(&brush, Color::rgb(206, 0, 0), 5, 0, 9, 9);
+        direct.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 10);
+        let mut preview = Document::new(10, 10);
+        preview.fill_rect(&brush, Color::rgb(200, 0, 0), 0, 0, 4, 9);
+        preview.fill_rect(&brush, Color::rgb(206, 0, 0), 5, 0, 9, 9);
+        let snap = preview.layers[0].pixels.clone();
+        preview.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 0);
+        preview.layers[0].pixels = snap;
+        preview.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 10);
+        assert_eq!(preview.layers[0].pixels, direct.layers[0].pixels);
     }
 
     #[test]

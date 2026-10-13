@@ -3,8 +3,9 @@
 //! Original clean-room code, GUI-free and unit-tested. The desktop app
 //! draws [`Guides::overlay_lines`] over the canvas and runs pointer input
 //! through [`Guides::snap_point`] before painting. Perspective vanishing
-//! points are fixed (canvas center for 1-point; two horizon points for
-//! 2-point) in this first version — draggable VPs are a later track.
+//! points default to canvas center (1-point) or two horizon points
+//! (2-point) and are draggable on-canvas via [`Guides::set_vp`]
+//! ([`Guides::reset_vps`] restores the defaults).
 
 /// What the guide overlay shows (and what snap assists to).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,11 +46,23 @@ pub struct Guides {
     pub snap_px: f32,
     /// Overlay line opacity, 0.05..=1.0.
     pub opacity: f32,
+    /// Custom vanishing points in canvas pixels (`None` = defaults derived
+    /// from the canvas size). Index 0 drives 1-point; both drive 2-point.
+    /// Off-canvas values are legal (2-point defaults sit off-canvas).
+    pub vp: Option<[(f32, f32); 2]>,
+}
+
+/// Vanishing-point coordinate bound (matches the layer-offset clamp: far
+/// off-canvas is fine, infinities are not).
+pub const VP_BOUND: f32 = 16384.0;
+
+fn default_vps(w: f32, h: f32) -> [(f32, f32); 2] {
+    [(w * 0.5 - w * 0.75, h * 0.5), (w * 0.5 + w * 0.75, h * 0.5)]
 }
 
 impl Default for Guides {
     fn default() -> Self {
-        Self { kind: GuideKind::Off, spacing: 64.0, snap: true, snap_px: 8.0, opacity: 0.35 }
+        Self { kind: GuideKind::Off, spacing: 64.0, snap: true, snap_px: 8.0, opacity: 0.35, vp: None }
     }
 }
 
@@ -65,6 +78,44 @@ impl Guides {
 
     fn snap_px_clamped(self) -> f32 {
         self.snap_px.clamp(2.0, 32.0)
+    }
+
+    /// Vanishing points driving the perspective kinds: custom values when
+    /// set, otherwise the canvas-size defaults (center for 1-point, two
+    /// horizon points for 2-point). Empty for grid kinds.
+    pub fn vp_list(self, w: f32, h: f32) -> Vec<(f32, f32)> {
+        match self.kind {
+            GuideKind::OnePoint => {
+                vec![self.vp.map(|v| v[0]).unwrap_or((w * 0.5, h * 0.5))]
+            }
+            GuideKind::TwoPoint => {
+                let v = self.vp.unwrap_or_else(|| default_vps(w, h));
+                vec![v[0], v[1]]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Move vanishing point `idx` (0 for 1-point, 0/1 for 2-point) to a
+    /// canvas position. Coordinates clamp to ±[`VP_BOUND`]; out-of-range
+    /// indices are ignored. Grid kinds store the value harmlessly (it
+    /// applies if the user later switches to perspective).
+    pub fn set_vp(&mut self, idx: usize, x: f32, y: f32, w: f32, h: f32) {
+        if idx > 1 {
+            return;
+        }
+        let mut v = self.vp.unwrap_or_else(|| default_vps(w, h));
+        // 1-point customizes from its own center default, not the pair.
+        if self.kind == GuideKind::OnePoint && self.vp.is_none() {
+            v[0] = (w * 0.5, h * 0.5);
+        }
+        v[idx] = (x.clamp(-VP_BOUND, VP_BOUND), y.clamp(-VP_BOUND, VP_BOUND));
+        self.vp = Some(v);
+    }
+
+    /// Forget custom vanishing points (back to canvas-size defaults).
+    pub fn reset_vps(&mut self) {
+        self.vp = None;
     }
 
     /// Snap a canvas point to the active guides. Returns the point
@@ -84,10 +135,7 @@ impl Guides {
                 ((if (nx - x).abs() <= t { nx } else { x }), (if (ny - y).abs() <= t { ny } else { y }))
             }
             GuideKind::Isometric => snap_iso(self, x, y),
-            GuideKind::OnePoint => snap_rays(self, &[(w * 0.5, h * 0.5)], x, y),
-            GuideKind::TwoPoint => {
-                snap_rays(self, &[(w * 0.5 - w * 0.75, h * 0.5), (w * 0.5 + w * 0.75, h * 0.5)], x, y)
-            }
+            GuideKind::OnePoint | GuideKind::TwoPoint => snap_rays(self, &self.vp_list(w, h), x, y),
         }
     }
 
@@ -128,11 +176,13 @@ impl Guides {
                 }
             }
             GuideKind::OnePoint => {
-                emit_rays(&mut out, w * 0.5, h * 0.5, w, h);
+                let v = self.vp_list(w, h);
+                emit_rays(&mut out, v[0].0, v[0].1, w, h);
             }
             GuideKind::TwoPoint => {
-                emit_rays(&mut out, w * 0.5 - w * 0.75, h * 0.5, w, h);
-                emit_rays(&mut out, w * 0.5 + w * 0.75, h * 0.5, w, h);
+                for (cx, cy) in self.vp_list(w, h) {
+                    emit_rays(&mut out, cx, cy, w, h);
+                }
             }
         }
         out
@@ -262,7 +312,7 @@ mod tests {
     use super::*;
 
     fn g(kind: GuideKind) -> Guides {
-        Guides { kind, spacing: 64.0, snap: true, snap_px: 8.0, opacity: 0.35 }
+        Guides { kind, spacing: 64.0, snap: true, snap_px: 8.0, opacity: 0.35, vp: None }
     }
 
     #[test]
@@ -340,5 +390,47 @@ mod tests {
         assert!((sy - 100.0).abs() < 0.5, "{sx} {sy}");
         // Far off-ray point survives (nearest arc > capture).
         assert_eq!(guides.snap_point(200.0, 200.0, 100.0, 40.0), (100.0, 40.0));
+    }
+
+    #[test]
+    fn custom_vp_moves_the_fan() {
+        let plain = g(GuideKind::OnePoint).overlay_lines(200.0, 200.0);
+        let mut moved = g(GuideKind::OnePoint);
+        moved.set_vp(0, 40.0, 160.0, 200.0, 200.0);
+        assert_eq!(moved.vp_list(200.0, 200.0), vec![(40.0, 160.0)]);
+        let custom = moved.overlay_lines(200.0, 200.0);
+        // Same ray count, but the fan now leaves from the custom point.
+        assert_eq!(custom.len(), plain.len());
+        assert_ne!(custom, plain);
+        assert!(custom.iter().any(|&[x0, y0, _, _]| {
+            (x0 - 40.0).abs() < 0.5 && (y0 - 160.0).abs() < 0.5
+        }));
+        // Snap collapses onto the custom VP, not the old center.
+        assert_eq!(moved.snap_point(200.0, 200.0, 42.0, 161.0), (40.0, 160.0));
+    }
+
+    #[test]
+    fn vp_set_clamps_resets_and_ignores_bad_index() {
+        let mut guides = g(GuideKind::TwoPoint);
+        guides.set_vp(5, 10.0, 10.0, 200.0, 200.0);
+        assert_eq!(guides.vp, None);
+        guides.set_vp(1, 1e9, -1e9, 200.0, 200.0);
+        assert_eq!(guides.vp.unwrap()[1], (VP_BOUND, -VP_BOUND));
+        // Index 0 keeps its canvas default until moved.
+        assert_eq!(guides.vp_list(200.0, 200.0)[0], (-50.0, 100.0));
+        guides.reset_vps();
+        assert_eq!(guides.vp, None);
+        // Reset restores the stock overlay exactly.
+        assert_eq!(guides.overlay_lines(200.0, 200.0), g(GuideKind::TwoPoint).overlay_lines(200.0, 200.0));
+    }
+
+    #[test]
+    fn one_point_customizes_from_center() {
+        // First drag on 1-point starts from the center default, not the
+        // 2-point pair (regression: moved[0] must not jump off-canvas).
+        let mut guides = g(GuideKind::OnePoint);
+        guides.set_vp(1, 30.0, 30.0, 200.0, 200.0);
+        assert_eq!(guides.vp_list(200.0, 200.0), vec![(100.0, 100.0)]);
+        assert_eq!(guides.vp.unwrap()[1], (30.0, 30.0));
     }
 }

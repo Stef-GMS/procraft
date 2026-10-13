@@ -9,6 +9,7 @@ description = "Layered raster document model and brush engine for ProCraft (no G
 [dependencies]
 image = "0.25"
 flate2 = "1"
+fontdue = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }

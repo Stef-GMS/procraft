@@ -134,9 +134,14 @@ pub fn save_psd(path: &std::path::Path, doc: &Document) -> Result<(), String> {
     // Layer records first (top layer first), channel data after.
     let mut records = Vec::new();
     let mut channel_data = Vec::new();
-    // PSD stores top-first; ours are bottom-first.
-    for layer in doc.layers.iter().rev() {
-        let has_mask = layer.mask.as_deref().map(|m| m.len() == n).unwrap_or(false);
+    // PSD stores top-first; ours are bottom-first. Each layer is baked
+    // at its canvas offset (Move tool) so Photoshop sees what we show.
+    for (ri, layer) in doc.layers.iter().rev().enumerate() {
+        let index = doc.layers.len() - 1 - ri;
+        let Some((baked_px, baked_mask)) = doc.baked_layer(index) else {
+            return Err("layer has wrong pixel size".to_string());
+        };
+        let has_mask = baked_mask.as_deref().map(|m| m.len() == n).unwrap_or(false);
         // Channel ids: transparency, R, G, B, optional user mask.
         let mut ids: Vec<i16> = vec![-1, 0, 1, 2];
         if has_mask {
@@ -175,7 +180,7 @@ pub fn save_psd(path: &std::path::Path, doc: &Document) -> Result<(), String> {
         be32(&mut records, extra.len() as u32);
         records.extend_from_slice(&extra);
         // Channel bytes: raw compression + planar data.
-        let (r, g, b, a) = planes(&layer.pixels, w, h);
+        let (r, g, b, a) = planes(&baked_px, w, h);
         let mut push = |plane: &[u8]| {
             be16(&mut channel_data, 0);
             channel_data.extend_from_slice(plane);
@@ -185,7 +190,7 @@ pub fn save_psd(path: &std::path::Path, doc: &Document) -> Result<(), String> {
         push(&g);
         push(&b);
         if has_mask {
-            push(layer.mask.as_deref().unwrap());
+            push(baked_mask.as_deref().unwrap());
         }
     }
     // Layer info section: length + count + records + channel data.
@@ -250,6 +255,8 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
             pixels: rgba,
             mask: None,
             clip: false,
+            ox: 0,
+            oy: 0,
         });
     } else {
         // The crate lists bottom-first, matching our order.
@@ -272,6 +279,8 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
                 pixels: rgba,
                 mask: None,
                 clip: !pl.is_clipping_mask(),
+                ox: 0,
+                oy: 0,
             });
             if layers.len() >= 256 {
                 break;
@@ -366,6 +375,22 @@ mod tests {
         assert_eq!(back.layers[1].pixels, vec![7; 5 * 3 * 4]);
         // Masks do not survive the third-party parser: documented gap.
         assert!(back.layers[1].mask.is_none());
+    }
+
+    #[test]
+    fn psd_offset_bakes_shifted_positions() {
+        // A layer moved +2 exports its content at canvas 2 (cropped bake),
+        // so Photoshop opens what ProCraft shows.
+        let mut doc = Document::new(5, 1);
+        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].ox = 2;
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-offset.psd");
+        save_psd(&path, &doc).unwrap();
+        let back = open_psd(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(&back.layers[0].pixels[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&back.layers[0].pixels[8..12], &[255, 0, 0, 255]);
     }
 
     #[test]

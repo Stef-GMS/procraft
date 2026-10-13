@@ -10,9 +10,10 @@ use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptio
 use rfd_shim as rfd;
 use procraft_engine::{
     BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides, PaintTarget, Palette,
-    ShapePoly, SymmetryMode, MAX_LIBRARY_BRUSHES, MAX_PALETTE_COLORS, analogous, complementary,
-    export_tip_png, import_brush_file, import_gpl_file, open_brush_library, open_palette, open_psd,
-    save_brush_library, save_palette, save_psd, starter_palette, triadic,
+    ShapePoly, SymmetryMode, MAX_ANIM_FPS, MAX_LIBRARY_BRUSHES, MAX_PALETTE_COLORS, MIN_ANIM_FPS, analogous,
+    clamp_frame, complementary, export_gif, export_tip_png, import_brush_file, import_gpl_file, next_frame,
+    onion_ghost, open_brush_library, open_palette, open_psd, prev_frame, rasterize_frame,
+    rasterize_frame_region, save_brush_library, save_palette, save_psd, starter_palette, triadic, MIN_TEXT_PX,
 };
 
 /// Latest Apple Pencil / touch pressure (0.0..=1.0) seen in this frame's
@@ -45,6 +46,7 @@ enum Tool {
     Fill,
     Move,
     Shapes,
+    Text,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -184,6 +186,22 @@ struct ProCraftApp {
     new_brush_name: String,
     custom_colors: Vec<[u8; 3]>,
     guides: Guides,
+    // Animation Assist: layers are frames (bottom-to-top), the active
+    // layer is the current frame. Ghost handles are half-res overlays,
+    // rebuilt when the neighbor pair changes or `ghost_dirty` is set by
+    // undo/redo and layer edits (painting only touches the current frame,
+    // so strokes never invalidate ghosts).
+    anim_assist: bool,
+    anim_playing: bool,
+    anim_fps: u32,
+    anim_last_t: f64,
+    anim_shown: Option<usize>,
+    onion: bool,
+    onion_amount: f32,
+    ghost_prev: Option<TextureHandle>,
+    ghost_next: Option<TextureHandle>,
+    ghost_key: (Option<usize>, Option<usize>, u32),
+    ghost_dirty: bool,
     move_from: Option<(f32, f32)>,
     move_acc: (f32, f32),
     shape_anchor: Option<(f32, f32)>,
@@ -191,6 +209,10 @@ struct ProCraftApp {
     shape_kind: ShapeKind,
     shape_fill: bool,
     shape_sides: u8,
+    text_anchor: Option<(f32, f32)>,
+    text_open: bool,
+    text_body: String,
+    text_size: f32,
     zoom: f32,
     status: String,
 }
@@ -251,6 +273,17 @@ impl ProCraftApp {
             new_brush_name: String::new(),
             custom_colors: Vec::new(),
             guides: Guides::default(),
+            anim_assist: false,
+            anim_playing: false,
+            anim_fps: 12,
+            anim_last_t: 0.0,
+            anim_shown: None,
+            onion: true,
+            onion_amount: 0.3,
+            ghost_prev: None,
+            ghost_next: None,
+            ghost_key: (None, None, 0),
+            ghost_dirty: true,
             move_from: None,
             move_acc: (0.0, 0.0),
             shape_anchor: None,
@@ -258,6 +291,10 @@ impl ProCraftApp {
             shape_kind: ShapeKind::Rect,
             shape_fill: false,
             shape_sides: 6,
+            text_anchor: None,
+            text_open: false,
+            text_body: String::new(),
+            text_size: 48.0,
             zoom: 1.0,
             status: "Drag on the canvas to paint. Ctrl+Z undoes, Ctrl+Y redoes, Esc clears selection.".to_string(),
         }
@@ -287,6 +324,32 @@ impl ProCraftApp {
                 return;
             }
         }
+        // Animation Assist: the canvas shows the current frame only
+        // (active layer over the page), not the full composite.
+        if self.anim_assist && !self.doc.layers.is_empty() {
+            let active = self.doc.active.min(self.doc.layers.len() - 1);
+            if self.texture.is_none() || self.anim_shown != Some(active) {
+                let bytes = rasterize_frame(&self.doc, active);
+                let img = ColorImage::from_rgba_unmultiplied(
+                    [self.doc.w as usize, self.doc.h as usize],
+                    &bytes,
+                );
+                self.texture = Some(ctx.load_texture("canvas", img, TextureOptions::LINEAR));
+                self.anim_shown = Some(active);
+                return;
+            }
+            if let Some((x0, y0, x1, y1)) = self.doc.take_dirty() {
+                let bytes = rasterize_frame_region(&self.doc, active, x0, y0, x1, y1);
+                let w = (x1 - x0 + 1) as usize;
+                let h = ((y1 - y0 + 1) as usize).max(bytes.len() / 4 / w.max(1));
+                let img = ColorImage::from_rgba_unmultiplied([w, h], &bytes);
+                if let Some(handle) = &mut self.texture {
+                    handle.set_partial([x0 as usize, y0 as usize], img, TextureOptions::LINEAR);
+                }
+            }
+            return;
+        }
+        self.anim_shown = None;
         if self.texture.is_none() {
             let flat = self.doc.flatten();
             let img = ColorImage::from_rgba_unmultiplied(
@@ -305,6 +368,31 @@ impl ProCraftApp {
                 handle.set_partial([x0 as usize, y0 as usize], img, TextureOptions::LINEAR);
             }
         }
+    }
+
+    /// Rebuild half-res onion ghost textures when the neighbor pair, the
+    /// amount, or layer content (`ghost_dirty`) changed. No-op otherwise.
+    fn refresh_ghosts(&mut self, ctx: &egui::Context) {
+        let active = clamp_frame(&self.doc, self.doc.active).unwrap_or(0);
+        let bits = (self.onion_amount.clamp(0.05, 0.8) * 1000.0).round() as u32;
+        let pair = if self.anim_assist && self.onion && !self.doc.layers.is_empty() {
+            (prev_frame(&self.doc, active), next_frame(&self.doc, active), bits)
+        } else {
+            (None, None, bits)
+        };
+        if !self.ghost_dirty && pair == self.ghost_key {
+            return;
+        }
+        self.ghost_dirty = false;
+        self.ghost_key = pair;
+        let (w, h) = (self.doc.w as usize, self.doc.h as usize);
+        let amount = self.onion_amount;
+        let load = |ctx: &egui::Context, name: &str, idx: Option<usize>| -> Option<TextureHandle> {
+            let full = onion_ghost(&self.doc, idx?, amount);
+            Some(ctx.load_texture(name, downsample_half(&full, w, h), TextureOptions::LINEAR))
+        };
+        self.ghost_prev = load(ctx, "ghost-prev", pair.0);
+        self.ghost_next = load(ctx, "ghost-next", pair.1);
     }
 
     fn set_page_color(&mut self, rgb: [u8; 3]) {
@@ -487,6 +575,38 @@ fn swatch_button(ui: &mut egui::Ui, rgb: [u8; 3], selected: bool) -> egui::Respo
     )
 }
 
+/// Box-downsample straight RGBA to half resolution for cheap onion-ghost
+/// overlays (the canvas rect stretches them back; ghosts are soft anyway).
+fn downsample_half(full: &[u8], w: usize, h: usize) -> ColorImage {
+    let (hw, hh) = ((w / 2).max(1), (h / 2).max(1));
+    let mut px = vec![0u8; hw * hh * 4];
+    for y in 0..hh {
+        for x in 0..hw {
+            let mut acc = [0u32; 4];
+            let mut n = 0u32;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let (sx, sy) = (x * 2 + dx, y * 2 + dy);
+                    if sx < w && sy < h {
+                        let o = (sy * w + sx) * 4;
+                        if o + 3 < full.len() {
+                            for c in 0..4 {
+                                acc[c] += full[o + c] as u32;
+                            }
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            let o = (y * hw + x) * 4;
+            for c in 0..4 {
+                px[o + c] = if n > 0 { (acc[c] / n) as u8 } else { 0 };
+            }
+        }
+    }
+    ColorImage::from_rgba_unmultiplied([hw, hh], &px)
+}
+
 /// Marching-ants rectangle: dark base line plus moving light dashes.
 fn paint_selection(painter: &egui::Painter, rect: egui::Rect, time: f64) {
     let dark = Color32::BLACK;
@@ -542,16 +662,19 @@ impl eframe::App for ProCraftApp {
         // Ctrl+Z undo, Ctrl+Y / Ctrl+Shift+Z redo, Esc clears selection.
         if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z)) && self.doc.undo()
         {
+            self.ghost_dirty = true;
             self.status = "Undone.".to_string();
         }
         if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Y)) && self.doc.redo()
         {
+            self.ghost_dirty = true;
             self.status = "Redone.".to_string();
         }
         if ui.ctx().input_mut(|i| {
             i.consume_key(egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT), egui::Key::Z)
         }) && self.doc.redo()
         {
+            self.ghost_dirty = true;
             self.status = "Redone.".to_string();
         }
         if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
@@ -572,6 +695,16 @@ impl eframe::App for ProCraftApp {
             || self.doc.selection_mask.is_some()
         {
             ui.ctx().request_repaint();
+        }
+        // Animation playback: advance the current frame on an fps clock.
+        if self.anim_assist && self.anim_playing && !self.doc.layers.is_empty() {
+            ui.ctx().request_repaint();
+            let now = ui.ctx().input(|i| i.time);
+            let fps = self.anim_fps.clamp(MIN_ANIM_FPS, MAX_ANIM_FPS);
+            if now - self.anim_last_t >= 1.0 / fps as f64 {
+                self.anim_last_t = now;
+                self.doc.active = (self.doc.active + 1) % self.doc.layers.len();
+            }
         }
 
         // One-time narrow-screen setup: portrait phones/tablets start
@@ -794,6 +927,52 @@ impl eframe::App for ProCraftApp {
                 });
         }
 
+        // Text dialog: type, size, then Render bakes the block to the
+        // active layer at the canvas anchor (one undo step).
+        if self.text_open {
+            let mut open = self.text_open;
+            let ink = Color::rgb(self.color[0], self.color[1], self.color[2]);
+            egui::Window::new("Text")
+                .open(&mut open)
+                .collapsible(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("Click the canvas to move the anchor, then Render.");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.text_body)
+                            .desired_rows(3)
+                            .hint_text("Type here (Enter = new line)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.text_size, MIN_TEXT_PX..=128.0).text("Size px"),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Render").clicked() {
+                            match self.text_anchor {
+                                Some((ax, ay)) => {
+                                    self.doc.checkpoint();
+                                    match self.doc.draw_text(ink, ax, ay, self.text_size, &self.text_body) {
+                                        Ok((w, h)) => {
+                                            self.status =
+                                                format!("Text placed ({w}x{h}px).");
+                                            self.text_open = false;
+                                        }
+                                        Err(e) => self.status = format!("Text failed: {e}"),
+                                    }
+                                }
+                                None => {
+                                    self.status =
+                                        "Click the canvas to anchor the text first.".to_string()
+                                }
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.text_open = false;
+                        }
+                    });
+                });
+            self.text_open = open;
+        }
+
         // Fresh id (not "tools"): eframe persists panel widths to disk, and the
         // old narrow width would otherwise override `default_size` forever.
         if self.show_tools {
@@ -814,6 +993,7 @@ impl eframe::App for ProCraftApp {
             ui.radio_value(&mut self.tool, Tool::Fill, "◧ Fill");
             ui.radio_value(&mut self.tool, Tool::Move, "↔ Move");
             ui.radio_value(&mut self.tool, Tool::Shapes, "○ Shapes");
+            ui.radio_value(&mut self.tool, Tool::Text, "T Text");
             if self.tool == Tool::Fill {
                 ui.add(egui::Slider::new(&mut self.fill_tolerance, 0..=255).text("Tolerance"));
             }
@@ -1182,7 +1362,7 @@ impl eframe::App for ProCraftApp {
                 }
                 ui.checkbox(&mut self.guides.snap, "Snap while painting");
                 if self.guides.snap {
-                    ui.add(egui::Slider::new(&mut self.guides.snap_px, 2.0..=32.0).text("Snap dist"));
+                    ui.add(egui::Slider::new(&mut self.guides.snap_px, 2.0..=32.0).text("Snap range (px)"));
                 }
                 ui.add(egui::Slider::new(&mut self.guides.opacity, 0.05..=1.0).text("Opacity"));
             }
@@ -1212,10 +1392,12 @@ impl eframe::App for ProCraftApp {
             });
             ui.horizontal(|ui| {
                 if ui.button("Add layer").clicked() {
+                    self.ghost_dirty = true;
                     self.doc.add_layer(format!("Layer {}", self.doc.layers.len() + 1));
                 }
                 if ui.button("Duplicate").clicked() {
                     let active = self.doc.active;
+                    self.ghost_dirty = true;
                     self.doc.duplicate_layer(active);
                     self.status = "Layer duplicated.".to_string();
                 }
@@ -1223,6 +1405,7 @@ impl eframe::App for ProCraftApp {
                 if ui.add_enabled(can_merge, egui::Button::new("Merge down")).clicked() {
                     let active = self.doc.active;
                     if self.doc.merge_down(active) {
+                        self.ghost_dirty = true;
                         self.status = "Merged down.".to_string();
                     }
                 }
@@ -1294,9 +1477,11 @@ impl eframe::App for ProCraftApp {
                 self.doc.mark_full_dirty();
             }
             if touched {
+                self.ghost_dirty = true;
                 self.doc.mark_full_dirty();
             }
             if let Some(i) = remove {
+                self.ghost_dirty = true;
                 self.doc.remove_layer(i);
             }
             ui.separator();
@@ -1333,12 +1518,14 @@ impl eframe::App for ProCraftApp {
                     self.doc.move_layer(active, active - 1);
                 }
                 if dirty {
+                    self.ghost_dirty = true;
                     self.doc.mark_full_dirty();
                 }
                 // Masks, clipping and paint target for the active layer.
                 let has_mask = self.doc.layers[active].mask.is_some();
                 ui.horizontal(|ui| {
                     if ui.button(if has_mask { "Clear mask" } else { "Add mask" }).clicked() {
+                        self.ghost_dirty = true;
                         if has_mask {
                             self.doc.clear_mask(active);
                             self.view_mask = false;
@@ -1360,6 +1547,7 @@ impl eframe::App for ProCraftApp {
                 ui.horizontal(|ui| {
                     let mut clip = self.doc.layers[active].clip;
                     if ui.checkbox(&mut clip, "Clip to below").changed() {
+                        self.ghost_dirty = true;
                         self.doc.layers[active].clip = clip;
                         self.doc.mark_full_dirty();
                         self.status = if clip { "Layer clips to below.".to_string() } else { "Clip off.".to_string() };
@@ -1377,6 +1565,87 @@ impl eframe::App for ProCraftApp {
                 self.doc.layers.len(),
                 self.doc.layers.get(self.doc.active).map(|l| l.name.as_str()).unwrap_or("-")
             ));
+            ui.separator();
+            ui.heading("Animation");
+            ui.label("Layers are frames, bottom first.");
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut self.anim_assist, "Assist").changed() {
+                    self.anim_playing = false;
+                    self.texture = None; // rebuild the view (frame vs composite)
+                    self.ghost_dirty = true;
+                    self.status = if self.anim_assist {
+                        "Animation Assist on: one frame at a time.".to_string()
+                    } else {
+                        "Animation Assist off.".to_string()
+                    };
+                }
+                let playing = self.anim_playing;
+                if ui.button(if playing { "Stop" } else { "Play" }).clicked() {
+                    if playing {
+                        self.anim_playing = false;
+                        self.status = "Playback stopped.".to_string();
+                    } else if self.doc.layers.len() < 2 {
+                        self.status = "Need at least 2 layers to play.".to_string();
+                    } else {
+                        self.anim_assist = true;
+                        self.anim_playing = true;
+                        self.anim_last_t = ui.ctx().input(|i| i.time);
+                        self.texture = None;
+                        self.ghost_dirty = true;
+                        self.status = "Playing.".to_string();
+                    }
+                }
+            });
+            if self.anim_assist && !self.doc.layers.is_empty() {
+                ui.horizontal(|ui| {
+                    if ui.button("|<").clicked() {
+                        let n = self.doc.layers.len();
+                        self.doc.active = (self.doc.active + n - 1) % n;
+                        self.doc.mark_full_dirty();
+                    }
+                    ui.label(format!("Frame {}/{}", self.doc.active + 1, self.doc.layers.len()));
+                    if ui.button(">|").clicked() {
+                        let n = self.doc.layers.len();
+                        self.doc.active = (self.doc.active + 1) % n;
+                        self.doc.mark_full_dirty();
+                    }
+                });
+                ui.add(egui::Slider::new(&mut self.anim_fps, MIN_ANIM_FPS..=MAX_ANIM_FPS).text("FPS"));
+                if ui.checkbox(&mut self.onion, "Onion skin").changed() {
+                    self.ghost_dirty = true;
+                }
+                if self.onion {
+                    if ui
+                        .add(egui::Slider::new(&mut self.onion_amount, 0.05..=0.8).text("Amount"))
+                        .changed()
+                    {
+                        self.ghost_dirty = true;
+                    }
+                }
+                if ui.button("Export GIF").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("GIF image", &["gif"]).save_file()
+                    {
+                        let path = ensure_extension(path, "gif");
+                        match export_gif(&self.doc, self.anim_fps) {
+                            Ok(bytes) => match std::fs::write(&path, &bytes) {
+                                Ok(()) => {
+                                    let shown =
+                                        self.doc.layers.iter().filter(|l| l.visible).count();
+                                    self.status = format!(
+                                        "GIF saved {} ({} frames, hidden skipped).",
+                                        path.display(),
+                                        shown
+                                    );
+                                    #[cfg(target_os = "ios")]
+                                    rfd::ios_share_file(&path);
+                                }
+                                Err(e) => self.status = format!("GIF save failed: {e}"),
+                            },
+                            Err(e) => self.status = format!("GIF export failed: {e}"),
+                        }
+                    }
+                }
+            }
             ui.separator();
             ui.heading("Transform layer");
             ui.horizontal(|ui| {
@@ -1549,6 +1818,37 @@ impl eframe::App for ProCraftApp {
                             ],
                             (1.0, gc),
                         );
+                    }
+                }
+                // Onion skins over the current frame (assist only, not in
+                // mask view): previous frame red, next frame blue.
+                if self.anim_assist && self.onion && !self.view_mask {
+                    self.refresh_ghosts(&ctx);
+                    let full = egui::Rect::from_min_max(
+                        egui::Pos2::ZERO,
+                        egui::Pos2::new(1.0, 1.0),
+                    );
+                    if let Some(tex) = &self.ghost_prev {
+                        ui.painter().image(tex.id(), rect, full, Color32::from_rgb(255, 130, 130));
+                    }
+                    if let Some(tex) = &self.ghost_next {
+                        ui.painter().image(tex.id(), rect, full, Color32::from_rgb(130, 165, 255));
+                    }
+                }
+                // Text anchor crosshair while placing type.
+                if self.tool == Tool::Text {
+                    if let Some((ax, ay)) = self.text_anchor {
+                        let p = egui::Pos2::new(rect.min.x + ax * z, rect.min.y + ay * z);
+                        for (color, width) in [(Color32::BLACK, 3.0), (Color32::WHITE, 1.5)] {
+                            ui.painter().line_segment(
+                                [p + egui::Vec2::new(-8.0, 0.0), p + egui::Vec2::new(8.0, 0.0)],
+                                (width, color),
+                            );
+                            ui.painter().line_segment(
+                                [p + egui::Vec2::new(0.0, -8.0), p + egui::Vec2::new(0.0, 8.0)],
+                                (width, color),
+                            );
+                        }
                     }
                 }
                 // Committed lasso outline stays visible on every tool (it is
@@ -1838,9 +2138,30 @@ impl eframe::App for ProCraftApp {
                     return;
                 }
 
+                if self.tool == Tool::Text {
+                    // Click anchors the text block and opens the dialog;
+                    // Render bakes it to the active layer (undoable).
+                    if resp.clicked() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            self.text_anchor = Some(clamp_pt(x, y));
+                            self.text_open = true;
+                        }
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                }
+
                 if resp.drag_started() {
                     self.doc.checkpoint();
                     self.painting = true;
+                    // Painting edits the current frame: pause playback so
+                    // the viewed frame never goes stale mid-stroke.
+                    if self.anim_playing {
+                        self.anim_playing = false;
+                        self.status = "Paused for painting.".to_string();
+                    }
                     self.last = None;
                     self.last_dyn = DabDynamics::default();
                     self.leftover = 0.0;

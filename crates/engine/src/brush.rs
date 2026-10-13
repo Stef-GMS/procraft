@@ -326,6 +326,9 @@ impl Document {
             (299.0 * c[0] as f32 + 587.0 * c[1] as f32 + 114.0 * c[2] as f32) / 1000.0
         };
         let edge = brush.softness.clamp(0.0, 1.0);
+        // Layer offset (Move tool): canvas pixel -> buffer slot.
+        let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
+        let bh = h_u32 as i32;
         let round = brush.roundness.clamp(0.1, 1.0);
         let (cos_a, sin_a) = (angle.cos(), angle.sin());
         let grain = clamp01(brush.grain);
@@ -359,7 +362,13 @@ impl Document {
                 if a <= 0.0 {
                     continue;
                 }
-                let o = (py * w + px) as usize;
+                // Store at the layer-offset slot (paint lands shifted on
+                // moved layers, exactly where the composite reads it).
+                let (lx, ly) = (px as i32 - lox, py as i32 - loy);
+                if lx < 0 || ly < 0 || lx >= w as i32 || ly >= bh {
+                    continue;
+                }
+                let o = (ly as u32 * w + lx as u32) as usize;
                 if o >= layer_mask.len() {
                     continue;
                 }
@@ -425,6 +434,9 @@ impl Document {
             (299.0 * c[0] as f32 + 587.0 * c[1] as f32 + 114.0 * c[2] as f32) / 1000.0
         };
         let round = brush.roundness.clamp(0.1, 1.0);
+        // Layer offset (Move tool): canvas pixel -> buffer slot.
+        let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
+        let bh = h_u32 as i32;
         let follow = brush.angle_follow;
         let (cos_a, sin_a) = (angle.cos(), angle.sin());
         let grain = clamp01(brush.grain);
@@ -467,7 +479,12 @@ impl Document {
                 if a <= 0.0 {
                     continue;
                 }
-                let o = (py * w + px) as usize;
+                // Store at the layer-offset slot (see parametric mask dab).
+                let (lx, ly) = (px as i32 - lox, py as i32 - loy);
+                if lx < 0 || ly < 0 || lx >= w as i32 || ly >= bh {
+                    continue;
+                }
+                let o = (ly as u32 * w + lx as u32) as usize;
                 if o >= layer_mask.len() {
                     continue;
                 }
@@ -507,8 +524,11 @@ impl Document {
             return;
         }
         let mask = self.selection_mask.as_deref();
-        let layer = &mut self.layers[active];
         let w = w_u32;
+        // Layer offset (Move tool): canvas pixel -> buffer slot.
+        let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
+        let bh = h_u32 as i32;
+        let layer = &mut self.layers[active];
         for py in y0..=y1 {
             for px in x0..=x1 {
                 if let Some((sx0, sy0, sx1, sy1)) = selection {
@@ -544,7 +564,12 @@ impl Document {
                 if a == 0 {
                     continue;
                 }
-                let o = ((py * w + px) * 4) as usize;
+                // Store at the layer-offset slot (see mask dabs).
+                let (lx, ly) = (px as i32 - lox, py as i32 - loy);
+                if lx < 0 || ly < 0 || lx >= w as i32 || ly >= bh {
+                    continue;
+                }
+                let o = ((ly as u32 * w + lx as u32) * 4) as usize;
                 if o + 3 >= layer.pixels.len() {
                     continue;
                 }
@@ -613,9 +638,12 @@ impl Document {
             return;
         }
         let mask = self.selection_mask.as_deref();
-        let layer = &mut self.layers[active];
         let w = w_u32;
         let round = brush.roundness.clamp(0.1, 1.0);
+        // Layer offset (Move tool): canvas pixel -> buffer slot.
+        let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
+        let bh = h_u32 as i32;
+        let layer = &mut self.layers[active];
         let follow = brush.angle_follow;
         let (cos_a, sin_a) = (angle.cos(), angle.sin());
         let grain = clamp01(brush.grain);
@@ -658,7 +686,12 @@ impl Document {
                 if a == 0 {
                     continue;
                 }
-                let o = ((py * w + px) * 4) as usize;
+                // Store at the layer-offset slot (see mask dabs).
+                let (lx, ly) = (px as i32 - lox, py as i32 - loy);
+                if lx < 0 || ly < 0 || lx >= w as i32 || ly >= bh {
+                    continue;
+                }
+                let o = ((ly as u32 * w + lx as u32) * 4) as usize;
                 if o + 3 >= layer.pixels.len() {
                     continue;
                 }
@@ -958,8 +991,15 @@ impl Document {
                 return;
             }
         }
-        let o = ((py * self.w + px) * 4) as usize;
+        let (w, h) = (self.w, self.h);
+        // Layer offset: store at the buffer slot for this canvas pixel.
         let Some(layer) = self.active_layer_mut() else { return };
+        let (lox, loy) = (layer.ox, layer.oy);
+        let (lx, ly) = (px as i32 - lox, py as i32 - loy);
+        if lx < 0 || ly < 0 || lx >= w as i32 || ly >= h as i32 {
+            return;
+        }
+        let o = ((ly as u32 * w + lx as u32) * 4) as usize;
         if o + 3 >= layer.pixels.len() {
             return;
         }
@@ -1203,7 +1243,20 @@ impl Document {
         }
         let (w, h) = (self.w, self.h);
         let snap = self.layers[self.active].pixels.clone();
-        let seed_off = ((y * w + x) * 4) as usize;
+        let (lox, loy) = (self.layers[self.active].ox, self.layers[self.active].oy);
+        // Canvas cell -> buffer offset, if the layer covers it. Uncovered
+        // canvas reads as transparent content (fill can flow through it
+        // when it matches, but there is no slot to store into).
+        let slot = |cx: u32, cy: u32| -> Option<usize> {
+            let lx = cx as i32 - lox;
+            let ly = cy as i32 - loy;
+            if lx < 0 || ly < 0 || lx >= w as i32 || ly >= h as i32 {
+                return None;
+            }
+            Some(((ly as u32 * w + lx as u32) * 4) as usize)
+        };
+        // Seed on uncovered canvas has no buffer to fill: no-op.
+        let Some(seed_off) = slot(x, y) else { return };
         if seed_off + 3 >= snap.len() {
             return;
         }
@@ -1254,13 +1307,25 @@ impl Document {
                 continue;
             }
             visited[idx] = 1;
-            let o = idx * 4;
-            if o + 3 >= layer.pixels.len() || !matches(&layer.pixels[o..o + 4]) {
+            let content: [u8; 4] = match slot(cx, cy) {
+                Some(o) if o + 3 < layer.pixels.len() => [
+                    layer.pixels[o],
+                    layer.pixels[o + 1],
+                    layer.pixels[o + 2],
+                    layer.pixels[o + 3],
+                ],
+                _ => [0, 0, 0, 0],
+            };
+            if !matches(&content) {
                 continue;
             }
-            let dst = [layer.pixels[o], layer.pixels[o + 1], layer.pixels[o + 2], layer.pixels[o + 3]];
-            layer.pixels[o..o + 4].copy_from_slice(&blend_over(dst, color, opacity));
-            any = true;
+            // Store only where the buffer exists (see `slot`).
+            if let Some(o) = slot(cx, cy) {
+                if o + 3 < layer.pixels.len() {
+                    layer.pixels[o..o + 4].copy_from_slice(&blend_over(content, color, opacity));
+                    any = true;
+                }
+            }
             if cx > 0 && selected(cx - 1, cy) {
                 stack.push((cx - 1, cy));
             }

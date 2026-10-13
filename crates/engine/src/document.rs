@@ -211,6 +211,13 @@ pub struct Layer {
     pub mask: Option<Vec<u8>>,
     /// Clipping mask: confine this layer to the opaque content beneath it.
     pub clip: bool,
+    /// Canvas offset of the buffer's top-left in pixels. The Move tool only
+    /// ever changes these (lossless, O(1)): content pushed off-canvas stays
+    /// in the buffer and returns when moved back. Paint paths map canvas
+    /// coordinates through the offset; compositing, merge and export bake
+    /// it. Saved to v6 project files (older versions read 0).
+    pub ox: i32,
+    pub oy: i32,
 }
 
 impl Layer {
@@ -223,7 +230,20 @@ impl Layer {
             pixels: vec![0; (w * h * 4) as usize],
             mask: None,
             clip: false,
+            ox: 0,
+            oy: 0,
         }
+    }
+
+    /// Map a canvas pixel to this layer's buffer index, if it holds content
+    /// there. `w`/`h` are the (shared) buffer dimensions.
+    fn local_offset(&self, px: u32, py: u32, w: u32, h: u32) -> Option<usize> {
+        let lx = px as i32 - self.ox;
+        let ly = py as i32 - self.oy;
+        if lx < 0 || ly < 0 || lx >= w as i32 || ly >= h as i32 {
+            return None;
+        }
+        Some(((ly as u32 * w + lx as u32) * 4) as usize)
     }
 
     pub fn clear(&mut self) {
@@ -281,6 +301,8 @@ struct UndoEntry {
     layer: usize,
     pixels: Vec<u8>,
     mask: Option<Vec<u8>>,
+    ox: i32,
+    oy: i32,
 }
 
 impl Document {
@@ -401,6 +423,8 @@ impl Document {
             layer: self.active,
             pixels: layer.pixels.clone(),
             mask: layer.mask.clone(),
+            ox: layer.ox,
+            oy: layer.oy,
         })
     }
 
@@ -415,6 +439,8 @@ impl Document {
                 if let Some(layer) = self.layers.get_mut(entry.layer) {
                     layer.pixels = entry.pixels;
                     layer.mask = entry.mask;
+                    layer.ox = entry.ox;
+                    layer.oy = entry.oy;
                     self.active = entry.layer.min(self.layers.len().saturating_sub(1));
                     self.mark_full_dirty();
                     return true;
@@ -435,6 +461,8 @@ impl Document {
                 if let Some(layer) = self.layers.get_mut(entry.layer) {
                     layer.pixels = entry.pixels;
                     layer.mask = entry.mask;
+                    layer.ox = entry.ox;
+                    layer.oy = entry.oy;
                     self.active = entry.layer.min(self.layers.len().saturating_sub(1));
                     self.mark_full_dirty();
                     return true;
@@ -447,17 +475,22 @@ impl Document {
     fn composite_pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let (mut r, mut g, mut b) =
             (self.background[0] as f32, self.background[1] as f32, self.background[2] as f32);
-        let o = ((y * self.w + x) * 4) as usize;
         // Opaque content composited so far (layers only, not the page):
         // clipping masks intersect against it.
         let mut below_a = 0.0f32;
         for layer in &self.layers {
-            if !layer.visible || layer.opacity <= 0.0 || o + 3 >= layer.pixels.len() {
+            if !layer.visible || layer.opacity <= 0.0 {
+                continue;
+            }
+            // Buffer content sits at the layer offset; off-canvas parts of
+            // the buffer simply don't cover this pixel.
+            let Some(o) = layer.local_offset(x, y, self.w, self.h) else { continue };
+            if o + 3 >= layer.pixels.len() {
                 continue;
             }
             let mut a = layer.pixels[o + 3] as f32 / 255.0 * layer.opacity.clamp(0.0, 1.0);
             if let Some(m) = layer.mask.as_deref() {
-                a *= m.get((y * self.w + x) as usize).copied().unwrap_or(255) as f32 / 255.0;
+                a *= m.get(o / 4).copied().unwrap_or(255) as f32 / 255.0;
             }
             if layer.clip {
                 a *= below_a;
@@ -507,39 +540,19 @@ impl Document {
         out
     }
 
-    /// Shift a layer by whole pixels (clipped, transparent fill). Masks
-    /// travel with their layer (shifted-in mask reveals, like new canvas).
-    /// Caller checkpoints for undo first.
+    /// Shift a layer by whole pixels. Lossless and O(1): only the layer
+    /// offset changes, so content pushed off-canvas stays in the buffer
+    /// and returns when moved back (this used to crop destructively).
+    /// Offsets are clamped to +/-16384 (the dimension cap). Caller
+    /// checkpoints for undo first (offsets ride the history entries).
     pub fn translate_layer(&mut self, index: usize, dx: i32, dy: i32) {
         if (dx == 0 && dy == 0) || index >= self.layers.len() {
             return;
         }
-        let (w, h) = (self.w as i32, self.h as i32);
-        let mut next = vec![0u8; (self.w * self.h * 4) as usize];
-        let src = self.layers[index].pixels.clone();
-        for y in 0..h {
-            for x in 0..w {
-                let (sx, sy) = (x - dx, y - dy);
-                if sx >= 0 && sx < w && sy >= 0 && sy < h {
-                    let s = ((sy * w + sx) * 4) as usize;
-                    let d = ((y * w + x) * 4) as usize;
-                    next[d..d + 4].copy_from_slice(&src[s..s + 4]);
-                }
-            }
-        }
-        self.layers[index].pixels = next;
-        if let Some(m) = self.layers[index].mask.clone() {
-            let mut nm = vec![255u8; (self.w * self.h) as usize];
-            for y in 0..h {
-                for x in 0..w {
-                    let (sx, sy) = (x - dx, y - dy);
-                    if sx >= 0 && sx < w && sy >= 0 && sy < h {
-                        nm[(y * w + x) as usize] = m[(sy * w + sx) as usize];
-                    }
-                }
-            }
-            self.layers[index].mask = Some(nm);
-        }
+        const LIM: i32 = 16384;
+        let layer = &mut self.layers[index];
+        layer.ox = (layer.ox + dx).clamp(-LIM, LIM);
+        layer.oy = (layer.oy + dy).clamp(-LIM, LIM);
         self.mark_full_dirty();
     }
 
@@ -582,6 +595,15 @@ impl Document {
             let out = Self::affine_buffer(&rgba, w, h, scale, degrees);
             self.layers[index].mask = Some(out.chunks_exact(4).map(|p| p[0]).collect());
         }
+        // Carry the offset through the same forward map (scale, then
+        // rotate about the canvas center) so transformed content lands
+        // where the pixels do. Matches affine_buffer's inverse map.
+        let theta = degrees.to_radians();
+        let (sin, cos) = theta.sin_cos();
+        let s = scale.max(0.01);
+        let (ox, oy) = (self.layers[index].ox as f32, self.layers[index].oy as f32);
+        self.layers[index].ox = (s * (ox * cos - oy * sin)).round() as i32;
+        self.layers[index].oy = (s * (ox * sin + oy * cos)).round() as i32;
         self.mark_full_dirty();
     }
 
@@ -625,6 +647,9 @@ impl Document {
             }
         }
         self.layers[index].pixels = next;
+        // Mirror the offset too so the content flips about the canvas
+        // center, exactly as before offsets existed.
+        self.layers[index].ox = -self.layers[index].ox;
         if let Some(m) = self.layers[index].mask.clone() {
             let mut nm = vec![0u8; (w * h) as usize];
             for y in 0..h {
@@ -654,6 +679,9 @@ impl Document {
             }
         }
         self.layers[index].pixels = next;
+        // Mirror the offset too so the content flips about the canvas
+        // center, exactly as before offsets existed.
+        self.layers[index].oy = -self.layers[index].oy;
         if let Some(m) = self.layers[index].mask.clone() {
             let mut nm = vec![0u8; (w * h) as usize];
             for y in 0..h {
@@ -691,29 +719,63 @@ impl Document {
         }
         let src = self.layers[index].clone();
         let sa_base = if src.visible { src.opacity.clamp(0.0, 1.0) } else { 0.0 };
+        let (w, h) = (self.w, self.h);
         let dst = &mut self.layers[index - 1];
-        for o in (0..dst.pixels.len()).step_by(4) {
-            if o + 3 >= src.pixels.len() {
-                break;
-            }
-            let mut sa = sa_base * src.pixels[o + 3] as f32 / 255.0;
-            if let Some(m) = src.mask.as_deref() {
-                sa *= m.get(o / 4).copied().unwrap_or(255) as f32 / 255.0;
-            }
-            if src.clip {
-                let dst_a = dst.pixels[o + 3] as f32 / 255.0;
-                let dst_m = dst.mask.as_deref().and_then(|m| m.get(o / 4).copied()).unwrap_or(255) as f32 / 255.0;
-                sa *= dst_a * dst_m;
-            }
-            let da = dst.pixels[o + 3] as f32 / 255.0;
-            let out_a = sa + da * (1.0 - sa);
-            if out_a > 0.0 {
-                for ch in 0..3 {
-                    let blended = src.blend.apply(src.pixels[o + ch] as f32, dst.pixels[o + ch] as f32);
-                    dst.pixels[o + ch] =
-                        ((blended * sa + dst.pixels[o + ch] as f32 * da * (1.0 - sa)) / out_a).round() as u8;
+        let (dox, doy) = (dst.ox, dst.oy);
+        for y in 0..h {
+            for x in 0..w {
+                // Destination slot -> canvas -> source slot. The merge bakes
+                // both offsets; the result keeps dst's offset.
+                let (dlx, dly) = (x as i32 - dox, y as i32 - doy);
+                if dlx < 0 || dly < 0 || dlx >= w as i32 || dly >= h as i32 {
+                    continue;
                 }
-                dst.pixels[o + 3] = (out_a * 255.0).round() as u8;
+                let o = ((dly as u32 * w + dlx as u32) * 4) as usize;
+                if o + 3 >= dst.pixels.len() {
+                    continue;
+                }
+                let (slx, sly) = (x as i32 - src.ox, y as i32 - src.oy);
+                let (sr, sg, sb, mut sa) = if slx < 0
+                    || sly < 0
+                    || slx >= w as i32
+                    || sly >= h as i32
+                {
+                    (0, 0, 0, 0.0)
+                } else {
+                    let so = ((sly as u32 * w + slx as u32) * 4) as usize;
+                    if so + 3 >= src.pixels.len() {
+                        (0, 0, 0, 0.0)
+                    } else {
+                        let mut a = sa_base * src.pixels[so + 3] as f32 / 255.0;
+                        if let Some(m) = src.mask.as_deref() {
+                            a *= m.get(so / 4).copied().unwrap_or(255) as f32 / 255.0;
+                        }
+                        (src.pixels[so], src.pixels[so + 1], src.pixels[so + 2], a)
+                    }
+                };
+                if src.clip {
+                    let dst_a = dst.pixels[o + 3] as f32 / 255.0;
+                    let dst_m = dst
+                        .mask
+                        .as_deref()
+                        .and_then(|m| m.get(o / 4).copied())
+                        .unwrap_or(255) as f32
+                        / 255.0;
+                    sa *= dst_a * dst_m;
+                }
+                let da = dst.pixels[o + 3] as f32 / 255.0;
+                let out_a = sa + da * (1.0 - sa);
+                if out_a > 0.0 {
+                    for (ch, sc) in [sr, sg, sb].iter().enumerate() {
+                        let blended =
+                            src.blend.apply(*sc as f32, dst.pixels[o + ch] as f32);
+                        dst.pixels[o + ch] = ((blended * sa
+                            + dst.pixels[o + ch] as f32 * da * (1.0 - sa))
+                            / out_a)
+                            .round() as u8;
+                    }
+                    dst.pixels[o + 3] = (out_a * 255.0).round() as u8;
+                }
             }
         }
         self.layers.remove(index);
@@ -762,17 +824,56 @@ impl Document {
     }
 
     /// The active layer's mask as opaque grayscale RGBA for the mask viewer.
-    /// `None` when there is no (valid) mask.
+    /// Rendered at the layer offset (aligned with canvas paint); uncovered
+    /// canvas reads concealed (black). `None` when there is no (valid) mask.
     pub fn mask_view(&self) -> Option<Vec<u8>> {
-        let m = self.layers.get(self.active)?.mask.as_deref()?;
+        let layer = self.layers.get(self.active)?;
+        let m = layer.mask.as_deref()?;
         if m.len() != (self.w * self.h) as usize {
             return None;
         }
         let mut out = Vec::with_capacity(m.len() * 4);
-        for &v in m {
-            out.extend_from_slice(&[v, v, v, 255]);
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let v = match layer.local_offset(x, y, self.w, self.h) {
+                    Some(o) => m.get(o / 4).copied().unwrap_or(0),
+                    None => 0,
+                };
+                out.extend_from_slice(&[v, v, v, 255]);
+            }
         }
         Some(out)
+    }
+
+    /// Bake one layer to canvas-size buffers with its offset applied
+    /// (cropped to the canvas): what interchange formats store. Returns
+    /// the shifted pixels plus the shifted mask (or `None` when the layer
+    /// has no valid mask, matching the exporter's existing rule).
+    pub fn baked_layer(&self, index: usize) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        let layer = self.layers.get(index)?;
+        let n = (self.w * self.h) as usize;
+        if layer.pixels.len() != n * 4 {
+            return None;
+        }
+        let mut px = vec![0u8; n * 4];
+        let mut mk: Option<Vec<u8>> = match layer.mask.as_deref() {
+            Some(m) if m.len() == n => Some(vec![0u8; n]),
+            _ => None,
+        };
+        for y in 0..self.h {
+            for x in 0..self.w {
+                if let Some(o) = layer.local_offset(x, y, self.w, self.h) {
+                    if o + 3 < layer.pixels.len() {
+                        let d = ((y * self.w + x) * 4) as usize;
+                        px[d..d + 4].copy_from_slice(&layer.pixels[o..o + 4]);
+                        if let (Some(m), Some(dst)) = (layer.mask.as_deref(), mk.as_mut()) {
+                            dst[(y * self.w + x) as usize] = m.get(o / 4).copied().unwrap_or(0);
+                        }
+                    }
+                }
+            }
+        }
+        Some((px, mk))
     }
 
     /// True when `(px, py)` is inside the active selection (rectangular
@@ -1055,7 +1156,7 @@ impl Document {
     pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        f.write_all(b"PCRAFT05").map_err(|e| e.to_string())?;
+        f.write_all(b"PCRAFT06").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes()).map_err(|e| e.to_string())?;
         f.write_all(&self.h.to_le_bytes()).map_err(|e| e.to_string())?;
         f.write_all(&self.background).map_err(|e| e.to_string())?;
@@ -1090,6 +1191,9 @@ impl Document {
             };
             f.write_all(&[blend]).map_err(|e| e.to_string())?;
             f.write_all(&[u8::from(layer.clip)]).map_err(|e| e.to_string())?;
+            // v6 stores the canvas offset (Move tool) as two i32s.
+            f.write_all(&layer.ox.to_le_bytes()).map_err(|e| e.to_string())?;
+            f.write_all(&layer.oy.to_le_bytes()).map_err(|e| e.to_string())?;
             let expect = (self.w * self.h * 4) as usize;
             if layer.pixels.len() != expect {
                 return Err("layer has wrong pixel size".to_string());
@@ -1133,7 +1237,8 @@ impl Document {
             Ok(head)
         };
         let magic = take(8)?.to_vec();
-        let v5 = magic == b"PCRAFT05";
+        let v6 = magic == b"PCRAFT06";
+        let v5 = v6 || magic == b"PCRAFT05";
         let v4 = v5 || magic == b"PCRAFT04";
         let v3 = v4 || magic == b"PCRAFT03";
         let v2 = v3 || magic == b"PCRAFT02";
@@ -1191,6 +1296,20 @@ impl Document {
             };
             // v5 stores the clipping flag right after the blend byte.
             let clip = if v5 { take(1)?[0] != 0 } else { false };
+            // v6 appends the canvas offset (two i32s); older files read 0.
+            let (ox, oy) = if v6 {
+                let ox = i32::from_le_bytes(
+                    take(4)?[..4].try_into().map_err(|_| "bad layer offset".to_string())?,
+                )
+                .clamp(-16384, 16384);
+                let oy = i32::from_le_bytes(
+                    take(4)?[..4].try_into().map_err(|_| "bad layer offset".to_string())?,
+                )
+                .clamp(-16384, 16384);
+                (ox, oy)
+            } else {
+                (0, 0)
+            };
             let expect = (w * h * 4) as usize;
             let pixels = if v4 {
                 let comp_len = u32::from_le_bytes(
@@ -1237,7 +1356,7 @@ impl Document {
             } else {
                 None
             };
-            layers.push(Layer { name, visible, opacity, blend, pixels, mask, clip });
+            layers.push(Layer { name, visible, opacity, blend, pixels, mask, clip, ox, oy });
         }
         if !cur.is_empty() {
             return Err("project has trailing data".to_string());
@@ -1397,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_roundtrip_keeps_masks_clips_and_blends() {
+    fn v6_roundtrip_keeps_masks_clips_and_blends() {
         let mut doc = Document::new(4, 2);
         doc.layers[0].blend = BlendMode::Difference;
         doc.layers[0].pixels = vec![200; 4 * 2 * 4];
@@ -1407,9 +1526,13 @@ mod tests {
         doc.layers[1].blend = BlendMode::SoftLight;
         doc.layers[1].clip = true;
         doc.layers[1].pixels = vec![7; 4 * 2 * 4];
+        doc.layers[1].ox = -3;
+        doc.layers[1].oy = 2;
         let dir = std::env::temp_dir();
-        let path = dir.join("procraft-v5.pcraft");
+        let path = dir.join("procraft-v6.pcraft");
         doc.save_project(&path).unwrap();
+        let head = std::fs::read(&path).unwrap();
+        assert_eq!(&head[..8], b"PCRAFT06");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].blend, BlendMode::Difference);
@@ -1417,6 +1540,44 @@ mod tests {
         assert_eq!(back.layers[1].blend, BlendMode::SoftLight);
         assert!(back.layers[1].clip);
         assert_eq!(back.layers[1].pixels, vec![7; 4 * 2 * 4]);
+        assert_eq!((back.layers[1].ox, back.layers[1].oy), (-3, 2));
+    }
+
+    #[test]
+    fn v5_files_open_with_zero_offsets() {
+        // Minimal v5 file: like v4 plus clip byte, no ox/oy fields.
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v5-compat.pcraft");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT05");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[0]);
+        buf.extend_from_slice(&[6]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // blend: Normal
+        buf.extend_from_slice(&[0]); // clip: off
+        let raw = vec![9u8; 2 * 1 * 4];
+        let packed = {
+            use std::io::Write;
+            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(&raw).unwrap();
+            enc.finish().unwrap()
+        };
+        buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&packed);
+        buf.extend_from_slice(&[0]); // mask flag: none
+        std::fs::write(&path, &buf).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.layers[0].pixels, raw);
+        assert_eq!((back.layers[0].ox, back.layers[0].oy), (0, 0));
     }
 
     #[test]
@@ -1479,9 +1640,13 @@ mod tests {
         doc.add_mask(0);
         doc.layers[0].mask.as_mut().unwrap()[0] = 0;
         doc.translate_layer(0, 1, 0);
-        assert_eq!(doc.layers[0].mask.as_ref().unwrap()[1], 0);
+        // With offsets, mask data doesn't move; offset changes instead.
+        assert_eq!(doc.layers[0].ox, 1);
+        assert_eq!(doc.layers[0].mask.as_ref().unwrap()[0], 0);
         doc.flip_layer_horizontal(0);
-        assert_eq!(doc.layers[0].mask.as_ref().unwrap()[2], 0);
+        // 4-pixel wide: horizontal flip mirrors mask indices 0<->3, 1<->2.
+        assert_eq!(doc.layers[0].mask.as_ref().unwrap()[3], 0);
+        assert_eq!(doc.layers[0].ox, -1);
         // Affine keeps dimensions and mask presence.
         doc.affine_layer(0, 1.0, 90.0);
         assert!(doc.layers[0].mask.is_some());
@@ -1599,8 +1764,114 @@ mod tests {
         let mut doc = Document::new(4, 1);
         doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
         doc.translate_layer(0, 2, 0);
-        assert_eq!(&doc.layers[0].pixels[8..12], &[255, 0, 0, 255]);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[0, 0, 0, 0]);
+        // With offsets, pixels don't move; offset changes instead.
+        assert_eq!(doc.layers[0].ox, 2);
+        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn move_off_canvas_and_back_restores() {
+        // The reported Move bug: content pushed fully off-canvas vanished
+        // on return because translate cropped destructively. Offsets keep
+        // every pixel, so the round trip is exact.
+        let mut doc = Document::new(8, 4);
+        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels[4..8].copy_from_slice(&[0, 255, 0, 255]);
+        let want = doc.layers[0].pixels.clone();
+        // Paint shows at the origin.
+        assert_eq!(&doc.flatten()[0..4], &[255, 0, 0, 255]);
+        // Fully off-canvas: composite shows only the page, buffer intact.
+        doc.translate_layer(0, 100, 0);
+        assert!(doc.flatten().chunks_exact(4).all(|p| p == [255, 255, 255, 255]));
+        assert_eq!(doc.layers[0].pixels, want);
+        // Back home: pixel-perfect, buffer untouched throughout.
+        doc.translate_layer(0, -100, 0);
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (0, 0));
+        assert_eq!(doc.layers[0].pixels, want);
+        assert_eq!(&doc.flatten()[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&doc.flatten()[4..8], &[0, 255, 0, 255]);
+        // Partially off-canvas: visible part composites, rest survives.
+        doc.translate_layer(0, -1, 0);
+        assert_eq!(&doc.flatten()[0..4], &[0, 255, 0, 255]);
+        doc.translate_layer(0, 1, 0);
+        assert_eq!(&doc.flatten()[0..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn move_undo_redo_restores_offset() {
+        let mut doc = Document::new(8, 8);
+        doc.checkpoint();
+        doc.translate_layer(0, 30, -12);
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (30, -12));
+        assert!(doc.undo());
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (0, 0));
+        assert!(doc.redo());
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (30, -12));
+    }
+
+    #[test]
+    fn paint_after_move_lands_shifted() {
+        // Brush input is canvas-space; storage follows the layer offset,
+        // so paint appears under the cursor on moved layers.
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(32, 32);
+        doc.translate_layer(0, 5, 0);
+        let brush = Brush { size: 3.0, softness: 0.0, opacity: 1.0, ..Default::default() };
+        doc.dab(&brush, Color::rgb(255, 0, 0), 10.5, 10.5);
+        // Composite shows paint at the canvas dab point...
+        let at = |d: &Document, x: u32, y: u32| {
+            let o = ((y * 32 + x) * 4) as usize;
+            [d.flatten()[o], d.flatten()[o + 1], d.flatten()[o + 2], d.flatten()[o + 3]]
+        };
+        assert_eq!(at(&doc, 10, 10), [255, 0, 0, 255]);
+        // ...stored shifted in the buffer (local 5, 10).
+        let o = ((10 * 32 + 5) * 4) as usize;
+        assert_eq!(&doc.layers[0].pixels[o..o + 4], &[255, 0, 0, 255]);
+        // And off-canvas dabs on a shifted layer still paint nothing.
+        let before = doc.layers[0].pixels.clone();
+        doc.translate_layer(0, 1000, 0);
+        doc.dab(&brush, Color::rgb(0, 255, 0), 10.5, 10.5);
+        assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
+    fn merge_with_offsets_bakes_positions() {
+        // dst blue at canvas 0; src red lives at buffer 0 but ox=1.
+        let mut doc = Document::new(3, 1);
+        doc.layers[0].pixels[0..4].copy_from_slice(&[0, 0, 255, 255]);
+        doc.add_layer("top".to_string());
+        doc.layers[1].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[1].ox = 1;
+        assert!(doc.merge_down(1));
+        // Red baked at canvas 1 (buffer 1), blue kept at canvas 0.
+        assert_eq!(&doc.layers[0].pixels[0..4], &[0, 0, 255, 255]);
+        assert_eq!(&doc.layers[0].pixels[4..8], &[255, 0, 0, 255]);
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (0, 0));
+    }
+
+    #[test]
+    fn flip_mirrors_offset_about_center() {
+        let mut doc = Document::new(8, 8);
+        doc.layers[0].ox = 3;
+        doc.layers[0].oy = -2;
+        doc.flip_layer_horizontal(0);
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (-3, -2));
+        doc.flip_layer_vertical(0);
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (-3, 2));
+    }
+
+    #[test]
+    fn mask_view_follows_offset() {
+        let mut doc = Document::new(4, 1);
+        doc.add_mask(0);
+        doc.layers[0].mask.as_mut().unwrap()[0] = 200;
+        // Unshifted: viewer shows the value at canvas 0.
+        assert_eq!(&doc.mask_view().unwrap()[0..4], &[200, 200, 200, 255]);
+        // Shifted right: canvas 0 reads concealed, canvas 1 shows it.
+        doc.translate_layer(0, 1, 0);
+        let view = doc.mask_view().unwrap();
+        assert_eq!(&view[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&view[4..8], &[200, 200, 200, 255]);
     }
 
     #[test]
@@ -1874,7 +2145,7 @@ mod tests {
         let raw = 128usize * 128 * 4;
         assert!(meta.len() as usize * 4 < raw, "compressed {} vs raw {raw}", meta.len());
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT05");
+        assert_eq!(&head[..8], b"PCRAFT06");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].pixels, doc.layers[0].pixels);

@@ -2026,8 +2026,11 @@ impl eframe::App for ProCraftApp {
             }
         }
 
+        // Top bar: pinned browser buttons plus grouped menus (File / Edit
+        // / View) — one row on every screen instead of the old wrapping
+        // button soup that clipped Rotate° off the iPad edge. Actions
+        // close their menu; sliders/steppers stay open for repeat tweaks.
         egui::Panel::top("menu").show(ui, |ui| {
-            // Wrapped rows: one row on desktop, two on narrow screens.
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Gallery").clicked() {
                     self.gallery_open = !self.gallery_open;
@@ -2035,223 +2038,254 @@ impl eframe::App for ProCraftApp {
                 if ui.button("Reference").clicked() {
                     self.ref_open = !self.ref_open;
                 }
-                if ui.button("Save PNG").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PNG", &["png"])
-                        .save_file()
-                    {
-                        // The dialog may return an extensionless path (always
-                        // on iOS); the encoder needs the suffix to pick PNG.
-                        let path = ensure_extension(path, "png");
-                        match self.doc.save_png(&path) {
-                            Ok(()) => {
-                                self.status = format!("Saved {}", path.display());
-                                #[cfg(target_os = "ios")]
-                                rfd::ios_share_file(&path);
+                ui.menu_button("File", |ui| {
+                    if ui.button("Save PNG").clicked() {
+                        ui.close();
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("PNG", &["png"])
+                            .save_file()
+                        {
+                            // The dialog may return an extensionless path (always
+                            // on iOS); the encoder needs the suffix to pick PNG.
+                            let path = ensure_extension(path, "png");
+                            match self.doc.save_png(&path) {
+                                Ok(()) => {
+                                    self.status = format!("Saved {}", path.display());
+                                    #[cfg(target_os = "ios")]
+                                    rfd::ios_share_file(&path);
+                                }
+                                Err(e) => self.status = format!("Save failed: {e}"),
                             }
-                            Err(e) => self.status = format!("Save failed: {e}"),
                         }
                     }
-                }
-                stepped_slider(ui, &mut self.jpeg_quality, 1..=100, 1.0, "JPEG q");
-                if ui.button("Save JPEG").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("JPEG", &["jpg", "jpeg"])
-                        .save_file()
-                    {
-                        let path = ensure_extension(path, "jpg");
-                        match self.doc.save_jpeg(&path, self.jpeg_quality) {
-                            Ok(()) => {
-                                self.status = format!(
-                                    "Saved {} (quality {})",
-                                    path.display(),
-                                    self.jpeg_quality
-                                );
-                                #[cfg(target_os = "ios")]
-                                rfd::ios_share_file(&path);
+                    stepped_slider(ui, &mut self.jpeg_quality, 1..=100, 1.0, "JPEG q");
+                    if ui.button("Save JPEG").clicked() {
+                        ui.close();
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("JPEG", &["jpg", "jpeg"])
+                            .save_file()
+                        {
+                            let path = ensure_extension(path, "jpg");
+                            match self.doc.save_jpeg(&path, self.jpeg_quality) {
+                                Ok(()) => {
+                                    self.status = format!(
+                                        "Saved {} (quality {})",
+                                        path.display(),
+                                        self.jpeg_quality
+                                    );
+                                    #[cfg(target_os = "ios")]
+                                    rfd::ios_share_file(&path);
+                                }
+                                Err(e) => self.status = format!("Save failed: {e}"),
                             }
-                            Err(e) => self.status = format!("Save failed: {e}"),
                         }
                     }
-                }
-                if ui.button("Save TIFF").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("TIFF", &["tif", "tiff"])
-                        .save_file()
-                    {
-                        let path = ensure_extension(path, "tiff");
-                        match self.doc.save_tiff(&path) {
-                            Ok(()) => {
-                                self.status = format!("Saved {}", path.display());
-                                #[cfg(target_os = "ios")]
-                                rfd::ios_share_file(&path);
+                    if ui.button("Save TIFF").clicked() {
+                        ui.close();
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("TIFF", &["tif", "tiff"])
+                            .save_file()
+                        {
+                            let path = ensure_extension(path, "tiff");
+                            match self.doc.save_tiff(&path) {
+                                Ok(()) => {
+                                    self.status = format!("Saved {}", path.display());
+                                    #[cfg(target_os = "ios")]
+                                    rfd::ios_share_file(&path);
+                                }
+                                Err(e) => self.status = format!("Save failed: {e}"),
                             }
-                            Err(e) => self.status = format!("Save failed: {e}"),
                         }
                     }
-                }
-                if ui.button("Open image").clicked() {
-                    #[cfg(not(target_os = "ios"))]
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter(
-                            "Images",
-                            &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
-                        )
-                        .pick_file()
-                    {
-                        match self.doc.load_background(&path) {
-                            Ok(()) => {
-                                self.texture = None;
-                                self.lasso_points.clear();
-                                self.lasso_poly.clear();
-                                self.status = format!("Opened {}", path.display());
-                            }
-                            Err(e) => self.status = format!("Open failed: {e}"),
-                        }
-                    }
-                    // iOS: presents the picker; open_picked() loads on resolve.
-                    #[cfg(target_os = "ios")]
-                    {
-                        let _ = rfd::FileDialog::new()
+                    if ui.button("Open image").clicked() {
+                        ui.close();
+                        #[cfg(not(target_os = "ios"))]
+                        if let Some(path) = rfd::FileDialog::new()
                             .add_filter(
                                 "Images",
                                 &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
                             )
-                            .pick_file();
-                        self.pending_open = Some(PendingOpen::Image);
-                        self.status = "Pick an image…".to_string();
-                    }
-                }
-                if ui.button("Save project").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("ProCraft project", &["procraft"])
-                        .save_file()
-                    {
-                        let path = ensure_extension(path, "procraft");
-                        match self.doc.save_project(&path) {
-                            Ok(()) => {
-                                let s = path.to_string_lossy().to_string();
-                                push_recent(&mut self.recent, &s);
-                                self.gallery_keys.clear();
-                                self.status = format!("Project saved {}", path.display());
-                                self.clear_recovery();
-                                #[cfg(target_os = "ios")]
-                                rfd::ios_share_file(&path);
+                            .pick_file()
+                        {
+                            match self.doc.load_background(&path) {
+                                Ok(()) => {
+                                    self.texture = None;
+                                    self.lasso_points.clear();
+                                    self.lasso_poly.clear();
+                                    self.status = format!("Opened {}", path.display());
+                                }
+                                Err(e) => self.status = format!("Open failed: {e}"),
                             }
-                            Err(e) => self.status = format!("Project save failed: {e}"),
+                        }
+                        // iOS: presents the picker; open_picked() loads on resolve.
+                        #[cfg(target_os = "ios")]
+                        {
+                            let _ = rfd::FileDialog::new()
+                                .add_filter(
+                                    "Images",
+                                    &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
+                                )
+                                .pick_file();
+                            self.pending_open = Some(PendingOpen::Image);
+                            self.status = "Pick an image…".to_string();
                         }
                     }
-                }
-                if ui.button("Open project").clicked() {
-                    #[cfg(not(target_os = "ios"))]
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("ProCraft project", &["procraft"])
-                        .pick_file()
-                    {
-                        match Document::open_project(&path) {
-                            Ok(doc) => {
-                                let s = path.to_string_lossy().to_string();
-                                self.adopt_project(doc, &s, "Project opened");
-                            }
-                            Err(e) => self.status = format!("Project open failed: {e}"),
-                        }
-                    }
-                    #[cfg(target_os = "ios")]
-                    {
-                        let _ = rfd::FileDialog::new()
+                    ui.separator();
+                    if ui.button("Save project").clicked() {
+                        ui.close();
+                        if let Some(path) = rfd::FileDialog::new()
                             .add_filter("ProCraft project", &["procraft"])
-                            .pick_file();
-                        self.pending_open = Some(PendingOpen::Project);
-                        self.status = "Pick a project…".to_string();
-                    }
-                }
-                if ui.button("PSD export").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Photoshop document", &["psd"])
-                        .save_file()
-                    {
-                        let path = ensure_extension(path, "psd");
-                        match save_psd(&path, &self.doc) {
-                            Ok(()) => {
-                                self.status = format!(
-                                    "PSD saved {} (masks do not round-trip)",
-                                    path.display()
-                                );
-                                #[cfg(target_os = "ios")]
-                                rfd::ios_share_file(&path);
+                            .save_file()
+                        {
+                            let path = ensure_extension(path, "procraft");
+                            match self.doc.save_project(&path) {
+                                Ok(()) => {
+                                    let s = path.to_string_lossy().to_string();
+                                    push_recent(&mut self.recent, &s);
+                                    self.gallery_keys.clear();
+                                    self.status = format!("Project saved {}", path.display());
+                                    self.clear_recovery();
+                                    #[cfg(target_os = "ios")]
+                                    rfd::ios_share_file(&path);
+                                }
+                                Err(e) => self.status = format!("Project save failed: {e}"),
                             }
-                            Err(e) => self.status = format!("PSD save failed: {e}"),
                         }
                     }
-                }
-                if ui.button("Open PSD").clicked() {
-                    #[cfg(not(target_os = "ios"))]
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Photoshop document", &["psd"])
-                        .pick_file()
-                    {
-                        match open_psd(&path) {
-                            Ok(doc) => {
-                                self.doc = doc;
-                                self.clear_recovery();
-                                self.texture = None;
-                                self.lasso_points.clear();
-                                self.lasso_poly.clear();
-                                self.status =
-                                    format!("PSD opened {} (masks do not import)", path.display());
+                    if ui.button("Open project").clicked() {
+                        ui.close();
+                        #[cfg(not(target_os = "ios"))]
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("ProCraft project", &["procraft"])
+                            .pick_file()
+                        {
+                            match Document::open_project(&path) {
+                                Ok(doc) => {
+                                    let s = path.to_string_lossy().to_string();
+                                    self.adopt_project(doc, &s, "Project opened");
+                                }
+                                Err(e) => self.status = format!("Project open failed: {e}"),
                             }
-                            Err(e) => self.status = format!("PSD open failed: {e}"),
+                        }
+                        #[cfg(target_os = "ios")]
+                        {
+                            let _ = rfd::FileDialog::new()
+                                .add_filter("ProCraft project", &["procraft"])
+                                .pick_file();
+                            self.pending_open = Some(PendingOpen::Project);
+                            self.status = "Pick a project…".to_string();
                         }
                     }
-                    #[cfg(target_os = "ios")]
-                    {
-                        let _ = rfd::FileDialog::new()
+                    ui.separator();
+                    if ui.button("PSD export").clicked() {
+                        ui.close();
+                        if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Photoshop document", &["psd"])
-                            .pick_file();
-                        self.pending_open = Some(PendingOpen::Psd);
-                        self.status = "Pick a PSD…".to_string();
+                            .save_file()
+                        {
+                            let path = ensure_extension(path, "psd");
+                            match save_psd(&path, &self.doc) {
+                                Ok(()) => {
+                                    self.status = format!(
+                                        "PSD saved {} (masks do not round-trip)",
+                                        path.display()
+                                    );
+                                    #[cfg(target_os = "ios")]
+                                    rfd::ios_share_file(&path);
+                                }
+                                Err(e) => self.status = format!("PSD save failed: {e}"),
+                            }
+                        }
                     }
-                }
-                if ui.button("Clear layer").clicked() {
-                    self.doc.checkpoint();
-                    if let Some(layer) = self.doc.active_layer_mut() {
-                        layer.clear();
+                    if ui.button("Open PSD").clicked() {
+                        ui.close();
+                        #[cfg(not(target_os = "ios"))]
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Photoshop document", &["psd"])
+                            .pick_file()
+                        {
+                            match open_psd(&path) {
+                                Ok(doc) => {
+                                    self.doc = doc;
+                                    self.clear_recovery();
+                                    self.texture = None;
+                                    self.lasso_points.clear();
+                                    self.lasso_poly.clear();
+                                    self.status = format!(
+                                        "PSD opened {} (masks do not import)",
+                                        path.display()
+                                    );
+                                }
+                                Err(e) => self.status = format!("PSD open failed: {e}"),
+                            }
+                        }
+                        #[cfg(target_os = "ios")]
+                        {
+                            let _ = rfd::FileDialog::new()
+                                .add_filter("Photoshop document", &["psd"])
+                                .pick_file();
+                            self.pending_open = Some(PendingOpen::Psd);
+                            self.status = "Pick a PSD…".to_string();
+                        }
                     }
-                    self.doc.mark_full_dirty();
-                }
-                if ui.button("Undo").clicked() && self.doc.undo() {
-                    self.status = "Undone.".to_string();
-                }
-                if ui.button("Redo").clicked() && self.doc.redo() {
-                    self.status = "Redone.".to_string();
-                }
-                ui.separator();
-                ui.label("Theme:");
-                ui.radio_value(&mut self.theme, Theme::Dark, "Dark");
-                ui.radio_value(&mut self.theme, Theme::Light, "Light");
-                ui.radio_value(&mut self.theme, Theme::Paper, "Paper");
-                ui.separator();
-                if ui.button("−").clicked() {
-                    self.zoom = (self.zoom / 1.25).clamp(0.1, 8.0);
-                }
-                ui.label(format!("{}%", (self.zoom * 100.0).round() as u32));
-                if ui.button("+").clicked() {
-                    self.zoom = (self.zoom * 1.25).clamp(0.1, 8.0);
-                }
-                if ui.button("Fit").clicked() {
-                    self.zoom = 0.0; // recomputed in the canvas view
-                    self.view_offset = egui::Vec2::ZERO;
-                    self.view_angle = 0.0;
-                }
-                let mut deg = self.view_angle.to_degrees();
-                stepped_slider(ui, &mut deg, -180.0..=180.0, 1.0, "Rotate°");
-                self.view_angle = deg.to_radians();
-                if ui.button("Reset rotation").clicked() {
-                    self.view_angle = 0.0;
-                }
-                if ui.button("ⓘ About").clicked() {
-                    self.show_about = !self.show_about;
-                }
+                });
+                ui.menu_button("Edit", |ui| {
+                    if ui.button("Clear layer").clicked() {
+                        self.doc.checkpoint();
+                        if let Some(layer) = self.doc.active_layer_mut() {
+                            layer.clear();
+                        }
+                        self.doc.mark_full_dirty();
+                        ui.close();
+                    }
+                    if ui.button("Undo").clicked() {
+                        if self.doc.undo() {
+                            self.status = "Undone.".to_string();
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Redo").clicked() {
+                        if self.doc.redo() {
+                            self.status = "Redone.".to_string();
+                        }
+                        ui.close();
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Theme:");
+                        ui.radio_value(&mut self.theme, Theme::Dark, "Dark");
+                        ui.radio_value(&mut self.theme, Theme::Light, "Light");
+                        ui.radio_value(&mut self.theme, Theme::Paper, "Paper");
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("−").clicked() {
+                            self.zoom = (self.zoom / 1.25).clamp(0.1, 8.0);
+                        }
+                        ui.label(format!("{}%", (self.zoom * 100.0).round() as u32));
+                        if ui.button("+").clicked() {
+                            self.zoom = (self.zoom * 1.25).clamp(0.1, 8.0);
+                        }
+                        if ui.button("Fit").clicked() {
+                            self.zoom = 0.0; // recomputed in the canvas view
+                            self.view_offset = egui::Vec2::ZERO;
+                            self.view_angle = 0.0;
+                            ui.close();
+                        }
+                    });
+                    let mut deg = self.view_angle.to_degrees();
+                    stepped_slider(ui, &mut deg, -180.0..=180.0, 1.0, "Rotate°");
+                    self.view_angle = deg.to_radians();
+                    if ui.button("Reset rotation").clicked() {
+                        self.view_angle = 0.0;
+                        ui.close();
+                    }
+                    if ui.button("ⓘ About").clicked() {
+                        self.show_about = !self.show_about;
+                        ui.close();
+                    }
+                });
             });
         });
 

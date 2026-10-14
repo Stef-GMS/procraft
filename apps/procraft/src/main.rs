@@ -2384,6 +2384,8 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                 }
+            });
+            ui.horizontal(|ui| {
                 if ui.button("Clear").clicked() {
                     self.palettes.clear_active();
                     self.status = "Active palette cleared.".to_string();
@@ -3760,8 +3762,10 @@ impl eframe::App for ProCraftApp {
                 if self.tool == Tool::Fill {
                     // ColorDrop: tap fills; keep holding and drag sideways to
                     // sweep the tolerance with a live preview (one undo step
-                    // for the whole gesture).
-                    if resp.drag_started() && !gesture {
+                    // for the whole gesture). `clicked` covers motionless
+                    // taps: a click-and-drag widget only reports a drag once
+                    // the pointer moves.
+                    if (resp.drag_started() || resp.clicked()) && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
                             let (cx, cy) = clamp_pt(x, y);
@@ -3833,7 +3837,8 @@ impl eframe::App for ProCraftApp {
                     // Tap or drag to lift the composited color into the
                     // brush; the loupe shows a magnified ring so a finger
                     // never covers the target (touch-first, iPad-visible).
-                    if (resp.drag_started() || resp.dragged()) && !gesture {
+                    // `clicked` covers motionless taps (see the Fill note).
+                    if (resp.drag_started() || resp.dragged() || resp.clicked()) && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
                             let (cx, cy) = clamp_pt(x, y);

@@ -1433,9 +1433,11 @@ fn vp_handle_pos(rect: egui::Rect, z: f32, vx: f32, vy: f32) -> (egui::Pos2, boo
 }
 
 /// Slider with −/+ step buttons flush at its ends: one compact control
-/// (`label [−|slider|+]`) instead of three widgets spread across the row.
-/// `step` is in value units, endpoints clamp. The row wraps on narrow
-/// screens; touch sizing is 28x24 on the buttons.
+/// instead of three widgets spread across the row. `stepped_slider` puts
+/// the name first (`Size [−|slider|+]`); `stepped_slider_label_end` puts
+/// it last (`[−|slider|+] Size`, the Filters convention). `step` is in
+/// value units, endpoints clamp. Rows wrap on narrow screens; the step
+/// buttons are 28x20.
 const SLIDER_W: f32 = 100.0;
 
 fn stepped_slider<Num: egui::emath::Numeric>(
@@ -1445,23 +1447,49 @@ fn stepped_slider<Num: egui::emath::Numeric>(
     step: f64,
     text: &str,
 ) {
+    stepped_slider_inner(ui, value, range, step, text, false);
+}
+
+fn stepped_slider_label_end<Num: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+    step: f64,
+    text: &str,
+) {
+    stepped_slider_inner(ui, value, range, step, text, true);
+}
+
+fn stepped_slider_inner<Num: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+    step: f64,
+    text: &str,
+    label_end: bool,
+) {
     let lo = range.start().to_f64();
     let hi = range.end().to_f64();
     ui.horizontal_wrapped(|ui| {
-        ui.label(text);
+        if !label_end {
+            ui.label(text);
+        }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-            if ui.add_sized([28.0, 24.0], egui::Button::new("−")).clicked() {
+            if ui.add_sized([28.0, 20.0], egui::Button::new("−")).clicked() {
                 *value = Num::from_f64((value.to_f64() - step).clamp(lo, hi));
             }
             ui.add_sized(
-                egui::Vec2::new(SLIDER_W, 24.0),
+                egui::Vec2::new(SLIDER_W, 20.0),
                 egui::Slider::new(value, range),
             );
-            if ui.add_sized([28.0, 24.0], egui::Button::new("+")).clicked() {
+            if ui.add_sized([28.0, 20.0], egui::Button::new("+")).clicked() {
                 *value = Num::from_f64((value.to_f64() + step).clamp(lo, hi));
             }
         });
+        if label_end {
+            ui.label(text);
+        }
     });
 }
 
@@ -4047,8 +4075,8 @@ impl eframe::App for ProCraftApp {
             // Tone previews live from a snapshot (one undo step); Apply
             // keeps the preview, or applies once when nothing is pending.
             let tone_before = (self.filt_brightness, self.filt_contrast);
-            stepped_slider(ui, &mut self.filt_brightness, -100..=100, 1.0, "Brightness");
-            stepped_slider(ui, &mut self.filt_contrast, 0.0..=200.0, 1.0, "Contrast %");
+            stepped_slider_label_end(ui, &mut self.filt_brightness, -100..=100, 1.0, "Brightness");
+            stepped_slider_label_end(ui, &mut self.filt_contrast, 0.0..=200.0, 1.0, "Contrast %");
             if (self.filt_brightness, self.filt_contrast) != tone_before {
                 let (b, c) = (self.filt_brightness, self.filt_contrast);
                 self.filter_scrub(0, move |doc, layer| {
@@ -4078,7 +4106,7 @@ impl eframe::App for ProCraftApp {
                 self.capture_timelapse();
             }
             let blur_before = self.filt_blur;
-            stepped_slider(ui, &mut self.filt_blur, 0..=25, 1.0, "Blur");
+            stepped_slider_label_end(ui, &mut self.filt_blur, 0..=25, 1.0, "Blur");
             if self.filt_blur != blur_before {
                 let r = self.filt_blur.max(0) as u32;
                 self.filter_scrub(1, move |doc, layer| {
@@ -4101,7 +4129,7 @@ impl eframe::App for ProCraftApp {
                 self.capture_timelapse();
             }
             let sharp_before = self.filt_sharpen;
-            stepped_slider(ui, &mut self.filt_sharpen, 0.0..=200.0, 1.0, "Sharpen %");
+            stepped_slider_label_end(ui, &mut self.filt_sharpen, 0.0..=200.0, 1.0, "Sharpen %");
             if self.filt_sharpen != sharp_before {
                 let s = self.filt_sharpen / 100.0;
                 self.filter_scrub(2, move |doc, layer| {
@@ -4127,9 +4155,9 @@ impl eframe::App for ProCraftApp {
             // preview + Apply rhythm as tone (preview kind 3).
             let levels_before =
                 (self.filt_levels_shadow, self.filt_levels_gamma, self.filt_levels_high);
-            stepped_slider(ui, &mut self.filt_levels_shadow, 0..=255, 1.0, "Shadow");
-            stepped_slider(ui, &mut self.filt_levels_gamma, 10.0..=400.0, 1.0, "Gamma %");
-            stepped_slider(ui, &mut self.filt_levels_high, 0..=255, 1.0, "Highlight");
+            stepped_slider_label_end(ui, &mut self.filt_levels_shadow, 0..=255, 1.0, "Shadow");
+            stepped_slider_label_end(ui, &mut self.filt_levels_gamma, 10.0..=400.0, 1.0, "Gamma %");
+            stepped_slider_label_end(ui, &mut self.filt_levels_high, 0..=255, 1.0, "Highlight");
             if (self.filt_levels_shadow, self.filt_levels_gamma, self.filt_levels_high)
                 != levels_before
             {
@@ -4167,9 +4195,9 @@ impl eframe::App for ProCraftApp {
             // M36 Curves (parametric shadows/mids/highlights through a
             // pinned-endpoint LUT; preview kind 4).
             let curves_before = (self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high);
-            stepped_slider(ui, &mut self.filt_curve_shadow, -100..=100, 1.0, "Shadows");
-            stepped_slider(ui, &mut self.filt_curve_mid, -100..=100, 1.0, "Midtones");
-            stepped_slider(ui, &mut self.filt_curve_high, -100..=100, 1.0, "Highlights");
+            stepped_slider_label_end(ui, &mut self.filt_curve_shadow, -100..=100, 1.0, "Shadows");
+            stepped_slider_label_end(ui, &mut self.filt_curve_mid, -100..=100, 1.0, "Midtones");
+            stepped_slider_label_end(ui, &mut self.filt_curve_high, -100..=100, 1.0, "Highlights");
             if (self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high) != curves_before
             {
                 let (s, m, h) = (self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high);
@@ -4199,9 +4227,9 @@ impl eframe::App for ProCraftApp {
             // M37 HSL: hue spin + saturation scale + lightness shift
             // (preview kind 5). Grays only answer to lightness.
             let hsl_before = (self.filt_hue, self.filt_sat, self.filt_light);
-            stepped_slider(ui, &mut self.filt_hue, -180.0..=180.0, 1.0, "Hue°");
-            stepped_slider(ui, &mut self.filt_sat, 0.0..=400.0, 1.0, "Sat %");
-            stepped_slider(ui, &mut self.filt_light, -100..=100, 1.0, "Light");
+            stepped_slider_label_end(ui, &mut self.filt_hue, -180.0..=180.0, 1.0, "Hue°");
+            stepped_slider_label_end(ui, &mut self.filt_sat, 0.0..=400.0, 1.0, "Sat %");
+            stepped_slider_label_end(ui, &mut self.filt_light, -100..=100, 1.0, "Light");
             if (self.filt_hue, self.filt_sat, self.filt_light) != hsl_before {
                 let (h, s, l) = (self.filt_hue, self.filt_sat / 100.0, self.filt_light as f32 / 100.0);
                 self.filter_scrub(5, move |doc, layer| {
@@ -4233,9 +4261,9 @@ impl eframe::App for ProCraftApp {
             // M37 Color balance: − toward cyan/magenta/yellow, + toward
             // red/green/blue (preview kind 6).
             let bal_before = (self.filt_bal_r, self.filt_bal_g, self.filt_bal_b);
-            stepped_slider(ui, &mut self.filt_bal_r, -100..=100, 1.0, "Red−Cyan");
-            stepped_slider(ui, &mut self.filt_bal_g, -100..=100, 1.0, "Green−Magenta");
-            stepped_slider(ui, &mut self.filt_bal_b, -100..=100, 1.0, "Blue−Yellow");
+            stepped_slider_label_end(ui, &mut self.filt_bal_r, -100..=100, 1.0, "Red−Cyan");
+            stepped_slider_label_end(ui, &mut self.filt_bal_g, -100..=100, 1.0, "Green−Magenta");
+            stepped_slider_label_end(ui, &mut self.filt_bal_b, -100..=100, 1.0, "Blue−Yellow");
             if (self.filt_bal_r, self.filt_bal_g, self.filt_bal_b) != bal_before {
                 let (r, g, b) = (
                     (self.filt_bal_r as f32 * 2.55).round() as i32,
@@ -4277,7 +4305,7 @@ impl eframe::App for ProCraftApp {
                 self.color[0], self.color[1], self.color[2]
             ));
             let recolor_before = self.filt_recolor_strength;
-            stepped_slider(ui, &mut self.filt_recolor_strength, 0.0..=100.0, 1.0, "Strength %");
+            stepped_slider_label_end(ui, &mut self.filt_recolor_strength, 0.0..=100.0, 1.0, "Strength %");
             if self.filt_recolor_strength != recolor_before {
                 let (target, s) = (self.color, self.filt_recolor_strength / 100.0);
                 self.filter_scrub(7, move |doc, layer| {

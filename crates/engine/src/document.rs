@@ -1759,6 +1759,42 @@ impl Document {
         .map_err(|e| e.to_string())
     }
 
+    /// Save the composite as JPEG at `quality` (1-100, higher keeps more
+    /// detail). JPEG stores no alpha; the composite is already opaque
+    /// over the background, so this only strips the alpha channel.
+    pub fn save_jpeg(&self, path: &std::path::Path, quality: u8) -> Result<(), String> {
+        if !(1..=100).contains(&quality) {
+            return Err(format!("bad JPEG quality: {quality} (want 1-100)"));
+        }
+        let flat = self.flatten();
+        let mut rgb = Vec::with_capacity((self.w * self.h) as usize * 3);
+        for i in 0..flat.len() / 4 {
+            let o = i * 4;
+            rgb.extend_from_slice(&flat[o..o + 3]);
+        }
+        let mut buf = Vec::new();
+        {
+            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+            enc.encode(&rgb, self.w, self.h, image::ExtendedColorType::Rgb8)
+                .map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, &buf).map_err(|e| e.to_string())
+    }
+
+    /// Save the composite as a plain single-image TIFF (lossless RGBA,
+    /// no layers or extras — the layered original stays in `.procraft`).
+    pub fn save_tiff(&self, path: &std::path::Path) -> Result<(), String> {
+        use image::ImageEncoder;
+        let flat = self.flatten();
+        let mut buf = Vec::new();
+        {
+            let enc = image::codecs::tiff::TiffEncoder::new(std::io::Cursor::new(&mut buf));
+            enc.write_image(&flat, self.w, self.h, image::ExtendedColorType::Rgba8)
+                .map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, &buf).map_err(|e| e.to_string())
+    }
+
     /// Load an image file flattened onto a fresh layer.
     pub fn load_background(&mut self, path: &std::path::Path) -> Result<(), String> {
         let img = image::open(path).map_err(|e| e.to_string())?.to_rgba8();
@@ -2390,6 +2426,62 @@ mod tests {
         let mut back = back;
         let g2 = back.new_group("More".to_string());
         assert!(g2 > g);
+    }
+
+    #[test]
+    fn jpeg_export_decodes_at_canvas_size() {
+        let mut doc = Document::new(16, 12);
+        // Solid red: lossy error stays one-sided and easy to bound.
+        let px = &mut doc.layers[0].pixels;
+        for i in 0..px.len() / 4 {
+            let o = i * 4;
+            px[o] = 255;
+            px[o + 1] = 0;
+            px[o + 2] = 0;
+            px[o + 3] = 255;
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-m28.jpg");
+        doc.save_jpeg(&path, 90).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(&raw[..2], &[0xFF, 0xD8]); // JPEG SOI marker
+        let img = image::load_from_memory(&raw).unwrap().to_rgb8();
+        assert_eq!((img.width(), img.height()), (16, 12));
+        let p = img.get_pixel(8, 6);
+        assert!(p[0] > 200 && p[1] < 60 && p[2] < 60);
+    }
+
+    #[test]
+    fn jpeg_rejects_bad_quality() {
+        let doc = Document::new(4, 4);
+        let dir = std::env::temp_dir();
+        assert!(doc.save_jpeg(&dir.join("procraft-m28-q0.jpg"), 0).is_err());
+        assert!(doc
+            .save_jpeg(&dir.join("procraft-m28-q101.jpg"), 101)
+            .is_err());
+    }
+
+    #[test]
+    fn tiff_export_roundtrips_lossless() {
+        let mut doc = Document::new(8, 6);
+        let px = &mut doc.layers[0].pixels;
+        for i in 0..px.len() / 4 {
+            let o = i * 4;
+            px[o] = (i % 251) as u8;
+            px[o + 1] = 17;
+            px[o + 2] = 200;
+            px[o + 3] = 255;
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-m28.tiff");
+        doc.save_tiff(&path).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(raw.starts_with(b"II*\0") || raw.starts_with(b"MM\0*"));
+        let img = image::load_from_memory(&raw).unwrap().to_rgba8();
+        assert_eq!((img.width(), img.height()), (8, 6));
+        assert_eq!(img.as_raw(), &doc.flatten());
     }
 
     #[test]

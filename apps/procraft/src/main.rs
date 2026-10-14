@@ -291,6 +291,8 @@ struct ProCraftApp {
     anim_fps: u32,
     anim_loop: LoopMode,
     anim_hold: u32,
+    /// JPEG export quality 1-100 (M28 slider; TIFF is lossless, no dial).
+    jpeg_quality: u8,
     anim_fwd: bool,
     anim_last_t: f64,
     anim_shown: Option<usize>,
@@ -414,6 +416,7 @@ impl ProCraftApp {
             anim_fps: 12,
             anim_loop: LoopMode::Forward,
             anim_hold: 1,
+            jpeg_quality: 90,
             anim_fwd: true,
             anim_last_t: 0.0,
             anim_shown: None,
@@ -1298,6 +1301,43 @@ impl eframe::App for ProCraftApp {
                         // on iOS); the encoder needs the suffix to pick PNG.
                         let path = ensure_extension(path, "png");
                         match self.doc.save_png(&path) {
+                            Ok(()) => {
+                                self.status = format!("Saved {}", path.display());
+                                #[cfg(target_os = "ios")]
+                                rfd::ios_share_file(&path);
+                            }
+                            Err(e) => self.status = format!("Save failed: {e}"),
+                        }
+                    }
+                }
+                stepped_slider(ui, &mut self.jpeg_quality, 1..=100, 1.0, "JPEG q");
+                if ui.button("Save JPEG").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("JPEG", &["jpg", "jpeg"])
+                        .save_file()
+                    {
+                        let path = ensure_extension(path, "jpg");
+                        match self.doc.save_jpeg(&path, self.jpeg_quality) {
+                            Ok(()) => {
+                                self.status = format!(
+                                    "Saved {} (quality {})",
+                                    path.display(),
+                                    self.jpeg_quality
+                                );
+                                #[cfg(target_os = "ios")]
+                                rfd::ios_share_file(&path);
+                            }
+                            Err(e) => self.status = format!("Save failed: {e}"),
+                        }
+                    }
+                }
+                if ui.button("Save TIFF").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("TIFF", &["tif", "tiff"])
+                        .save_file()
+                    {
+                        let path = ensure_extension(path, "tiff");
+                        match self.doc.save_tiff(&path) {
                             Ok(()) => {
                                 self.status = format!("Saved {}", path.display());
                                 #[cfg(target_os = "ios")]

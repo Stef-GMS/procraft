@@ -2217,10 +2217,7 @@ impl eframe::App for ProCraftApp {
             }
             ui.separator();
             ui.heading("Color");
-            ui.horizontal(|ui| {
-                ui.label("Picker size:");
-                stepped_slider(ui, &mut self.picker_size, 140.0..=420.0, 5.0, "px");
-            });
+            stepped_slider(ui, &mut self.picker_size, 140.0..=420.0, 5.0, "Picker px");
             let mut c = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
             // The SV square + hue strip size themselves from `slider_width`,
             // not the panel width: drive it from the slider above.

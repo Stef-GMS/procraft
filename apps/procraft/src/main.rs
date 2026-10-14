@@ -1433,7 +1433,11 @@ fn vp_handle_pos(rect: egui::Rect, z: f32, vx: f32, vy: f32) -> (egui::Pos2, boo
 }
 
 /// Slider with −/+ step buttons (34x24 targets for touch use; `step`
-/// is in value units, endpoints clamp).
+/// is in value units, endpoints clamp). The slider itself is capped at
+/// `SLIDER_W` so −/+ sit right at its ends instead of spreading across
+/// (or clipping past) the panel; the row wraps on narrow screens.
+const SLIDER_W: f32 = 140.0;
+
 fn stepped_slider<Num: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     value: &mut Num,
@@ -1443,11 +1447,14 @@ fn stepped_slider<Num: egui::emath::Numeric>(
 ) {
     let lo = range.start().to_f64();
     let hi = range.end().to_f64();
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.add_sized([34.0, 24.0], egui::Button::new("−")).clicked() {
             *value = Num::from_f64((value.to_f64() - step).clamp(lo, hi));
         }
-        ui.add(egui::Slider::new(value, range).text(text));
+        ui.add_sized(
+            egui::Vec2::new(SLIDER_W, 24.0),
+            egui::Slider::new(value, range).text(text),
+        );
         if ui.add_sized([34.0, 24.0], egui::Button::new("+")).clicked() {
             *value = Num::from_f64((value.to_f64() + step).clamp(lo, hi));
         }

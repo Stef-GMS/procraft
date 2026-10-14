@@ -22,6 +22,10 @@ pub const MIN_ANIM_HOLD: u32 = 1;
 pub const MAX_ANIM_HOLD: u32 = 8;
 /// Sanity cap on exported frames (layer counts never reach it in practice).
 pub const MAX_GIF_FRAMES: usize = 256;
+/// M41 Time-lapse: frames staged per session (ring-evicted past this).
+pub const MAX_LAPSE_FRAMES: usize = 180;
+/// M41 Time-lapse: staged snapshots downscale to this longest side.
+pub const LAPSE_SIDE: u32 = 320;
 
 /// Playback loop direction.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -387,6 +391,47 @@ pub fn export_gif_ext(doc: &Document, fps: u32, mode: LoopMode) -> Result<Vec<u8
     Ok(buf)
 }
 
+/// M41 Time-lapse export: flat RGBA snapshots (staged app-side while
+/// recording) as a looping GIF at `fps`. Frames are resampled to the
+/// first frame's dims, so a mid-session canvas resize can't rag the
+/// file. Empty input and bad rates fail honestly.
+pub fn export_timelapse(frames: &[(Vec<u8>, u32, u32)], fps: u32) -> Result<Vec<u8>, String> {
+    if !(MIN_ANIM_FPS..=MAX_ANIM_FPS).contains(&fps) {
+        return Err(format!("bad time-lapse rate: {fps}"));
+    }
+    if frames.is_empty() {
+        return Err("no time-lapse frames staged".to_string());
+    }
+    if frames.len() > MAX_GIF_FRAMES {
+        return Err(format!("too many frames (max {MAX_GIF_FRAMES})"));
+    }
+    let (w0, h0) = (frames[0].1, frames[0].2);
+    if w0 == 0 || h0 == 0 || w0 > 4096 || h0 > 4096 {
+        return Err("time-lapse has bad dimensions".to_string());
+    }
+    let mut buf = Vec::new();
+    {
+        let mut enc = GifEncoder::new(&mut buf);
+        enc.set_repeat(Repeat::Infinite)
+            .map_err(|e| e.to_string())?;
+        for (bytes, w, h) in frames {
+            if bytes.len() != (*w as usize) * (*h as usize) * 4 {
+                return Err("time-lapse frame is corrupt".to_string());
+            }
+            let img = RgbaImage::from_raw(*w, *h, bytes.clone()).ok_or("frame raster failed")?;
+            let img = if (*w, *h) != (w0, h0) {
+                image::imageops::resize(&img, w0, h0, image::imageops::FilterType::Triangle)
+            } else {
+                img
+            };
+            let delay = Delay::from_numer_denom_ms(1000, fps);
+            let frame = Frame::from_parts(img, 0, 0, delay);
+            enc.encode_frame(frame).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::brush::{Brush, Color};
@@ -667,5 +712,27 @@ mod tests {
         assert_eq!(fps, 10);
         assert!(import_gif_document(b"GIF89a nope").is_err());
         assert!(import_gif_document(&[]).is_err());
+    }
+
+    #[test]
+    fn timelapse_exports_staged_frames() {
+        let solid = |rgb: [u8; 3]| {
+            let mut v = Vec::with_capacity(8 * 8 * 4);
+            for _ in 0..64 {
+                v.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+            (v, 8u32, 8u32)
+        };
+        let frames = vec![solid([255, 0, 0]), solid([0, 255, 0]), solid([0, 0, 255])];
+        let bytes = export_timelapse(&frames, 10).unwrap();
+        assert!(bytes.starts_with(b"GIF89a"));
+        assert!(bytes.len() > 100);
+        // Mixed dims resample to the first frame (no ragged export).
+        let odd = vec![solid([255, 0, 0]), (vec![9u8; 4 * 4 * 4], 4u32, 4u32)];
+        assert!(export_timelapse(&odd, 10).is_ok());
+        assert!(export_timelapse(&[], 10).is_err());
+        assert!(export_timelapse(&frames, 0).is_err());
+        assert!(export_timelapse(&frames, 61).is_err());
+        assert!(export_timelapse(&[(vec![1u8; 5], 8u32, 8u32)], 10).is_err());
     }
 }

@@ -12,10 +12,10 @@ mod psd;
 mod text;
 
 pub use animation::{
-    clamp_frame, export_gif, export_gif_ext, import_gif_document, next_frame, onion_ghost,
-    prev_frame, rasterize_frame, rasterize_frame_region, step_playback, step_playback_visible,
-    visible_frames, LoopMode, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_GIF_FRAMES, MIN_ANIM_FPS,
-    MIN_ANIM_HOLD,
+    clamp_frame, export_gif, export_gif_ext, export_timelapse, import_gif_document, next_frame,
+    onion_ghost, prev_frame, rasterize_frame, rasterize_frame_region, step_playback,
+    step_playback_visible, visible_frames, LoopMode, LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD,
+    MAX_GIF_FRAMES, MAX_LAPSE_FRAMES, MIN_ANIM_FPS, MIN_ANIM_HOLD,
 };
 pub use brush::{
     open_brush_library, presets, save_brush_library, Brush, BrushPreset, BrushTip, Color,

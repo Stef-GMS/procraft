@@ -7,15 +7,16 @@
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
 // iOS has no rfd backend: same call shape, every dialog declined.
 use procraft_engine::{
-    analogous, check_font, clamp_frame, complementary, curves_lut, export_gif_ext, export_tip_png,
-    gallery_thumb, import_brush_file, import_gif_document, import_gpl_file, levels_lut, next_frame,
-    onion_ghost, open_brush_library, open_palette, open_psd, palette_from_rgba, prev_frame,
-    rasterize_frame, rasterize_frame_region, save_brush_library, save_palette, save_psd,
-    starter_palette, step_playback_visible, triadic, AssistLine, BlendMode, Brush, BrushPreset,
-    Color, DabDynamics, Document, GuideKind, Guides, LoopMode, PaintTarget, Palette, PaletteSet,
-    ShapePoly, SymmetryMode, TextStyle, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE,
-    MAX_IMAGE_COLORS, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS,
-    MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
+    analogous, check_font, clamp_frame, complementary, curves_lut, export_gif_ext,
+    export_timelapse, export_tip_png, gallery_thumb, import_brush_file, import_gif_document,
+    import_gpl_file, levels_lut, next_frame, onion_ghost, open_brush_library, open_palette,
+    open_psd, palette_from_rgba, prev_frame, rasterize_frame, rasterize_frame_region,
+    save_brush_library, save_palette, save_psd, starter_palette, step_playback_visible, triadic,
+    AssistLine, BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides,
+    LoopMode, PaintTarget, Palette, PaletteSet, ShapePoly, SymmetryMode, TextStyle, LAPSE_SIDE,
+    MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES,
+    MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING,
+    MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
 };
 #[cfg(target_os = "ios")]
 use rfd_shim as rfd;
@@ -135,6 +136,10 @@ struct FilterPreview {
 /// re-flatten and texture upload per tick; without a floor, every slider
 /// tick queues one and the UI visibly hangs during the drag.
 const PREVIEW_MIN_DT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// M41 Time-lapse: minimum time between staged snapshots (with the
+/// frame cap, this bounds a session to ~180 small thumbs, not gigabytes).
+const LAPSE_MIN_DT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// M35 Selection upgrades: saved snapshot (canvas dims, rect, mask).
 type SavedSelection = ((u32, u32), Option<(u32, u32, u32, u32)>, Option<Vec<u8>>);
@@ -367,6 +372,11 @@ struct ProCraftApp {
     /// Onion ghost strengths per side (red = previous, blue = next).
     onion_prev: f32,
     onion_next: f32,
+    /// M41 Time-lapse: record flag, staged snapshots (bytes, w, h),
+    /// and the last stage time (min-interval gate).
+    lapse_on: bool,
+    lapse_frames: Vec<(Vec<u8>, u32, u32)>,
+    lapse_last: std::time::Instant,
     ghost_prev: Option<TextureHandle>,
     ghost_next: Option<TextureHandle>,
     ghost_key: (Option<usize>, Option<usize>, u32, u32),
@@ -544,6 +554,9 @@ impl ProCraftApp {
             onion: true,
             onion_prev: 0.3,
             onion_next: 0.3,
+            lapse_on: false,
+            lapse_frames: Vec::new(),
+            lapse_last: std::time::Instant::now(),
             ghost_prev: None,
             ghost_next: None,
             ghost_key: (None, None, 0, 0),
@@ -1108,6 +1121,27 @@ impl ProCraftApp {
             }
             self.filter_preview = Some(fp);
         }
+    }
+
+    /// M41 Time-lapse: stage a downscaled composite snapshot while
+    /// recording. The min-interval gate plus the frame cap bound a
+    /// session to small thumbs (ring-evicted past the cap); callers
+    /// invoke this at every commit point and it stays cheap otherwise.
+    /// Session-only — staged frames never enter the project file.
+    fn capture_timelapse(&mut self) {
+        if !self.lapse_on || self.lapse_last.elapsed() < LAPSE_MIN_DT {
+            return;
+        }
+        self.lapse_last = std::time::Instant::now();
+        let (bytes, tw, th) =
+            gallery_thumb(&self.doc.flatten(), self.doc.w, self.doc.h, LAPSE_SIDE);
+        if bytes.is_empty() {
+            return;
+        }
+        if self.lapse_frames.len() >= MAX_LAPSE_FRAMES {
+            self.lapse_frames.remove(0);
+        }
+        self.lapse_frames.push((bytes, tw, th));
     }
 
     /// Adopt an imported GIF as the document (one layer per frame, active
@@ -2501,6 +2535,7 @@ impl eframe::App for ProCraftApp {
                                         Ok((w, h)) => {
                                             self.status = format!("Text placed ({w}x{h}px).");
                                             self.text_open = false;
+                                            self.capture_timelapse();
                                         }
                                         Err(e) => self.status = format!("Text failed: {e}"),
                                     }
@@ -3861,6 +3896,48 @@ impl eframe::App for ProCraftApp {
                         self.status = "Pick GIF…".to_string();
                     }
                 }
+                // M41 Time-lapse: staged snapshots while recording
+                // (session-only, capped small thumbs), exported as GIF.
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.lapse_on, "Time-lapse");
+                    ui.label(format!("{} frames", self.lapse_frames.len()));
+                });
+                if !self.lapse_frames.is_empty() {
+                    ui.horizontal(|ui| {
+                        if ui.button("Export lapse").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("GIF image", &["gif"])
+                                .save_file()
+                            {
+                                let path = ensure_extension(path, "gif");
+                                match export_timelapse(&self.lapse_frames, 10) {
+                                    Ok(bytes) => match std::fs::write(&path, &bytes) {
+                                        Ok(()) => {
+                                            self.status = format!(
+                                                "Time-lapse saved {} ({} frames).",
+                                                path.display(),
+                                                self.lapse_frames.len()
+                                            );
+                                            #[cfg(target_os = "ios")]
+                                            rfd::ios_share_file(&path);
+                                        }
+                                        Err(e) => {
+                                            self.status = format!("Time-lapse save failed: {e}")
+                                        }
+                                    },
+                                    Err(e) => {
+                                        self.status = format!("Time-lapse export failed: {e}")
+                                    }
+                                }
+                            }
+                        }
+                        if ui.button("Clear lapse").clicked() {
+                            self.lapse_frames.clear();
+                            self.status = "Time-lapse cleared.".to_string();
+                        }
+                    });
+                }
             }
             ui.separator();
             ui.heading("Transform layer");
@@ -3956,6 +4033,7 @@ impl eframe::App for ProCraftApp {
                 }
                 self.filter_preview = None;
                 self.status = "Tone applied.".to_string();
+                self.capture_timelapse();
             }
             let blur_before = self.filt_blur;
             stepped_slider(ui, &mut self.filt_blur, 0..=25, 1.0, "Blur");
@@ -3978,6 +4056,7 @@ impl eframe::App for ProCraftApp {
                 }
                 self.filter_preview = None;
                 self.status = "Blur applied.".to_string();
+                self.capture_timelapse();
             }
             let sharp_before = self.filt_sharpen;
             stepped_slider(ui, &mut self.filt_sharpen, 0.0..=200.0, 1.0, "Sharpen %");
@@ -4000,6 +4079,7 @@ impl eframe::App for ProCraftApp {
                 }
                 self.filter_preview = None;
                 self.status = "Sharpen applied.".to_string();
+                self.capture_timelapse();
             }
             // M36 Levels: black/white points + mid gamma, same live
             // preview + Apply rhythm as tone (preview kind 3).
@@ -4040,6 +4120,7 @@ impl eframe::App for ProCraftApp {
                 }
                 self.filter_preview = None;
                 self.status = "Levels applied.".to_string();
+                self.capture_timelapse();
             }
             // M36 Curves (parametric shadows/mids/highlights through a
             // pinned-endpoint LUT; preview kind 4).
@@ -4071,6 +4152,7 @@ impl eframe::App for ProCraftApp {
                 }
                 self.filter_preview = None;
                 self.status = "Curves applied.".to_string();
+                self.capture_timelapse();
             }
             // M37 HSL: hue spin + saturation scale + lightness shift
             // (preview kind 5). Grays only answer to lightness.
@@ -4104,6 +4186,7 @@ impl eframe::App for ProCraftApp {
                 }
                 self.filter_preview = None;
                 self.status = "HSL applied.".to_string();
+                self.capture_timelapse();
             }
             // M37 Color balance: − toward cyan/magenta/yellow, + toward
             // red/green/blue (preview kind 6).
@@ -4143,6 +4226,7 @@ impl eframe::App for ProCraftApp {
                 }
                 self.filter_preview = None;
                 self.status = "Balance applied.".to_string();
+                self.capture_timelapse();
             }
             // M37 Recolor (colorize) toward the current paint color at
             // strength (preview kind 7). White stays white by definition.
@@ -4172,6 +4256,7 @@ impl eframe::App for ProCraftApp {
                 }
                 self.filter_preview = None;
                 self.status = "Recolor applied.".to_string();
+                self.capture_timelapse();
             }
         });
         });
@@ -4801,6 +4886,7 @@ impl eframe::App for ProCraftApp {
                     } else if resp.drag_stopped() {
                         if let Some(fp) = self.fill_preview.take() {
                             self.status = format!("Filled (tolerance {}).", fp.applied);
+                            self.capture_timelapse();
                         }
                     }
                     self.painting = false;
@@ -4892,6 +4978,7 @@ impl eframe::App for ProCraftApp {
                     }
                     if resp.drag_stopped() {
                         self.liquify_from = None;
+                        self.capture_timelapse();
                         self.status = "Liquified.".to_string();
                     }
                     self.painting = false;
@@ -5138,6 +5225,7 @@ impl eframe::App for ProCraftApp {
                                 }
                             }
                             self.status = format!("{} drawn.", self.shape_kind.name());
+                            self.capture_timelapse();
                         }
                         self.shape_anchor = None;
                         self.shape_current = None;
@@ -5200,6 +5288,10 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                     if resp.drag_stopped() {
+                        if self.stroke_painted {
+                            self.stroke_painted = false;
+                            self.capture_timelapse();
+                        }
                         self.painting = false;
                         self.last = None;
                     }
@@ -5331,6 +5423,10 @@ impl eframe::App for ProCraftApp {
                     }
                 }
                 if resp.drag_stopped() {
+                    if self.stroke_painted {
+                        self.stroke_painted = false;
+                        self.capture_timelapse();
+                    }
                     self.painting = false;
                     self.last = None;
                     self.smooth_pt = None;

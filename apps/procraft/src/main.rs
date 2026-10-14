@@ -152,6 +152,7 @@ enum PendingOpen {
     Palette,
     ImagePalette,
     Gif,
+    Reference,
 }
 
 impl Theme {
@@ -358,6 +359,12 @@ struct ProCraftApp {
     gallery_keys: Vec<String>,
     gallery_new_w: u32,
     gallery_new_h: u32,
+    /// M34 Reference companion: pinned image alongside the canvas
+    /// (session-only, not saved in the project). Texture rebuilds lazily.
+    ref_open: bool,
+    ref_image: Option<(Vec<u8>, u32, u32)>,
+    ref_tex: Option<TextureHandle>,
+    ref_scale: f32,
 }
 
 impl ProCraftApp {
@@ -497,6 +504,10 @@ impl ProCraftApp {
             gallery_keys: Vec::new(),
             gallery_new_w: 1280,
             gallery_new_h: 800,
+            ref_open: false,
+            ref_image: None,
+            ref_tex: None,
+            ref_scale: 1.0,
         };
         // Restore disk-persisted UI state (theme, panels, zoom); defaults
         // stand when nothing was saved yet.
@@ -765,6 +776,14 @@ impl ProCraftApp {
                     self.adopt_gif(doc, fps);
                 }
                 Err(e) => self.status = format!("GIF import failed: {e}"),
+            },
+            // M34 Reference: pin the image beside the canvas (not a layer).
+            PendingOpen::Reference => match image::open(&path).map(|i| i.to_rgba8()) {
+                Ok(img) => {
+                    let (w, h) = (img.width(), img.height());
+                    self.set_reference(img.into_raw(), w, h, &format!("{}", path.display()));
+                }
+                Err(e) => self.status = format!("Reference load failed: {e}"),
             },
         }
     }
@@ -1142,6 +1161,41 @@ impl ProCraftApp {
                 self.adopt_project(doc, &s, "Duplicated");
             }
             Err(e) => self.status = format!("Duplicate save failed: {e}"),
+        }
+    }
+
+    /// M34 Reference: pin RGBA bytes as the companion image (session-only;
+    /// never touches the canvas or undo). Oversized images are downscaled
+    /// through the Gallery helper so a phone photo can't OOM the session.
+    fn set_reference(&mut self, pixels: Vec<u8>, w: u32, h: u32, from: &str) {
+        if pixels.is_empty() || w == 0 || h == 0 {
+            self.status = format!("Reference load failed: empty image ({from}).");
+            return;
+        }
+        const MAX_SIDE: u32 = 1024;
+        let (bytes, tw, th) = if w.max(h) > MAX_SIDE {
+            gallery_thumb(&pixels, w, h, MAX_SIDE)
+        } else {
+            (pixels, w, h)
+        };
+        if bytes.is_empty() {
+            self.status = format!("Reference load failed: bad pixels ({from}).");
+            return;
+        }
+        self.ref_image = Some((bytes, tw, th));
+        self.ref_tex = None;
+        self.ref_open = true;
+        self.status = format!("Reference pinned ({from}).");
+    }
+
+    /// M34 Reference: upload the companion texture on demand (load/replace
+    /// only, never per frame).
+    fn refresh_ref_tex(&mut self, ctx: &egui::Context) {
+        if self.ref_tex.is_none() {
+            if let Some((bytes, w, h)) = &self.ref_image {
+                let img = ColorImage::from_rgba_unmultiplied([*w as usize, *h as usize], bytes);
+                self.ref_tex = Some(ctx.load_texture("reference", img, TextureOptions::LINEAR));
+            }
         }
     }
 }
@@ -1649,6 +1703,9 @@ impl eframe::App for ProCraftApp {
                 if ui.button("Gallery").clicked() {
                     self.gallery_open = !self.gallery_open;
                 }
+                if ui.button("Reference").clicked() {
+                    self.ref_open = !self.ref_open;
+                }
                 if ui.button("Save PNG").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("PNG", &["png"])
@@ -2009,6 +2066,80 @@ impl eframe::App for ProCraftApp {
                 self.recent.clear();
                 self.gallery_keys.clear();
                 self.gallery_thumbs.clear();
+            }
+        }
+
+        // M34 Reference companion window: pinned image beside the canvas.
+        // Session-only (not in the project file); sampling from it with
+        // the Picker is deferred.
+        if self.ref_open {
+            self.refresh_ref_tex(ui.ctx());
+            let mut open = self.ref_open;
+            let mut load = false;
+            let mut clear = false;
+            egui::Window::new("Reference")
+                .open(&mut open)
+                .resizable(true)
+                .collapsible(false)
+                .min_width(200.0)
+                .show(ui.ctx(), |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Load…").clicked() {
+                            load = true;
+                        }
+                        if self.ref_image.is_some() && ui.button("Clear").clicked() {
+                            clear = true;
+                        }
+                    });
+                    if let (Some(tex), Some((_, w, h))) =
+                        (self.ref_tex.as_ref(), self.ref_image.as_ref())
+                    {
+                        // Fit the pin inside 320px, then zoom (slider).
+                        let fit = (320.0 / (*w).max(*h).max(1) as f32).min(1.0);
+                        let z = fit * self.ref_scale;
+                        let dw = (*w as f32 * z).clamp(32.0, 640.0);
+                        let dh = (*h as f32 * z).clamp(32.0, 640.0);
+                        ui.image((tex.id(), egui::Vec2::new(dw, dh)));
+                        stepped_slider(ui, &mut self.ref_scale, 0.25..=2.0, 0.25, "Zoom");
+                    } else {
+                        ui.label("Pin an image to paint from — nothing here yet.");
+                    }
+                });
+            self.ref_open = open;
+            if clear {
+                self.ref_image = None;
+                self.ref_tex = None;
+                self.status = "Reference cleared.".to_string();
+            }
+            if load {
+                #[cfg(not(target_os = "ios"))]
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter(
+                        "Images",
+                        &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
+                    )
+                    .pick_file()
+                {
+                    let from = format!("{}", path.display());
+                    match image::open(&path).map(|i| i.to_rgba8()) {
+                        Ok(img) => {
+                            let (w, h) = (img.width(), img.height());
+                            self.set_reference(img.into_raw(), w, h, &from);
+                        }
+                        Err(e) => self.status = format!("Reference load failed: {e}"),
+                    }
+                }
+                #[cfg(target_os = "ios")]
+                {
+                    let _ = rfd::FileDialog::new()
+                        .add_filter(
+                            "Images",
+                            &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
+                        )
+                        .pick_file();
+                    self.pending_open = Some(PendingOpen::Reference);
+                    self.status = "Pick a reference image…".to_string();
+                }
             }
         }
 

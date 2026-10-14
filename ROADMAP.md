@@ -43,16 +43,16 @@ people touch daily. Ranked by user-visible value per effort.
   (v10 format, GIF round-trips timing), onion strength per side.
   **→ PC checkpoint #2 + iPad check #1 (IPA) (you are here).**
 
-## Batch 3: M33–M37 (in progress — Gallery + Adjustments start)
+## Batch 3: M33–M37 (done — Gallery + Adjustments start)
 
-- [ ] **M33 — Gallery/file browser.** New/open/recent/duplicates with
+- [x] **M33 — Gallery/file browser.** New/open/recent/duplicates with
   thumbnails; replaces OS-dialog-only flow (dialogs stay as fallback).
-- [ ] **M34 — Reference companion window.** Pinned image alongside canvas.
-- [ ] **M35 — Selection upgrades.** Save/load selection, transform
-  selection, on-canvas color-fill tolerance UI.
-- [ ] **M36 — Adjustments I.** Curves + Levels.
-- [ ] **M37 — Adjustments II.** HSL + Color Balance + Recolor.
-  **→ PC checkpoint #3 (you are here when done).**
+- [x] **M34 — Reference companion window.** Pinned image alongside canvas.
+- [x] **M35 — Selection upgrades.** Save/load selection, transform
+  selection (nudge/flip); on-canvas fill-tolerance sweep pre-existed.
+- [x] **M36 — Adjustments I.** Curves + Levels.
+- [x] **M37 — Adjustments II.** HSL + Color Balance + Recolor.
+  **→ PC checkpoint #3 (you are here).**
 
 ## P0 backlog (done)
 

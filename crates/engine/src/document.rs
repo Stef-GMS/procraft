@@ -2017,6 +2017,144 @@ impl Document {
         self.mark_full_dirty();
     }
 
+    /// M37 HSL adjust: rotate hue by `hue_deg` degrees, scale saturation
+    /// by `sat_mult`, shift lightness by `light` (-1..=1). Grays have no
+    /// hue, so they only answer to lightness (same honesty as the palette
+    /// harmonies). Honors the active selection. Caller checkpoints first.
+    pub fn adjust_hsl(&mut self, index: usize, hue_deg: f32, sat_mult: f32, light: f32) {
+        if index >= self.layers.len() {
+            return;
+        }
+        let sat_mult = sat_mult.clamp(0.0, 4.0);
+        let light = light.clamp(-1.0, 1.0);
+        if hue_deg == 0.0 && sat_mult == 1.0 && light == 0.0 {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
+        let sel = self.selection;
+        let mask = self.selection_mask.as_deref();
+        let pixels = &mut self.layers[index].pixels;
+        for y in 0..h {
+            for x in 0..w {
+                if let Some((a, b, c, d)) = sel {
+                    if x < a || x > c || y < b || y > d {
+                        continue;
+                    }
+                }
+                if let Some(m) = mask {
+                    if m[(y * w + x) as usize] == 0 {
+                        continue;
+                    }
+                }
+                let o = ((y * w + x) * 4) as usize;
+                if o + 2 >= pixels.len() {
+                    continue;
+                }
+                let (hh, ss, ll) =
+                    super::palette::rgb_to_hsl([pixels[o], pixels[o + 1], pixels[o + 2]]);
+                let v = if ss <= 0.0 {
+                    let g = ((ll + light).clamp(0.0, 1.0) * 255.0).round();
+                    [g as u8, g as u8, g as u8]
+                } else {
+                    super::palette::hsl_to_rgb(
+                        hh + hue_deg,
+                        (ss * sat_mult).clamp(0.0, 1.0),
+                        (ll + light).clamp(0.0, 1.0),
+                    )
+                };
+                let k = Self::sel_k(mask, w, x, y);
+                for ch in 0..3 {
+                    let mixed = pixels[o + ch] as f32 * (1.0 - k) + v[ch] as f32 * k;
+                    pixels[o + ch] = mixed.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        self.mark_full_dirty();
+    }
+
+    /// M37 Color balance: channel offsets in -255..=255 (positive warms
+    /// toward red/green/blue, negative toward cyan/magenta/yellow).
+    /// Honors the active selection. Caller checkpoints first.
+    pub fn color_balance(&mut self, index: usize, r: i32, g: i32, b: i32) {
+        if index >= self.layers.len() || (r == 0 && g == 0 && b == 0) {
+            return;
+        }
+        let off = [r as f32, g as f32, b as f32];
+        let (w, h) = (self.w, self.h);
+        let sel = self.selection;
+        let mask = self.selection_mask.as_deref();
+        let pixels = &mut self.layers[index].pixels;
+        for y in 0..h {
+            for x in 0..w {
+                if let Some((a, b, c, d)) = sel {
+                    if x < a || x > c || y < b || y > d {
+                        continue;
+                    }
+                }
+                if let Some(m) = mask {
+                    if m[(y * w + x) as usize] == 0 {
+                        continue;
+                    }
+                }
+                let o = ((y * w + x) * 4) as usize;
+                if o + 2 >= pixels.len() {
+                    continue;
+                }
+                let k = Self::sel_k(mask, w, x, y);
+                for ch in 0..3 {
+                    let v = pixels[o + ch] as f32 + off[ch];
+                    let mixed = pixels[o + ch] as f32 * (1.0 - k) + v * k;
+                    pixels[o + ch] = mixed.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        self.mark_full_dirty();
+    }
+
+    /// M37 Recolor (colorize): push every pixel's hue/saturation toward
+    /// `target` while keeping its own luminance, mixed by `strength`
+    /// 0..=1 (0 is a no-op). White stays white, black stays black —
+    /// that is what colorize means. Honors the active selection.
+    /// Caller checkpoints first.
+    pub fn colorize(&mut self, index: usize, target: [u8; 3], strength: f32) {
+        if index >= self.layers.len() || strength <= 0.0 {
+            return;
+        }
+        let strength = strength.clamp(0.0, 1.0);
+        let (th, ts, _) = super::palette::rgb_to_hsl(target);
+        let (w, h) = (self.w, self.h);
+        let sel = self.selection;
+        let mask = self.selection_mask.as_deref();
+        let pixels = &mut self.layers[index].pixels;
+        for y in 0..h {
+            for x in 0..w {
+                if let Some((a, b, c, d)) = sel {
+                    if x < a || x > c || y < b || y > d {
+                        continue;
+                    }
+                }
+                if let Some(m) = mask {
+                    if m[(y * w + x) as usize] == 0 {
+                        continue;
+                    }
+                }
+                let o = ((y * w + x) * 4) as usize;
+                if o + 2 >= pixels.len() {
+                    continue;
+                }
+                let (_, _, ll) =
+                    super::palette::rgb_to_hsl([pixels[o], pixels[o + 1], pixels[o + 2]]);
+                let tint = super::palette::hsl_to_rgb(th, ts, ll);
+                let k = Self::sel_k(mask, w, x, y) * strength;
+                for ch in 0..3 {
+                    let mixed = pixels[o + ch] as f32 * (1.0 - k) + tint[ch] as f32 * k;
+                    pixels[o + ch] = mixed.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        self.mark_full_dirty();
+    }
+
     /// Save the composite as PNG.
     pub fn save_png(&self, path: &std::path::Path) -> Result<(), String> {
         image::save_buffer(
@@ -4428,5 +4566,65 @@ mod tests {
         doc.apply_lut(0, &lut);
         assert_eq!(doc.layers[0].pixels[o], 0);
         assert_eq!(doc.layers[0].pixels[o + 3], 255);
+    }
+
+    #[test]
+    fn hsl_adjust_invariants() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(4, 4);
+        let brush = Brush {
+            size: 20.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        // Gray has no hue: hue spins leave it gray, lightness lifts it.
+        doc.dab(&brush, Color::rgb(128, 128, 128), 1.5, 1.5);
+        doc.adjust_hsl(0, 180.0, 2.0, 0.0);
+        let o = 20usize;
+        assert_eq!(doc.layers[0].pixels[o], doc.layers[0].pixels[o + 1]);
+        assert_eq!(doc.layers[0].pixels[o + 1], doc.layers[0].pixels[o + 2]);
+        doc.adjust_hsl(0, 0.0, 1.0, 1.0);
+        assert_eq!(doc.layers[0].pixels[o], 255);
+        // Pure red rotated +120 lands on green.
+        let mut doc = Document::new(2, 2);
+        doc.dab(&brush, Color::rgb(255, 0, 0), 0.5, 0.5);
+        doc.adjust_hsl(0, 120.0, 1.0, 0.0);
+        let px = &doc.layers[0].pixels[0..3];
+        assert!(px[1] > 200 && px[0] < 55 && px[2] < 55, "{px:?}");
+    }
+
+    #[test]
+    fn balance_and_colorize_behave() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(2, 2);
+        let brush = Brush {
+            size: 20.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.dab(&brush, Color::rgb(100, 100, 100), 0.5, 0.5);
+        doc.color_balance(0, 51, 0, 0);
+        assert_eq!(doc.layers[0].pixels[0], 151);
+        assert_eq!(doc.layers[0].pixels[1], 100);
+        // No-op guards leave pixels alone.
+        let before = doc.layers[0].pixels.clone();
+        doc.color_balance(0, 0, 0, 0);
+        doc.colorize(0, [255, 0, 0], 0.0);
+        assert_eq!(doc.layers[0].pixels, before);
+        // Colorize mid-gray to red: keeps luminance, takes the hue.
+        let mut doc = Document::new(2, 2);
+        doc.dab(&brush, Color::rgb(128, 128, 128), 0.5, 0.5);
+        doc.colorize(0, [255, 0, 0], 1.0);
+        let px = &doc.layers[0].pixels[0..3];
+        assert!(px[0] > 200 && px[1] < 80 && px[2] < 80, "{px:?}");
+        // Selection gate: excluded pixels keep their color.
+        let mut doc = Document::new(4, 4);
+        doc.dab(&brush, Color::rgb(100, 100, 100), 1.5, 1.5);
+        doc.selection = Some((0, 0, 0, 0));
+        doc.color_balance(0, 51, 51, 51);
+        assert_eq!(doc.layers[0].pixels[0], 151);
+        assert_eq!(doc.layers[0].pixels[20], 100);
     }
 }

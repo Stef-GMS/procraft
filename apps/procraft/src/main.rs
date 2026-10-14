@@ -300,6 +300,15 @@ struct ProCraftApp {
     filt_curve_shadow: i32,
     filt_curve_mid: i32,
     filt_curve_high: i32,
+    /// M37 Adjustments II: HSL, color balance, recolor strength (the
+    /// recolor target is the current paint color).
+    filt_hue: f32,
+    filt_sat: f32,
+    filt_light: i32,
+    filt_bal_r: i32,
+    filt_bal_g: i32,
+    filt_bal_b: i32,
+    filt_recolor_strength: f32,
     renaming: Option<usize>,
     renaming_text: String,
     group_renaming: Option<u32>,
@@ -464,6 +473,13 @@ impl ProCraftApp {
             filt_curve_shadow: 0,
             filt_curve_mid: 0,
             filt_curve_high: 0,
+            filt_hue: 0.0,
+            filt_sat: 100.0,
+            filt_light: 0,
+            filt_bal_r: 0,
+            filt_bal_g: 0,
+            filt_bal_b: 0,
+            filt_recolor_strength: 100.0,
             renaming: None,
             renaming_text: String::new(),
             group_renaming: None,
@@ -3769,6 +3785,87 @@ impl eframe::App for ProCraftApp {
                 }
                 self.filter_preview = None;
                 self.status = "Curves applied.".to_string();
+            }
+            // M37 HSL: hue spin + saturation scale + lightness shift
+            // (preview kind 5). Grays only answer to lightness.
+            let hsl_before = (self.filt_hue, self.filt_sat, self.filt_light);
+            stepped_slider(ui, &mut self.filt_hue, -180.0..=180.0, 1.0, "Hue°");
+            stepped_slider(ui, &mut self.filt_sat, 0.0..=400.0, 1.0, "Sat %");
+            stepped_slider(ui, &mut self.filt_light, -100..=100, 1.0, "Light");
+            if (self.filt_hue, self.filt_sat, self.filt_light) != hsl_before {
+                let (h, s, l) = (self.filt_hue, self.filt_sat / 100.0, self.filt_light as f32 / 100.0);
+                self.filter_scrub(5, move |doc, layer| {
+                    doc.adjust_hsl(layer, h, s, l);
+                });
+                self.status = "Previewing HSL — Apply to keep.".to_string();
+            }
+            if ui.button("Apply HSL").clicked() {
+                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 5) {
+                    self.doc.checkpoint();
+                    let active = self.doc.active;
+                    self.doc.adjust_hsl(
+                        active,
+                        self.filt_hue,
+                        self.filt_sat / 100.0,
+                        self.filt_light as f32 / 100.0,
+                    );
+                }
+                self.filter_preview = None;
+                self.status = "HSL applied.".to_string();
+            }
+            // M37 Color balance: − toward cyan/magenta/yellow, + toward
+            // red/green/blue (preview kind 6).
+            let bal_before = (self.filt_bal_r, self.filt_bal_g, self.filt_bal_b);
+            stepped_slider(ui, &mut self.filt_bal_r, -100..=100, 1.0, "Red−Cyan");
+            stepped_slider(ui, &mut self.filt_bal_g, -100..=100, 1.0, "Green−Magenta");
+            stepped_slider(ui, &mut self.filt_bal_b, -100..=100, 1.0, "Blue−Yellow");
+            if (self.filt_bal_r, self.filt_bal_g, self.filt_bal_b) != bal_before {
+                let (r, g, b) = (
+                    (self.filt_bal_r as f32 * 2.55).round() as i32,
+                    (self.filt_bal_g as f32 * 2.55).round() as i32,
+                    (self.filt_bal_b as f32 * 2.55).round() as i32,
+                );
+                self.filter_scrub(6, move |doc, layer| {
+                    doc.color_balance(layer, r, g, b);
+                });
+                self.status = "Previewing balance — Apply to keep.".to_string();
+            }
+            if ui.button("Apply balance").clicked() {
+                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 6) {
+                    let (r, g, b) = (
+                        (self.filt_bal_r as f32 * 2.55).round() as i32,
+                        (self.filt_bal_g as f32 * 2.55).round() as i32,
+                        (self.filt_bal_b as f32 * 2.55).round() as i32,
+                    );
+                    self.doc.checkpoint();
+                    self.doc.color_balance(self.doc.active, r, g, b);
+                }
+                self.filter_preview = None;
+                self.status = "Balance applied.".to_string();
+            }
+            // M37 Recolor (colorize) toward the current paint color at
+            // strength (preview kind 7). White stays white by definition.
+            ui.label(format!(
+                "Recolor target: #{:02X}{:02X}{:02X} (paint color).",
+                self.color[0], self.color[1], self.color[2]
+            ));
+            let recolor_before = self.filt_recolor_strength;
+            stepped_slider(ui, &mut self.filt_recolor_strength, 0.0..=100.0, 1.0, "Strength %");
+            if self.filt_recolor_strength != recolor_before {
+                let (target, s) = (self.color, self.filt_recolor_strength / 100.0);
+                self.filter_scrub(7, move |doc, layer| {
+                    doc.colorize(layer, target, s);
+                });
+                self.status = "Previewing recolor — Apply to keep.".to_string();
+            }
+            if ui.button("Apply recolor").clicked() {
+                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 7) {
+                    self.doc.checkpoint();
+                    let active = self.doc.active;
+                    self.doc.colorize(active, self.color, self.filt_recolor_strength / 100.0);
+                }
+                self.filter_preview = None;
+                self.status = "Recolor applied.".to_string();
             }
         });
         });

@@ -10,7 +10,8 @@ people touch daily. Ranked by user-visible value per effort.
 - **PC check every 5 milestones** (desktop verify + user verdict).
 - **iPad check every 10 milestones** (IPA + sideload verdict).
 - Batch 1 (PC check #1): M23–M27. Batch 2 (PC check #2 + iPad check #1):
-  M28–M32 (exact slice decided at M27).
+  M28–M32 (exact slice decided at M27). Batch 3 (PC check #3): M33–M37
+  (Gallery + Adjustments start, decided at v0.7.5).
 
 ## Batch 1: M23–M27 (done, awaiting PC check #1)
 
@@ -42,10 +43,20 @@ people touch daily. Ranked by user-visible value per effort.
   (v10 format, GIF round-trips timing), onion strength per side.
   **→ PC checkpoint #2 + iPad check #1 (IPA) (you are here).**
 
-## P0 backlog (batch 3)
+## Batch 3: M33–M37 (in progress — Gallery + Adjustments start)
 
-- [ ] Gallery/file browser (new/open/recent/duplicates) — biggest P0,
-  anchors batch 3.
+- [ ] **M33 — Gallery/file browser.** New/open/recent/duplicates with
+  thumbnails; replaces OS-dialog-only flow (dialogs stay as fallback).
+- [ ] **M34 — Reference companion window.** Pinned image alongside canvas.
+- [ ] **M35 — Selection upgrades.** Save/load selection, transform
+  selection, on-canvas color-fill tolerance UI.
+- [ ] **M36 — Adjustments I.** Curves + Levels.
+- [ ] **M37 — Adjustments II.** HSL + Color Balance + Recolor.
+  **→ PC checkpoint #3 (you are here when done).**
+
+## P0 backlog (done)
+
+- [x] Gallery/file browser — moved into Batch 3 above.
 
 ## P1 — depth on what exists
 

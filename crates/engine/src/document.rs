@@ -2476,6 +2476,39 @@ impl Document {
     }
 }
 
+/// Downscale row-major RGBA bytes to a thumbnail whose longest side is
+/// `max_side` (nearest-neighbor, aspect preserved). Returns
+/// `(bytes, thumb_w, thumb_h)`. Images already at or under `max_side`
+/// are returned unchanged (no upscale). Empty or length-mismatched
+/// input yields an empty thumbnail — the Gallery shows a placeholder
+/// instead of failing.
+pub fn gallery_thumb(src: &[u8], w: u32, h: u32, max_side: u32) -> (Vec<u8>, u32, u32) {
+    if w == 0 || h == 0 || max_side == 0 {
+        return (Vec::new(), 0, 0);
+    }
+    if src.len() != (w as usize) * (h as usize) * 4 {
+        return (Vec::new(), 0, 0);
+    }
+    let longest = w.max(h);
+    if longest <= max_side {
+        return (src.to_vec(), w, h);
+    }
+    let scale = max_side as f64 / longest as f64;
+    let tw = ((w as f64 * scale).round() as u32).max(1);
+    let th = ((h as f64 * scale).round() as u32).max(1);
+    let mut out = vec![0u8; (tw as usize) * (th as usize) * 4];
+    for ty in 0..th {
+        let sy = ((ty as f64 / scale).floor() as u32).min(h - 1);
+        for tx in 0..tw {
+            let sx = ((tx as f64 / scale).floor() as u32).min(w - 1);
+            let s = ((sy * w + sx) * 4) as usize;
+            let d = ((ty * tw + tx) * 4) as usize;
+            out[d..d + 4].copy_from_slice(&src[s..s + 4]);
+        }
+    }
+    (out, tw, th)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4089,5 +4122,48 @@ mod tests {
         } else {
             assert_eq!(a, 0);
         }
+    }
+
+    #[test]
+    fn gallery_thumb_downscales_square() {
+        // 4x4 where pixel (x,y) holds red=x*64+y*16: each 2x2 block's
+        // top-left must win the single output pixel (nearest-neighbor).
+        let mut src = vec![0u8; 4 * 4 * 4];
+        for y in 0..4 {
+            for x in 0..4 {
+                let i = ((y * 4 + x) * 4) as usize;
+                src[i] = (x * 64 + y * 16) as u8;
+                src[i + 1] = 1;
+                src[i + 2] = 2;
+                src[i + 3] = 255;
+            }
+        }
+        let (out, tw, th) = gallery_thumb(&src, 4, 4, 2);
+        assert_eq!((tw, th), (2, 2));
+        let at = |x: usize, y: usize| out[(y * 2 + x) * 4];
+        assert_eq!(at(0, 0), 0);
+        assert_eq!(at(1, 0), 128);
+        assert_eq!(at(0, 1), 32);
+        assert_eq!(at(1, 1), 160);
+    }
+
+    #[test]
+    fn gallery_thumb_preserves_aspect_and_skips_upscale() {
+        let src = vec![7u8; 8 * 4 * 4];
+        let (out, tw, th) = gallery_thumb(&src, 8, 4, 4);
+        assert_eq!((tw, th), (4, 2));
+        assert_eq!(out.len(), 4 * 2 * 4);
+        let small = vec![9u8; 2 * 2 * 4];
+        let (same, w, h) = gallery_thumb(&small, 2, 2, 96);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(same, small);
+    }
+
+    #[test]
+    fn gallery_thumb_rejects_bad_input() {
+        let (out, w, h) = gallery_thumb(&[1u8; 10], 4, 4, 96);
+        assert!(out.is_empty() && w == 0 && h == 0);
+        let (out, w, h) = gallery_thumb(&[], 0, 0, 96);
+        assert!(out.is_empty() && w == 0 && h == 0);
     }
 }

@@ -22,7 +22,8 @@ pub use brush::{
     DabDynamics, ShapePoly, Stroke, MAX_LIBRARY_BRUSHES, MAX_TIP_SIDE,
 };
 pub use document::{
-    BlendMode, Document, Layer, LayerGroup, PaintTarget, SymmetryMode, MAX_CANVAS_SIDE,
+    gallery_thumb, BlendMode, Document, Layer, LayerGroup, PaintTarget, SymmetryMode,
+    MAX_CANVAS_SIDE,
 };
 pub use guides::{AssistLine, GuideKind, Guides, ASSIST_DEADZONE, VP_BOUND};
 pub use palette::{

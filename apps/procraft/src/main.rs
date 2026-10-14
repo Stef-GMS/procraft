@@ -7,14 +7,15 @@
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
 // iOS has no rfd backend: same call shape, every dialog declined.
 use procraft_engine::{
-    analogous, clamp_frame, complementary, export_gif_ext, export_tip_png, import_brush_file,
-    import_gif_document, import_gpl_file, next_frame, onion_ghost, open_brush_library,
-    open_palette, open_psd, palette_from_rgba, prev_frame, rasterize_frame, rasterize_frame_region,
-    save_brush_library, save_palette, save_psd, starter_palette, step_playback_visible, triadic,
-    AssistLine, BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides,
-    LoopMode, PaintTarget, Palette, PaletteSet, ShapePoly, SymmetryMode, MAX_ANIM_FPS,
-    MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LIBRARY_BRUSHES, MAX_PALETTES,
-    MAX_PALETTE_COLORS, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
+    analogous, clamp_frame, complementary, export_gif_ext, export_tip_png, gallery_thumb,
+    import_brush_file, import_gif_document, import_gpl_file, next_frame, onion_ghost,
+    open_brush_library, open_palette, open_psd, palette_from_rgba, prev_frame, rasterize_frame,
+    rasterize_frame_region, save_brush_library, save_palette, save_psd, starter_palette,
+    step_playback_visible, triadic, AssistLine, BlendMode, Brush, BrushPreset, Color, DabDynamics,
+    Document, GuideKind, Guides, LoopMode, PaintTarget, Palette, PaletteSet, ShapePoly,
+    SymmetryMode, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS,
+    MAX_LIBRARY_BRUSHES, MAX_PALETTES, MAX_PALETTE_COLORS, MIN_ANIM_FPS, MIN_ANIM_HOLD,
+    MIN_TEXT_PX,
 };
 #[cfg(target_os = "ios")]
 use rfd_shim as rfd;
@@ -194,6 +195,22 @@ fn ensure_extension(mut path: std::path::PathBuf, ext: &str) -> std::path::PathB
     path
 }
 
+/// M33 Gallery: how many recent projects to remember (newest first).
+const MAX_RECENT: usize = 10;
+/// M33 Gallery: thumbnail longest side in px.
+const GALLERY_THUMB_SIDE: u32 = 96;
+
+/// M33 Gallery: record a project path as most-recent (dedup, truncate).
+fn push_recent(recent: &mut Vec<String>, path: &str) {
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+    recent.retain(|p| p != path);
+    recent.insert(0, path.to_string());
+    recent.truncate(MAX_RECENT);
+}
+
 fn page_presets() -> Vec<(&'static str, [u8; 3])> {
     vec![
         ("White", [255, 255, 255]),
@@ -332,6 +349,15 @@ struct ProCraftApp {
     text_size: f32,
     zoom: f32,
     status: String,
+    /// M33 Gallery: recent project paths (newest first, max 10),
+    /// the browser window flag, cached per-path thumbnails, the key
+    /// they were built from, and the New-canvas size fields.
+    recent: Vec<String>,
+    gallery_open: bool,
+    gallery_thumbs: Vec<Option<TextureHandle>>,
+    gallery_keys: Vec<String>,
+    gallery_new_w: u32,
+    gallery_new_h: u32,
 }
 
 impl ProCraftApp {
@@ -465,6 +491,12 @@ impl ProCraftApp {
             status:
                 "Drag on the canvas to paint. Ctrl+Z undoes, Ctrl+Y redoes, Esc clears selection."
                     .to_string(),
+            recent: Vec::new(),
+            gallery_open: false,
+            gallery_thumbs: Vec::new(),
+            gallery_keys: Vec::new(),
+            gallery_new_w: 1280,
+            gallery_new_h: 800,
         };
         // Restore disk-persisted UI state (theme, panels, zoom); defaults
         // stand when nothing was saved yet.
@@ -486,6 +518,17 @@ impl ProCraftApp {
                         app.zoom = z;
                     }
                 }
+            }
+            // M33 Gallery recents: newline-joined paths (iOS has no
+            // disk persistence, so the list is session-only there).
+            if let Some(v) = storage.get_string("recent") {
+                app.recent = v
+                    .lines()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .take(MAX_RECENT)
+                    .map(str::to_string)
+                    .collect();
             }
         }
         app
@@ -669,12 +712,8 @@ impl ProCraftApp {
             },
             PendingOpen::Project => match Document::open_project(&path) {
                 Ok(doc) => {
-                    self.doc = doc;
-                    self.clear_recovery();
-                    self.texture = None;
-                    self.lasso_points.clear();
-                    self.lasso_poly.clear();
-                    self.status = format!("Project opened {}", path.display());
+                    let s = path.to_string_lossy().to_string();
+                    self.adopt_project(doc, &s, "Project opened");
                 }
                 Err(e) => self.status = format!("Project open failed: {e}"),
             },
@@ -1009,6 +1048,102 @@ impl ProCraftApp {
         self.canvas_w = self.doc.w;
         self.canvas_h = self.doc.h;
     }
+
+    /// M33 Gallery: adopt an opened/saved/duplicated project — one place
+    /// for the reset + recent + status so every entry path behaves alike.
+    fn adopt_project(&mut self, doc: Document, path: &str, verb: &str) {
+        self.doc = doc;
+        self.clear_recovery();
+        push_recent(&mut self.recent, path);
+        self.after_canvas_change();
+        self.gallery_keys.clear();
+        self.status = format!("{verb} {path}");
+    }
+
+    /// M33 Gallery: start a blank canvas at `w` x `h` (clamped to the
+    /// engine cap). No recent entry until it is saved somewhere.
+    fn new_canvas(&mut self, w: u32, h: u32) {
+        let w = w.clamp(1, MAX_CANVAS_SIDE);
+        let h = h.clamp(1, MAX_CANVAS_SIDE);
+        self.doc = Document::new(w, h);
+        self.clear_recovery();
+        self.after_canvas_change();
+        self.status = format!("New canvas {w} x {h}.");
+    }
+
+    /// M33 Gallery: rebuild cached thumbnails when the recent list
+    /// changed. Each path is opened, flattened, and downscaled; missing
+    /// or corrupt files yield `None` (placeholder row, kept so the user
+    /// can Remove it). Runs on demand, not per frame.
+    fn refresh_gallery_thumbs(&mut self, ctx: &egui::Context) {
+        if self.gallery_keys == self.recent {
+            return;
+        }
+        self.gallery_thumbs.clear();
+        for (idx, path) in self.recent.iter().enumerate() {
+            let tex = Document::open_project(std::path::Path::new(path))
+                .ok()
+                .and_then(|doc| {
+                    let (bytes, tw, th) =
+                        gallery_thumb(&doc.flatten(), doc.w, doc.h, GALLERY_THUMB_SIDE);
+                    if bytes.is_empty() {
+                        return None;
+                    }
+                    let img =
+                        ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], &bytes);
+                    Some(ctx.load_texture(format!("gallery-{idx}"), img, TextureOptions::LINEAR))
+                });
+            self.gallery_thumbs.push(tex);
+        }
+        self.gallery_keys = self.recent.clone();
+    }
+
+    /// M33 Gallery: copy `recent[idx]` to a sibling ` copyN.procraft`
+    /// file and adopt it. Errors surface in the status line.
+    fn duplicate_recent(&mut self, idx: usize) {
+        let Some(src) = self.recent.get(idx).cloned() else {
+            return;
+        };
+        let src_path = std::path::PathBuf::from(&src);
+        let doc = match Document::open_project(&src_path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = format!("Duplicate failed to open {src}: {e}");
+                return;
+            }
+        };
+        let stem = src_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("artwork");
+        // Strip an older " copyN" tail so re-duplicates don't stack names.
+        let base = stem.rsplit_once(" copy").map(|(b, _)| b).unwrap_or(stem);
+        let mut dest = src_path.clone();
+        let mut n = 1u32;
+        loop {
+            let name = if n == 1 {
+                format!("{base} copy.procraft")
+            } else {
+                format!("{base} copy{n}.procraft")
+            };
+            dest.set_file_name(&name);
+            if !dest.exists() {
+                break;
+            }
+            n += 1;
+            if n > 999 {
+                self.status = "Duplicate failed: too many copies.".to_string();
+                return;
+            }
+        }
+        match doc.save_project(&dest) {
+            Ok(()) => {
+                let s = dest.to_string_lossy().to_string();
+                self.adopt_project(doc, &s, "Duplicated");
+            }
+            Err(e) => self.status = format!("Duplicate save failed: {e}"),
+        }
+    }
 }
 
 /// Screen position of a vanishing-point handle: the true point when it is
@@ -1337,6 +1472,7 @@ impl eframe::App for ProCraftApp {
             if self.show_layers { "1" } else { "0" }.to_string(),
         );
         storage.set_string("zoom", self.zoom.to_string());
+        storage.set_string("recent", self.recent.join("\n"));
         self.clear_recovery();
     }
 
@@ -1510,6 +1646,9 @@ impl eframe::App for ProCraftApp {
         egui::Panel::top("menu").show(ui, |ui| {
             // Wrapped rows: one row on desktop, two on narrow screens.
             ui.horizontal_wrapped(|ui| {
+                if ui.button("Gallery").clicked() {
+                    self.gallery_open = !self.gallery_open;
+                }
                 if ui.button("Save PNG").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("PNG", &["png"])
@@ -1605,6 +1744,9 @@ impl eframe::App for ProCraftApp {
                         let path = ensure_extension(path, "procraft");
                         match self.doc.save_project(&path) {
                             Ok(()) => {
+                                let s = path.to_string_lossy().to_string();
+                                push_recent(&mut self.recent, &s);
+                                self.gallery_keys.clear();
                                 self.status = format!("Project saved {}", path.display());
                                 self.clear_recovery();
                                 #[cfg(target_os = "ios")]
@@ -1622,12 +1764,8 @@ impl eframe::App for ProCraftApp {
                     {
                         match Document::open_project(&path) {
                             Ok(doc) => {
-                                self.doc = doc;
-                                self.clear_recovery();
-                                self.texture = None;
-                                self.lasso_points.clear();
-                                self.lasso_poly.clear();
-                                self.status = format!("Project opened {}", path.display());
+                                let s = path.to_string_lossy().to_string();
+                                self.adopt_project(doc, &s, "Project opened");
                             }
                             Err(e) => self.status = format!("Project open failed: {e}"),
                         }
@@ -1730,6 +1868,149 @@ impl eframe::App for ProCraftApp {
                 }
             });
         });
+
+        // M33 Gallery: file browser (New / Open / Recent / Duplicate).
+        // OS dialogs stay as the fallback path; recents persist in
+        // ui.json (session-only on iOS, which has no disk persistence).
+        if self.gallery_open {
+            self.refresh_gallery_thumbs(ui.ctx());
+            let mut open = self.gallery_open;
+            let mut create = false;
+            let mut browse = false;
+            let mut open_idx: Option<usize> = None;
+            let mut dup_idx: Option<usize> = None;
+            let mut remove_idx: Option<usize> = None;
+            let mut clear_all = false;
+            egui::Window::new("Gallery")
+                .open(&mut open)
+                .resizable(true)
+                .collapsible(false)
+                .min_width(320.0)
+                .show(ui.ctx(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.gallery_new_w)
+                                .range(1..=MAX_CANVAS_SIDE)
+                                .prefix("W "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut self.gallery_new_h)
+                                .range(1..=MAX_CANVAS_SIDE)
+                                .prefix("H "),
+                        );
+                        if ui.button("New canvas").clicked() {
+                            create = true;
+                        }
+                        if ui.button("Open…").clicked() {
+                            browse = true;
+                        }
+                    });
+                    ui.separator();
+                    if self.recent.is_empty() {
+                        ui.label("No recent projects yet — start one above or open a file.");
+                    }
+                    // Snapshot paths: row buttons mutate `recent` below.
+                    for (idx, path) in self.recent.clone().iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if let Some(tex) = self.gallery_thumbs.get(idx).and_then(|t| t.as_ref())
+                            {
+                                let sz = tex.size();
+                                let (w, h) = (sz[0].max(1) as f32, sz[1].max(1) as f32);
+                                let s = 56.0 / w.max(h);
+                                ui.image((tex.id(), egui::Vec2::new(w * s, h * s)));
+                            } else {
+                                let (r, _) = ui.allocate_exact_size(
+                                    egui::Vec2::splat(56.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_stroke(
+                                    r,
+                                    4.0,
+                                    ui.visuals().widgets.noninteractive.bg_stroke,
+                                    egui::StrokeKind::Outside,
+                                );
+                            }
+                            ui.vertical(|ui| {
+                                let name = std::path::Path::new(path)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(path);
+                                ui.label(name);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Open").clicked() {
+                                        open_idx = Some(idx);
+                                    }
+                                    if ui.button("Duplicate").clicked() {
+                                        dup_idx = Some(idx);
+                                    }
+                                    if ui.button("✕").clicked() {
+                                        remove_idx = Some(idx);
+                                    }
+                                });
+                            });
+                        });
+                    }
+                    if !self.recent.is_empty() && ui.button("Clear recents").clicked() {
+                        clear_all = true;
+                    }
+                });
+            self.gallery_open = open;
+            if create {
+                let (w, h) = (self.gallery_new_w, self.gallery_new_h);
+                self.new_canvas(w, h);
+                self.gallery_open = false;
+            }
+            if browse {
+                #[cfg(not(target_os = "ios"))]
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("ProCraft project", &["procraft"])
+                    .pick_file()
+                {
+                    match Document::open_project(&path) {
+                        Ok(doc) => {
+                            let s = path.to_string_lossy().to_string();
+                            self.adopt_project(doc, &s, "Project opened");
+                            self.gallery_open = false;
+                        }
+                        Err(e) => self.status = format!("Project open failed: {e}"),
+                    }
+                }
+                #[cfg(target_os = "ios")]
+                {
+                    let _ = rfd::FileDialog::new()
+                        .add_filter("ProCraft project", &["procraft"])
+                        .pick_file();
+                    self.pending_open = Some(PendingOpen::Project);
+                    self.status = "Pick a project…".to_string();
+                }
+            }
+            if let Some(idx) = open_idx {
+                if let Some(path) = self.recent.get(idx).cloned() {
+                    match Document::open_project(std::path::Path::new(&path)) {
+                        Ok(doc) => {
+                            self.adopt_project(doc, &path, "Project opened");
+                            self.gallery_open = false;
+                        }
+                        Err(e) => self.status = format!("Project open failed: {e}"),
+                    }
+                }
+            }
+            if let Some(idx) = dup_idx {
+                self.duplicate_recent(idx);
+                self.gallery_open = false;
+            }
+            if let Some(idx) = remove_idx {
+                if idx < self.recent.len() {
+                    self.recent.remove(idx);
+                    self.gallery_keys.clear();
+                }
+            }
+            if clear_all {
+                self.recent.clear();
+                self.gallery_keys.clear();
+                self.gallery_thumbs.clear();
+            }
+        }
 
         // Recovery prompt: a previous session died with unsaved work.
         if self.recovery_offer {

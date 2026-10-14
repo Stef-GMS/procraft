@@ -2367,6 +2367,7 @@ impl eframe::App for ProCraftApp {
             let mut grp_eye = None;
             let mut grp_add = None;
             let mut grp_ungroup = None;
+            let mut grp_opacity: Option<(u32, f32)> = None;
             let mut grp_rename_commit: Option<(u32, String)> = None;
             // Ancestor chains (top-down group ids) per layer, computed up
             // front so the row loop can read them without borrowing.
@@ -2409,10 +2410,11 @@ impl eframe::App for ProCraftApp {
                         continue;
                     }
                     printed.push(*gid);
-                    let (gname, gvis, gcollapsed) = match self.doc.groups.iter().find(|g| g.id == *gid) {
-                        Some(g) => (g.name.clone(), g.visible, g.collapsed),
-                        None => continue,
-                    };
+                    let (gname, gvis, gcollapsed, gopacity) =
+                        match self.doc.groups.iter().find(|g| g.id == *gid) {
+                            Some(g) => (g.name.clone(), g.visible, g.collapsed, g.opacity),
+                            None => continue,
+                        };
                     ui.horizontal(|ui| {
                         ui.add_space(d as f32 * 12.0);
                         if ui
@@ -2480,6 +2482,14 @@ impl eframe::App for ProCraftApp {
                             .clicked()
                         {
                             grp_ungroup = Some(*gid);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(d as f32 * 12.0);
+                        let mut gop = gopacity;
+                        stepped_slider(ui, &mut gop, 0.0..=1.0, 0.05, "Opacity");
+                        if (gop - gopacity).abs() > f32::EPSILON {
+                            grp_opacity = Some((*gid, gop));
                         }
                     });
                 }
@@ -2592,6 +2602,11 @@ impl eframe::App for ProCraftApp {
                 self.ghost_dirty = true;
                 self.doc.mark_full_dirty();
                 self.status = "Group disbanded (layers kept).".to_string();
+            }
+            if let Some((gid, op)) = grp_opacity {
+                self.doc.set_group_opacity(gid, op);
+                self.ghost_dirty = true;
+                self.doc.mark_full_dirty();
             }
             if let Some((gid, name)) = grp_rename_commit {
                 self.doc.rename_group(gid, name);

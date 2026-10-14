@@ -155,9 +155,9 @@ pub fn next_frame(doc: &Document, index: usize) -> Option<usize> {
     ((index + 1)..doc.layers.len()).find(|&i| doc.is_layer_shown(i))
 }
 
-/// Render one frame: the layer (Normal blend, opacity + reveal mask
-/// applied, clipping intentionally ignored — a cel stands alone) over the
-/// page background. Opaque RGBA out. `index` out of range renders the bare
+/// Render one frame: the layer (Normal blend, opacity + group opacity +
+/// reveal mask applied, clipping intentionally ignored — a cel stands
+/// alone) over the page background. Opaque RGBA out. `index` out of range renders the bare
 /// background instead of failing, so playback never panics on a racing
 /// layer delete.
 pub fn rasterize_frame(doc: &Document, index: usize) -> Vec<u8> {
@@ -169,7 +169,7 @@ pub fn rasterize_frame(doc: &Document, index: usize) -> Vec<u8> {
     let Some(layer) = doc.layers.get(index) else {
         return out;
     };
-    let op = layer.opacity.clamp(0.0, 1.0);
+    let op = layer.opacity.clamp(0.0, 1.0) * doc.group_opacity(index);
     let (ox, oy) = (layer.ox, layer.oy);
     for y in 0..doc.h {
         for x in 0..doc.w {
@@ -243,7 +243,7 @@ pub fn onion_ghost(doc: &Document, index: usize, strength: f32) -> Vec<u8> {
     let Some(layer) = doc.layers.get(index) else {
         return out;
     };
-    let op = layer.opacity.clamp(0.0, 1.0);
+    let op = layer.opacity.clamp(0.0, 1.0) * doc.group_opacity(index);
     let (ox, oy) = (layer.ox, layer.oy);
     for y in 0..doc.h {
         for x in 0..doc.w {

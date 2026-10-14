@@ -241,6 +241,11 @@ pub struct LayerGroup {
     pub name: String,
     pub visible: bool,
     pub collapsed: bool,
+    /// Group opacity 0.0..=1.0: multiplies every member's alpha at
+    /// composite time (pass-through semantics — exact for opaque and
+    /// non-overlapping content). Saved to v9 project files (v8 files
+    /// read 1.0); structural like visibility, not undoable.
+    pub opacity: f32,
     /// Parent group id for nesting; `None` lives at the top level.
     pub parent: Option<u32>,
 }
@@ -493,8 +498,41 @@ impl Document {
         self.groups.iter().find(|g| g.id == id)
     }
 
-    fn group_mut(&mut self, id: u32) -> Option<&mut LayerGroup> {
+    pub(crate) fn group_mut(&mut self, id: u32) -> Option<&mut LayerGroup> {
         self.groups.iter_mut().find(|g| g.id == id)
+    }
+
+    /// Product of a layer's ancestor group opacities (1.0 when ungrouped):
+    /// what compositing, frames and export multiply into the layer alpha.
+    /// Corrupt parent cycles break the same bounded walk as visibility, and
+    /// non-finite stored values read as opaque (writers sanitize).
+    pub fn group_opacity(&self, index: usize) -> f32 {
+        let Some(layer) = self.layers.get(index) else {
+            return 1.0;
+        };
+        let mut op = 1.0f32;
+        let mut parent = layer.group;
+        let mut guard = self.groups.len().saturating_add(1);
+        while let Some(id) = parent {
+            if guard == 0 {
+                break;
+            }
+            guard -= 1;
+            let Some(g) = self.group(id) else {
+                break;
+            };
+            let o = g.opacity;
+            op *= if o.is_finite() {
+                o.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            if op <= 0.0 {
+                return 0.0;
+            }
+            parent = g.parent;
+        }
+        op
     }
 
     /// True when the layer and every ancestor group are visible (what
@@ -537,6 +575,7 @@ impl Document {
             name,
             visible: true,
             collapsed: false,
+            opacity: 1.0,
             parent: None,
         });
         self.mark_full_dirty();
@@ -552,6 +591,19 @@ impl Document {
     pub fn set_group_visible(&mut self, id: u32, visible: bool) {
         if let Some(g) = self.group_mut(id) {
             g.visible = visible;
+        }
+        self.mark_full_dirty();
+    }
+
+    /// Set a group's opacity (non-finite reads as opaque). Structural like
+    /// visibility: not undoable, marks the view dirty.
+    pub fn set_group_opacity(&mut self, id: u32, opacity: f32) {
+        if let Some(g) = self.group_mut(id) {
+            g.opacity = if opacity.is_finite() {
+                opacity.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
         }
         self.mark_full_dirty();
     }
@@ -709,7 +761,11 @@ impl Document {
         // clipping masks intersect against it.
         let mut below_a = 0.0f32;
         for (li, layer) in self.layers.iter().enumerate() {
-            if !self.is_layer_shown(li) || layer.opacity <= 0.0 {
+            if !self.is_layer_shown(li) {
+                continue;
+            }
+            let gop = self.group_opacity(li);
+            if layer.opacity <= 0.0 || gop <= 0.0 {
                 continue;
             }
             // Buffer content sits at the layer offset; off-canvas parts of
@@ -720,7 +776,7 @@ impl Document {
             if o + 3 >= layer.pixels.len() {
                 continue;
             }
-            let mut a = layer.pixels[o + 3] as f32 / 255.0 * layer.opacity.clamp(0.0, 1.0);
+            let mut a = layer.pixels[o + 3] as f32 / 255.0 * layer.opacity.clamp(0.0, 1.0) * gop;
             if let Some(m) = layer.mask.as_deref() {
                 a *= m.get(o / 4).copied().unwrap_or(255) as f32 / 255.0;
             }
@@ -1913,12 +1969,13 @@ impl Document {
 
     /// Save the full project (layers, opacity, blend, background, symmetry)
     /// to a `.procraft` file: magic + little-endian records, zlib-compressed
-    /// pixels. Version 8 adds layer groups (v1-v7 files still open with no
-    /// groups; old app versions cleanly refuse v8 files at the magic).
+    /// pixels. Version 9 adds group opacity (v1-v8 files still open, with
+    /// groups at full opacity; old app versions cleanly refuse v9 files at
+    /// the magic).
     pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        f.write_all(b"PCRAFT08").map_err(|e| e.to_string())?;
+        f.write_all(b"PCRAFT09").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes())
             .map_err(|e| e.to_string())?;
         f.write_all(&self.h.to_le_bytes())
@@ -1973,6 +2030,9 @@ impl Document {
             f.write_all(&[u8::from(g.visible)])
                 .map_err(|e| e.to_string())?;
             f.write_all(&[u8::from(g.collapsed)])
+                .map_err(|e| e.to_string())?;
+            // v9 stores the group opacity; older files end the record here.
+            f.write_all(&g.opacity.to_le_bytes())
                 .map_err(|e| e.to_string())?;
         }
         for layer in &self.layers {
@@ -2061,7 +2121,8 @@ impl Document {
             Ok(head)
         };
         let magic = take(8)?.to_vec();
-        let v8 = magic == b"PCRAFT08";
+        let v9 = magic == b"PCRAFT09";
+        let v8 = v9 || magic == b"PCRAFT08";
         let v7 = v8 || magic == b"PCRAFT07";
         let v6 = v7 || magic == b"PCRAFT06";
         let v5 = v6 || magic == b"PCRAFT05";
@@ -2192,11 +2253,28 @@ impl Document {
                     .map_err(|_| "bad group name".to_string())?;
                 let visible = take(1)?[0] != 0;
                 let collapsed = take(1)?[0] != 0;
+                // v9 appends the group opacity; v8 files end here and read
+                // full opacity. Non-finite values fall back to opaque.
+                let opacity = if v9 {
+                    let o = f32::from_le_bytes(
+                        take(4)?[..4]
+                            .try_into()
+                            .map_err(|_| "bad group opacity".to_string())?,
+                    );
+                    if o.is_finite() {
+                        o.clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    }
+                } else {
+                    1.0
+                };
                 groups.push(LayerGroup {
                     id,
                     name,
                     visible,
                     collapsed,
+                    opacity,
                     parent,
                 });
             }
@@ -2511,7 +2589,7 @@ mod tests {
         let path = dir.join("procraft-v8.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT08");
+        assert_eq!(&head[..8], b"PCRAFT09");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.groups.len(), 1);
@@ -2523,6 +2601,101 @@ mod tests {
         let mut back = back;
         let g2 = back.new_group("More".to_string());
         assert!(g2 > g);
+    }
+
+    #[test]
+    fn group_opacity_fades_members() {
+        let mut doc = Document::new(2, 1);
+        doc.layers[0].pixels = [255, 0, 0, 255].repeat(2);
+        let g = doc.new_group("Fade".to_string());
+        doc.move_layer_into_group(0, Some(g));
+        assert_eq!(doc.group_opacity(0), 1.0);
+        doc.set_group_opacity(g, 0.5);
+        assert_eq!(doc.group_opacity(0), 0.5);
+        // Red at half alpha over the white page.
+        assert_eq!(&doc.flatten()[0..4], &[255, 128, 128, 255]);
+        // Nested products multiply: 0.5 x 0.5.
+        let outer = doc.new_group("Outer".to_string());
+        doc.groups.iter_mut().find(|x| x.id == g).unwrap().parent = Some(outer);
+        doc.set_group_opacity(outer, 0.5);
+        assert_eq!(doc.group_opacity(0), 0.25);
+        assert_eq!(&doc.flatten()[0..4], &[255, 191, 191, 255]);
+        // Zero-opacity groups conceal like hidden ones.
+        doc.set_group_opacity(g, 0.0);
+        assert_eq!(&doc.flatten()[0..4], &[255, 255, 255, 255]);
+        // Frames fade with their group too (playback, onion, GIF):
+        // fully faded means no ghost pixels at all.
+        let ghost = crate::onion_ghost(&doc, 0, 1.0);
+        assert_eq!(&ghost[0..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn v9_roundtrip_keeps_group_opacity() {
+        let mut doc = Document::new(2, 1);
+        doc.layers[0].pixels = [255, 0, 0, 255].repeat(2);
+        let g = doc.new_group("Fade".to_string());
+        doc.set_group_opacity(g, 0.5);
+        doc.move_layer_into_group(0, Some(g));
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v9.pcraft");
+        doc.save_project(&path).unwrap();
+        let head = std::fs::read(&path).unwrap();
+        assert_eq!(&head[..8], b"PCRAFT09");
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.groups.len(), 1);
+        assert_eq!(back.groups[0].opacity, 0.5);
+        assert_eq!(back.layers[0].group, Some(g));
+        // Opacity composes after reload too.
+        assert_eq!(&back.flatten()[0..4], &[255, 128, 128, 255]);
+    }
+
+    #[test]
+    fn v8_files_open_with_opaque_groups() {
+        // Hand-build a minimal version-8 file (group record without the
+        // v9 opacity tail).
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v8-compat.pcraft");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT08");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // Symmetry off.
+        buf.extend_from_slice(&[6]);
+        buf.extend_from_slice(&[0]); // No mirror center.
+        buf.extend_from_slice(&1u32.to_le_bytes()); // One group.
+        buf.extend_from_slice(&7u32.to_le_bytes()); // id
+        buf.extend_from_slice(&[0]); // No parent.
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"G");
+        buf.extend_from_slice(&[1]); // Visible.
+        buf.extend_from_slice(&[0]); // Expanded.
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // Blend: Normal.
+        buf.extend_from_slice(&[0]); // Clip: off.
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&[1]); // In group 7.
+        buf.extend_from_slice(&7u32.to_le_bytes());
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&[9u8; 2 * 4]).unwrap();
+        let packed = enc.finish().unwrap();
+        buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&packed);
+        buf.extend_from_slice(&[0]); // No mask.
+        std::fs::write(&path, &buf).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.groups.len(), 1);
+        assert_eq!(back.groups[0].opacity, 1.0);
+        assert_eq!(back.layers[0].group, Some(7));
     }
 
     #[test]
@@ -2827,7 +3000,7 @@ mod tests {
         let path = dir.join("procraft-v6.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT08");
+        assert_eq!(&head[..8], b"PCRAFT09");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].blend, BlendMode::Difference);
@@ -3550,7 +3723,7 @@ mod tests {
             meta.len()
         );
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT08");
+        assert_eq!(&head[..8], b"PCRAFT09");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].pixels, doc.layers[0].pixels);

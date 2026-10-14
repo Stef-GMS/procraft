@@ -2548,11 +2548,11 @@ impl eframe::App for ProCraftApp {
             egui::Panel::right("layers-wide").default_size(280.0).show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Layers");
+                if ui.add_sized([40.0, 24.0], egui::Button::new("▶")).clicked() {
+                    self.show_layers = false;
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_sized([40.0, 24.0], egui::Button::new("▶")).clicked() {
-                        self.show_layers = false;
-                    }
+                    ui.heading("Layers");
                 });
             });
             ui.horizontal(|ui| {

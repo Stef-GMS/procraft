@@ -114,6 +114,7 @@ struct FillPreview {
     start_x: f32,
     start_tol: u8,
     applied: u8,
+    live_hash: u64,
 }
 
 /// Live filter preview baseline: scrubbing a filter slider restores these
@@ -129,6 +130,27 @@ struct FilterPreview {
     pixels: Vec<u8>,
     last: std::time::Instant,
     stale: bool,
+    /// Fingerprint of the layer right after our last apply (or of the
+    /// snapshot on a fresh preview). A tick finding anything else means
+    /// another edit touched the layer meanwhile — restoring the stale
+    /// snapshot would wipe that work, so the preview restarts instead.
+    live_hash: u64,
+}
+
+/// Cheap non-crypto fingerprint of layer pixels (samples every ~1KB):
+/// detects "the layer changed underneath us" for preview guards. A miss
+/// only ever restarts a preview, never destroys work.
+fn pixels_hash(pixels: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    h = h
+        .wrapping_mul(0x100000001b3)
+        .wrapping_add(pixels.len() as u64);
+    let step = (pixels.len() / 4096).max(1);
+    for (i, &b) in pixels.iter().enumerate().step_by(step) {
+        h ^= (b as u64).wrapping_add(i as u64);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// Minimum time between live preview re-applies while a slider is
@@ -1056,8 +1078,23 @@ impl ProCraftApp {
     /// mismatched pixels after undo/layer edits) restarts it. Re-applies
     /// closer than [`PREVIEW_MIN_DT`] are skipped and flag the preview
     /// `stale` — Apply restamps the latest values (see `restamp_preview`).
+    /// A preview whose layer changed underneath (paint stroke, undo, layer
+    /// op, new/opened doc…) never restores its stale snapshot — that wipe
+    /// is exactly "my paint disappeared" — it restarts on current pixels.
     fn filter_scrub(&mut self, kind: u8, apply: impl Fn(&mut Document, usize)) {
         let layer = self.doc.active;
+        // Stale-snapshot guard: the live layer must still match what our
+        // last apply left behind (or the snapshot on a fresh preview).
+        let expired = match &self.filter_preview {
+            Some(fp) => match self.doc.layers.get(fp.layer) {
+                Some(l) => pixels_hash(&l.pixels) != fp.live_hash,
+                None => true,
+            },
+            None => false,
+        };
+        if expired {
+            self.filter_preview = None;
+        }
         let fresh = match &self.filter_preview {
             Some(fp) => {
                 fp.kind != kind
@@ -1074,12 +1111,14 @@ impl ProCraftApp {
             self.doc.checkpoint();
             match self.doc.layers.get(layer) {
                 Some(l) => {
+                    let live_hash = pixels_hash(&l.pixels);
                     self.filter_preview = Some(FilterPreview {
                         kind,
                         layer,
                         pixels: l.pixels.clone(),
                         last: std::time::Instant::now() - PREVIEW_MIN_DT,
                         stale: false,
+                        live_hash,
                     });
                 }
                 None => {
@@ -1102,6 +1141,9 @@ impl ProCraftApp {
                 l.pixels = fp.pixels.clone();
             }
             apply(&mut self.doc, fp.layer);
+            if let Some(l) = self.doc.layers.get(fp.layer) {
+                fp.live_hash = pixels_hash(&l.pixels);
+            }
             fp.last = std::time::Instant::now();
             fp.stale = false;
             self.filter_preview = Some(fp);
@@ -1111,13 +1153,35 @@ impl ProCraftApp {
     /// Re-apply current slider values over the scrub snapshot (for a
     /// throttled-stale preview at Apply time, or to refresh a current
     /// one). The scrub's checkpoint still covers undo — no new step.
+    /// If the layer moved on underneath (see `filter_scrub`), the stale
+    /// preview is dropped and the values apply fresh on the active layer
+    /// (new undo step) — the intervening work is always kept.
     fn restamp_preview(&mut self, apply: impl Fn(&mut Document, usize)) {
-        if let Some(fp) = self.filter_preview.take() {
+        let expired = match &self.filter_preview {
+            Some(fp) => match self.doc.layers.get(fp.layer) {
+                Some(l) => pixels_hash(&l.pixels) != fp.live_hash,
+                None => true,
+            },
+            None => return,
+        };
+        if expired {
+            self.filter_preview = None;
+            self.doc.checkpoint();
+            let layer = self.doc.active;
+            if self.doc.layers.get(layer).is_some() {
+                apply(&mut self.doc, layer);
+            }
+            return;
+        }
+        if let Some(mut fp) = self.filter_preview.take() {
             if self.doc.layers.get(fp.layer).is_some() {
                 if let Some(l) = self.doc.layers.get_mut(fp.layer) {
                     l.pixels = fp.pixels.clone();
                 }
                 apply(&mut self.doc, fp.layer);
+                if let Some(l) = self.doc.layers.get(fp.layer) {
+                    fp.live_hash = pixels_hash(&l.pixels);
+                }
             }
             self.filter_preview = Some(fp);
         }
@@ -4937,10 +5001,11 @@ impl eframe::App for ProCraftApp {
                             self.fill_preview = Some(FillPreview {
                                 layer,
                                 seed: (cx as u32, cy as u32),
-                                pixels,
+                                pixels: pixels.clone(),
                                 start_x: pos.x,
                                 start_tol: self.fill_tolerance,
                                 applied: self.fill_tolerance,
+                                live_hash: pixels_hash(&pixels),
                             });
                             self.status = format!(
                                 "Fill preview — drag sideways for tolerance ({}).",
@@ -4949,26 +5014,41 @@ impl eframe::App for ProCraftApp {
                         }
                     } else if resp.dragged() && !gesture {
                         if let Some(mut fp) = self.fill_preview.take() {
-                            if let Some(pos) = resp.hover_pos() {
-                                let tol = (fp.start_tol as i32
-                                    + ((pos.x - fp.start_x) * 0.5) as i32)
-                                    .clamp(0, 255) as u8;
-                                if tol != fp.applied {
-                                    if let Some(layer) = self.doc.layers.get_mut(fp.layer) {
-                                        layer.pixels = fp.pixels.clone();
+                            // Same stale-snapshot guard as filters: if the
+                            // layer changed underneath (paint, undo, layer
+                            // op…), drop the sweep instead of wiping work.
+                            let expired = match self.doc.layers.get(fp.layer) {
+                                Some(l) => pixels_hash(&l.pixels) != fp.live_hash,
+                                None => true,
+                            };
+                            if expired {
+                                self.status = "Fill expired — layer changed.".to_string();
+                            } else {
+                                if let Some(pos) = resp.hover_pos() {
+                                    let tol = (fp.start_tol as i32
+                                        + ((pos.x - fp.start_x) * 0.5) as i32)
+                                        .clamp(0, 255)
+                                        as u8;
+                                    if tol != fp.applied {
+                                        if let Some(layer) = self.doc.layers.get_mut(fp.layer) {
+                                            layer.pixels = fp.pixels.clone();
+                                        }
+                                        let brush = self.base_brush();
+                                        let color = self.current_color();
+                                        self.doc
+                                            .flood_fill(&brush, color, fp.seed.0, fp.seed.1, tol);
+                                        fp.applied = tol;
+                                        self.fill_tolerance = tol;
+                                        if let Some(layer) = self.doc.layers.get(fp.layer) {
+                                            fp.live_hash = pixels_hash(&layer.pixels);
+                                        }
+                                        self.status = format!("Fill preview — tolerance {tol}.");
                                     }
-                                    let brush = self.base_brush();
-                                    let color = self.current_color();
-                                    self.doc
-                                        .flood_fill(&brush, color, fp.seed.0, fp.seed.1, tol);
-                                    fp.applied = tol;
-                                    self.fill_tolerance = tol;
-                                    self.status = format!("Fill preview — tolerance {tol}.");
                                 }
-                            }
-                            // Keep the preview alive only while its layer exists.
-                            if self.doc.layers.get(fp.layer).is_some() {
-                                self.fill_preview = Some(fp);
+                                // Keep the preview alive only while its layer exists.
+                                if self.doc.layers.get(fp.layer).is_some() {
+                                    self.fill_preview = Some(fp);
+                                }
                             }
                         }
                     } else if resp.drag_stopped() {
@@ -5568,4 +5648,25 @@ fn main() {
         options,
         Box::new(|cc| Ok(Box::new(ProCraftApp::new(cc)))),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pixels_hash_sees_any_change() {
+        // Empty and identical buffers hash equal (length included).
+        assert_eq!(pixels_hash(&[]), pixels_hash(&[]));
+        let a = vec![7u8; 4096];
+        assert_eq!(pixels_hash(&a), pixels_hash(&a.clone()));
+        // One dab-sized byte flip anywhere (head, middle, tail) flips it.
+        for i in [0usize, 1000, 2048, 4095] {
+            let mut b = a.clone();
+            b[i] = b[i].wrapping_add(1);
+            assert_ne!(pixels_hash(&a), pixels_hash(&b), "byte {i}");
+        }
+        // Length alone distinguishes.
+        assert_ne!(pixels_hash(&a), pixels_hash(&a[..2048]));
+    }
 }

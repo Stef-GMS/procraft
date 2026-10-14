@@ -11,12 +11,12 @@ original.
 > Interactive. ProCraft is an independent project with its own name, branding
 > and code, and is not affiliated with or endorsed by any other vendor.
 
-## Status: milestone 22
+## Status: milestone 32
 
 - [x] Layered document model (add / hide / reorder / opacity / blend)
 - [x] Soft-round brush + eraser with spacing, dynamics and undo
 - [x] egui desktop app: paint, layers panel, color/size sliders, PNG export
-- [x] Project files (`.procraft` v7 with masks, clipping + 10 blends, layer offsets and mirror center; v1-v6 still open), pinch-to-zoom, themes, page colors with active-preset highlight
+- [x] Project files (`.procraft` v10 with masks, clipping + 10 blends, layer offsets, mirror center, groups + group opacity, frame holds; v1-v9 still open), pinch-to-zoom, themes, page colors with active-preset highlight
 - [x] Rectangular + freehand lasso selections constraining paint
 - [x] Flood fill bucket with tolerance (selection-aware, symmetry-mirrored) + ColorDrop threshold-drag (hold + drag sweeps 0-255 with live preview, one undo step)
 - [x] Move tool (drag active layer), shape tools (line/rect/ellipse/triangle/diamond/star/arrow/polygon + fill)
@@ -25,7 +25,7 @@ original.
 - [x] Layer filters: brightness/contrast, box blur, unsharp sharpen (selection-masked) with live snapshot preview (scrub, then Apply keeps; one undo step per gesture)
 - [x] Kaleidoscope symmetry (2-16 segments), layer rename/duplicate/merge, eyedropper, honest brush previews
 - [x] Non-destructive layers: reveal masks (paint luminance, eraser reveals, mask viewer), clipping masks, 10 blend modes (masks travel with transforms, merge bakes them)
-- [x] Layered PSD interchange: export keeps names/opacity/blends/clipping/transparency/masks for Photoshop/Procreate/Krita/GIMP; import restores structure (masks and exotic blends documented gaps)
+- [x] Layered PSD interchange: export keeps names/opacity/blends/clipping/transparency/masks/groups for Photoshop/Procreate/Krita/GIMP; import restores structure including nested groups (masks, collapse state and exotic blends documented gaps)
 - [x] Compressed project files (PCRAFT04 zlib per layer; verified 12MB → 107KB on a 3-layer painting, corrupt payloads rejected)
 - [x] Brush library: named custom brushes with honest clickable previews + active highlight, `.pcbrush` set import/export (validated, max 64)
 - [x] Pro brush interop: import Photoshop `.abr` (v6-v10 sampled tips + names/spacing via UUID linkage, verified on real Photoshop 2026 files), Procreate `.brush`/`.brushset` (Shape tips), Krita `.kpp`/`.bundle` (verified on Krita repo presets: MaskGenerator diameter, Opacity x Flow, embedded tips), GIMP `.gbr`, tip images; export grayscale tip PNGs for other software
@@ -40,6 +40,11 @@ original.
 - [x] Micro-steppers (−/+ on every slider), compact tools panel
 - [x] Drawing Assist: strokes lock to guides while drawing (perspective nearest-ray incl. draggable VPs, square/iso dominant axis; 4px deadzone, parked-on-VP and Off paint free) with checkbox + hint and amber lock-line overlay (brush + eraser)
 - [x] Selection Studio: feather/grow-shrink/smooth/invert/select-opaque/outline in a collapsing group, 0-255 weighted masks (graduated coverage through paint/tone/blur/sharpen, flood binary-gated), bbox-retightened rect ants, stamp-path feather fix
+- [x] Layer groups: nested model with effective visibility, panel tree (collapse/eye/rename/+Add/Ungroup), per-group opacity in compositing/frames, PSD group round-trip
+- [x] Smudge tool (finger pickup, Strength slider), canvas rotate (twist gesture + slider/Reset), two-finger-tap undo / three-finger-tap redo, autosave + crash recovery (silent snapshots, Recover/Discard prompt)
+- [x] JPEG export with quality slider + lossless TIFF export; drag-crop rect + pad/trim canvas resize with anchor (offsets carry content)
+- [x] Pick tool with magnifier loupe ring (Alt-pick too), palette-from-image and palette-from-canvas import
+- [x] Animation frame UI: duplicate frame, per-frame hold (playback + GIF round-trip timing), onion strength per side
 
 ## Icon
 

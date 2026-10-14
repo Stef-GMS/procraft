@@ -27,12 +27,24 @@ people touch daily. Ranked by user-visible value per effort.
   120 s, centered Recover/Discard prompt, cleared on save/load/clean
   exit. **→ PC checkpoint #1 (you are here).**
 
-## P0 backlog (batches 2–3)
+## Batch 2: M28–M32 (PC check #2 + iPad check #1)
 
-- [ ] Gallery/file browser (new/open/recent/duplicates).
-- [ ] Crop + canvas resize (pad/trim).
-- [ ] JPEG/TIFF export (PNG/PSD/GIF exist).
-- [ ] Group opacity + PSD group round-trip (M23 follow-ups).
+- [ ] **M28 — JPEG/TIFF export.** Quality slider for JPEG, plain TIFF
+  (PNG/PSD/GIF exist).
+- [ ] **M29 — Crop + canvas resize.** Drag-crop rect + pad/trim resize
+  (lossless offsets carry content).
+- [ ] **M30 — Group opacity + PSD groups.** Finish the M23 gaps: group
+  opacity in compositing, PSD group round-trip.
+- [ ] **M31 — Color from image + loupe.** Eyedropper loupe ring +
+  palette-from-image import (touch-friendly, iPad-visible).
+- [ ] **M32 — Animation frame UI.** Duplicate frame, per-frame hold,
+  onion strength per side (engine exists). **→ PC check #2 + iPad
+  check #1 (IPA).**
+
+## P0 backlog (batch 3)
+
+- [ ] Gallery/file browser (new/open/recent/duplicates) — biggest P0,
+  anchors batch 3.
 
 ## P1 — depth on what exists
 

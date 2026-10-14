@@ -2551,9 +2551,7 @@ impl eframe::App for ProCraftApp {
                 if ui.add_sized([40.0, 24.0], egui::Button::new("▶")).clicked() {
                     self.show_layers = false;
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.heading("Layers");
-                });
+                ui.heading("Layers");
             });
             ui.horizontal(|ui| {
                 if ui.button("Add layer").clicked() {

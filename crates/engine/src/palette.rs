@@ -276,6 +276,58 @@ pub fn import_gpl_file(path: &std::path::Path) -> Result<Palette, String> {
     import_gpl_text(&text, &stem)
 }
 
+/// Maximum swatches pulled from one image (keeps the import grid tidy;
+/// the palette cap still applies downstream).
+pub const MAX_IMAGE_COLORS: usize = 12;
+
+/// Build a palette from RGBA pixels: 15-bit histogram buckets (5 bits per
+/// channel) ranked by pixel count, each swatch the bucket's mean color.
+/// Mostly-transparent pixels (alpha < 128) never vote — they contribute no
+/// visible color. Ties break by bucket key so output is deterministic.
+/// `max_colors` clamps to 1..=[`MAX_PALETTE_COLORS`].
+pub fn palette_from_rgba(
+    name: &str,
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    max_colors: usize,
+) -> Result<Palette, String> {
+    use std::collections::HashMap;
+    let clean = check_name(name)?;
+    if w == 0 || h == 0 {
+        return Err("image has bad dimensions".to_string());
+    }
+    if pixels.len() != (w * h * 4) as usize {
+        return Err("image has wrong pixel size".to_string());
+    }
+    let mut bins: HashMap<u16, (u32, u32, u32, u32)> = HashMap::new();
+    for px in pixels.as_chunks::<4>().0 {
+        if px[3] < 128 {
+            continue;
+        }
+        let key = ((px[0] as u16 >> 3) << 10) | ((px[1] as u16 >> 3) << 5) | (px[2] as u16 >> 3);
+        let e = bins.entry(key).or_insert((0, 0, 0, 0));
+        e.0 += 1;
+        e.1 += px[0] as u32;
+        e.2 += px[1] as u32;
+        e.3 += px[2] as u32;
+    }
+    if bins.is_empty() {
+        return Err("image has no visible pixels".to_string());
+    }
+    let mut ranked: Vec<(u16, (u32, u32, u32, u32))> = bins.into_iter().collect();
+    ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
+    let want = max_colors.clamp(1, MAX_PALETTE_COLORS).min(ranked.len());
+    let colors = ranked[..want]
+        .iter()
+        .map(|(_, (n, r, g, b))| [(r / n) as u8, (g / n) as u8, (b / n) as u8])
+        .collect();
+    Ok(Palette {
+        name: clean,
+        colors,
+    })
+}
+
 /// Starter swatch set: an original 24-color spread (primaries, earths,
 /// pastels, grays) so the swatch grid is useful on first launch.
 pub fn starter_palette() -> Palette {
@@ -396,6 +448,42 @@ mod tests {
         let back = open_palette(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back, pal);
+    }
+
+    #[test]
+    fn palette_from_image_extracts_dominant_colors() {
+        // Four solid quadrants: every swatch lands exactly.
+        let mut px = Vec::new();
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let c = match (x < 2, y < 2) {
+                    (true, true) => [255, 0, 0, 255],
+                    (false, true) => [0, 255, 0, 255],
+                    (true, false) => [0, 0, 255, 255],
+                    (false, false) => [255, 255, 255, 255],
+                };
+                px.extend_from_slice(&c);
+            }
+        }
+        let pal = palette_from_rgba("Quads", &px, 4, 4, 12).unwrap();
+        assert_eq!(pal.name, "Quads");
+        let mut got = pal.colors.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![[0, 0, 255], [0, 255, 0], [255, 0, 0], [255, 255, 255]]
+        );
+        // The count caps, and transparent pixels never vote.
+        let pal = palette_from_rgba("Quads", &px, 4, 4, 2).unwrap();
+        assert_eq!(pal.colors.len(), 2);
+        let mut ghost = px.clone();
+        for i in 0..ghost.len() / 4 {
+            ghost[i * 4 + 3] = 0;
+        }
+        assert!(palette_from_rgba("Ghost", &ghost, 4, 4, 12).is_err());
+        assert!(palette_from_rgba("Empty", &[], 0, 0, 12).is_err());
+        assert!(palette_from_rgba("  ", &px, 4, 4, 12).is_err());
+        assert!(palette_from_rgba("Short", &px[..8], 4, 4, 12).is_err());
     }
 
     #[test]

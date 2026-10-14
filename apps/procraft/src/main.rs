@@ -9,12 +9,12 @@ use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptio
 use procraft_engine::{
     analogous, clamp_frame, complementary, export_gif_ext, export_tip_png, import_brush_file,
     import_gif_document, import_gpl_file, next_frame, onion_ghost, open_brush_library,
-    open_palette, open_psd, prev_frame, rasterize_frame, rasterize_frame_region,
+    open_palette, open_psd, palette_from_rgba, prev_frame, rasterize_frame, rasterize_frame_region,
     save_brush_library, save_palette, save_psd, starter_palette, step_playback_visible, triadic,
     AssistLine, BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides,
     LoopMode, PaintTarget, Palette, PaletteSet, ShapePoly, SymmetryMode, MAX_ANIM_FPS,
-    MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_LIBRARY_BRUSHES, MAX_PALETTES, MAX_PALETTE_COLORS,
-    MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
+    MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LIBRARY_BRUSHES, MAX_PALETTES,
+    MAX_PALETTE_COLORS, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
 };
 #[cfg(target_os = "ios")]
 use rfd_shim as rfd;
@@ -51,6 +51,7 @@ enum Tool {
     Select,
     Lasso,
     Fill,
+    Picker,
     Move,
     Crop,
     Shapes,
@@ -148,6 +149,7 @@ enum PendingOpen {
     Psd,
     Brushes,
     Palette,
+    ImagePalette,
     Gif,
 }
 
@@ -686,9 +688,24 @@ impl ProCraftApp {
                 Err(e) => self.status = format!("Brush import failed: {e}"),
             },
             PendingOpen::Palette => match load_palette_file(&path) {
-                Ok(pal) => self.status = self.absorb_colors(pal, &path),
+                Ok(pal) => self.status = self.absorb_colors(pal, &format!("{}", path.display())),
                 Err(e) => self.status = format!("Palette import failed: {e}"),
             },
+            PendingOpen::ImagePalette => {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Image")
+                    .to_string();
+                let from = format!("{}", path.display());
+                match image::open(&path).map(|i| i.to_rgba8()) {
+                    Ok(img) => {
+                        let (w, h) = (img.width(), img.height());
+                        self.status = self.image_palette_status(&stem, img.as_raw(), w, h, &from);
+                    }
+                    Err(e) => self.status = format!("Image open failed: {e}"),
+                }
+            }
             PendingOpen::Gif => match std::fs::read(&path)
                 .map_err(|e| e.to_string())
                 .and_then(|b| import_gif_document(&b))
@@ -827,9 +844,9 @@ impl ProCraftApp {
     }
 
     /// Append an imported palette's swatches to the active palette,
-    /// skipping exact duplicates (shared by desktop Import and the iOS
-    /// picker resolve path).
-    fn absorb_colors(&mut self, pal: Palette, path: &std::path::Path) -> String {
+    /// skipping exact duplicates (shared by desktop Import, image/canvas
+    /// extraction and the iOS picker resolve path).
+    fn absorb_colors(&mut self, pal: Palette, from: &str) -> String {
         let mut added = 0;
         if let Some(active) = self.palettes.active_mut() {
             for c in pal.colors {
@@ -842,7 +859,23 @@ impl ProCraftApp {
                 }
             }
         }
-        format!("Imported {added} swatches from {}.", path.display())
+        format!("Imported {added} swatches from {from}.")
+    }
+
+    /// Extract a palette from RGBA pixels and absorb it (shared by the
+    /// image-file and canvas arms on both platforms).
+    fn image_palette_status(
+        &mut self,
+        name: &str,
+        pixels: &[u8],
+        w: u32,
+        h: u32,
+        from: &str,
+    ) -> String {
+        match palette_from_rgba(name, pixels, w, h, MAX_IMAGE_COLORS) {
+            Ok(pal) => self.absorb_colors(pal, from),
+            Err(e) => format!("Palette from image failed: {e}"),
+        }
     }
 
     /// Scrub a filter slider with a live preview: checkpoint + snapshot on
@@ -912,6 +945,45 @@ impl ProCraftApp {
     /// save, load, or clean exit — anything that makes it stale).
     fn clear_recovery(&self) {
         let _ = std::fs::remove_file(&self.recovery_path);
+    }
+
+    /// Draw the eyedropper loupe for canvas point `(cx, cy)` (already
+    /// clamped): magnified composite ring parked above the pointer (below
+    /// near the top edge, shifted inside near the sides) with the
+    /// would-be picked color read out.
+    fn paint_picker_loupe(
+        &self,
+        painter: &egui::Painter,
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        cx: f32,
+        cy: f32,
+    ) {
+        const SIDE: u32 = 11;
+        const CELL: f32 = 12.0;
+        let size = SIDE as f32 * CELL;
+        let (cells, ci, cj) = loupe_cells(&self.doc, cx as u32, cy as u32, SIDE);
+        let center = cells[(cj * SIDE + ci) as usize];
+        let screen = ctx.viewport_rect();
+        let mut at = egui::Pos2::new(pos.x + 24.0, pos.y - size - 48.0);
+        if at.y < screen.min.y + 8.0 {
+            at.y = pos.y + 28.0;
+        }
+        if at.x + size + 12.0 > screen.max.x - 8.0 {
+            at.x = screen.max.x - 8.0 - size - 12.0;
+        }
+        if at.x < screen.min.x + 8.0 {
+            at.x = screen.min.x + 8.0;
+        }
+        paint_loupe(
+            painter,
+            &cells,
+            SIDE,
+            (ci, cj),
+            at,
+            CELL,
+            [center[0], center[1], center[2]],
+        );
     }
 
     /// Reset view-side state after the canvas changes size (crop, canvas
@@ -1108,6 +1180,96 @@ fn paint_selection(painter: &egui::Painter, corners: [egui::Pos2; 4], time: f64)
         draw_dashed(w[0], w[1]);
     }
     draw_dashed(corners[3], corners[0]);
+}
+
+/// Eyedropper loupe cells: an odd-sided square of composited colors
+/// around `(cx, cy)`, missing edge cells filled with the page background.
+/// Returns the cells plus the cursor's cell position inside the grid.
+fn loupe_cells(doc: &Document, cx: u32, cy: u32, side: u32) -> (Vec<[u8; 4]>, u32, u32) {
+    let half = side / 2;
+    let (w, h) = (doc.w, doc.h);
+    let (rx0, ry0) = (cx.saturating_sub(half), cy.saturating_sub(half));
+    let (rx1, ry1) = (
+        (cx + half).min(w.saturating_sub(1)),
+        (cy + half).min(h.saturating_sub(1)),
+    );
+    let region = doc.flatten_region(rx0, ry0, rx1, ry1);
+    let bg = doc.background;
+    let mut cells = Vec::with_capacity((side * side) as usize);
+    for j in 0..side {
+        for i in 0..side {
+            let (x, y) = (rx0 + i, ry0 + j);
+            if x <= rx1 && y <= ry1 {
+                let o = (((y - ry0) * (rx1 - rx0 + 1) + (x - rx0)) * 4) as usize;
+                cells.push([region[o], region[o + 1], region[o + 2], region[o + 3]]);
+            } else {
+                cells.push(bg);
+            }
+        }
+    }
+    (cells, cx - rx0, cy - ry0)
+}
+
+/// Magnifier ring for the eyedropper: `cells` render as squares at `cell`
+/// px with the cursor cell outlined, plus a chip + hex readout. Screen
+/// space (never rotated with the canvas); the caller parks it clear of
+/// the pointer so fingers never cover the target.
+fn paint_loupe(
+    painter: &egui::Painter,
+    cells: &[[u8; 4]],
+    side: u32,
+    center: (u32, u32),
+    at: egui::Pos2,
+    cell: f32,
+    picked: [u8; 3],
+) {
+    let size = side as f32 * cell;
+    let pad = 6.0;
+    let row = 22.0;
+    painter.rect_filled(
+        egui::Rect::from_min_size(
+            at - egui::Vec2::splat(pad),
+            egui::Vec2::new(size + pad * 2.0, size + pad * 2.0 + row),
+        ),
+        8.0,
+        Color32::from_black_alpha(220),
+    );
+    for (k, c) in cells.iter().enumerate() {
+        let (i, j) = ((k as u32 % side) as f32, (k as u32 / side) as f32);
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                at + egui::Vec2::new(i * cell, j * cell),
+                egui::Vec2::splat(cell),
+            ),
+            0.0,
+            Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]),
+        );
+    }
+    painter.rect_stroke(
+        egui::Rect::from_min_size(
+            at + egui::Vec2::new(center.0 as f32 * cell, center.1 as f32 * cell),
+            egui::Vec2::splat(cell),
+        ),
+        0.0,
+        (2.0, Color32::WHITE),
+        egui::StrokeKind::Middle,
+    );
+    let chip = egui::Rect::from_min_size(
+        at + egui::Vec2::new(0.0, size + pad),
+        egui::Vec2::new(row - 6.0, row - 6.0),
+    );
+    painter.rect_filled(
+        chip,
+        3.0,
+        Color32::from_rgb(picked[0], picked[1], picked[2]),
+    );
+    painter.text(
+        at + egui::Vec2::new(row, size + pad + (row - 6.0) * 0.5),
+        egui::Align2::LEFT_CENTER,
+        format!("#{:02X}{:02X}{:02X}", picked[0], picked[1], picked[2]),
+        egui::FontId::monospace(13.0),
+        Color32::WHITE,
+    );
 }
 
 /// Freehand path overlay: dark base plus light top, visible on any art.
@@ -1702,6 +1864,7 @@ impl eframe::App for ProCraftApp {
             ui.radio_value(&mut self.tool, Tool::Select, "⬚ Select");
             ui.radio_value(&mut self.tool, Tool::Lasso, "◌ Lasso");
             ui.radio_value(&mut self.tool, Tool::Fill, "◧ Fill");
+            ui.radio_value(&mut self.tool, Tool::Picker, "◉ Pick");
             ui.radio_value(&mut self.tool, Tool::Move, "↔ Move");
             ui.radio_value(&mut self.tool, Tool::Crop, "◫ Crop");
             ui.radio_value(&mut self.tool, Tool::Shapes, "○ Shapes");
@@ -1709,6 +1872,9 @@ impl eframe::App for ProCraftApp {
             if self.tool == Tool::Fill {
                 stepped_slider(ui, &mut self.fill_tolerance, 0..=255, 1.0, "Tolerance");
                 ui.label("Tap fills; hold + drag sideways to sweep tolerance.");
+            }
+            if self.tool == Tool::Picker {
+                ui.label("Tap the canvas to lift its color; the loupe magnifies the target.");
             }
             if self.tool == Tool::Smudge {
                 stepped_slider(ui, &mut self.smudge_strength, 0.0..=1.0, 0.05, "Strength");
@@ -2170,7 +2336,9 @@ impl eframe::App for ProCraftApp {
                         .pick_file()
                     {
                         match load_palette_file(&path) {
-                            Ok(pal) => self.status = self.absorb_colors(pal, &path),
+                            Ok(pal) => {
+                                self.status = self.absorb_colors(pal, &format!("{}", path.display()))
+                            }
                             Err(e) => self.status = format!("Palette import failed: {e}"),
                         }
                     }
@@ -2206,6 +2374,47 @@ impl eframe::App for ProCraftApp {
                 if ui.button("Clear").clicked() {
                     self.palettes.clear_active();
                     self.status = "Active palette cleared.".to_string();
+                }
+                if ui.button("From image").clicked() {
+                    #[cfg(not(target_os = "ios"))]
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter(
+                            "Images",
+                            &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
+                        )
+                        .pick_file()
+                    {
+                        let stem = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Image")
+                            .to_string();
+                        let from = format!("{}", path.display());
+                        match image::open(&path).map(|i| i.to_rgba8()) {
+                            Ok(img) => {
+                                let (w, h) = (img.width(), img.height());
+                                self.status =
+                                    self.image_palette_status(&stem, img.as_raw(), w, h, &from);
+                            }
+                            Err(e) => self.status = format!("Image open failed: {e}"),
+                        }
+                    }
+                    #[cfg(target_os = "ios")]
+                    {
+                        let _ = rfd::FileDialog::new()
+                            .add_filter(
+                                "Images",
+                                &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
+                            )
+                            .pick_file();
+                        self.pending_open = Some(PendingOpen::ImagePalette);
+                        self.status = "Pick an image…".to_string();
+                    }
+                }
+                if ui.button("From canvas").clicked() {
+                    let flat = self.doc.flatten();
+                    let (w, h) = (self.doc.w, self.doc.h);
+                    self.status = self.image_palette_status("Canvas", &flat, w, h, "canvas");
                 }
             });
             ui.label("Harmony of the current color (click applies):");
@@ -3292,6 +3501,12 @@ impl eframe::App for ProCraftApp {
                             }
                         }
                     }
+                    // Same magnifier as the Pick tool, parked clear of the cursor.
+                    if let Some(pos) = resp.hover_pos() {
+                        let (x, y) = to_canvas(pos);
+                        let (cx, cy) = clamp_pt(x, y);
+                        self.paint_picker_loupe(ui.painter(), &ctx, pos, cx, cy);
+                    }
                     self.painting = false;
                     self.last = None;
                     return;
@@ -3573,6 +3788,32 @@ impl eframe::App for ProCraftApp {
                         if let Some(fp) = self.fill_preview.take() {
                             self.status = format!("Filled (tolerance {}).", fp.applied);
                         }
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                }
+
+                if self.tool == Tool::Picker {
+                    // Tap or drag to lift the composited color into the
+                    // brush; the loupe shows a magnified ring so a finger
+                    // never covers the target (touch-first, iPad-visible).
+                    if (resp.drag_started() || resp.dragged()) && !gesture {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            let (cx, cy) = clamp_pt(x, y);
+                            if let Some(rgb) = self.doc.sample(cx as u32, cy as u32) {
+                                self.color = rgb;
+                                self.status =
+                                    format!("Picked #{:02X}{:02X}{:02X}.", rgb[0], rgb[1], rgb[2]);
+                            }
+                        }
+                    }
+                    // Loupe on hover and mid-drag alike.
+                    if let Some(pos) = resp.hover_pos() {
+                        let (x, y) = to_canvas(pos);
+                        let (cx, cy) = clamp_pt(x, y);
+                        self.paint_picker_loupe(ui.painter(), &ctx, pos, cx, cy);
                     }
                     self.painting = false;
                     self.last = None;

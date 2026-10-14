@@ -2155,6 +2155,90 @@ impl Document {
         self.mark_full_dirty();
     }
 
+    /// M40 Liquify push: displace layer pixels along the drag vector
+    /// `(dx, dy)` within `size` px of `(x, y)`, reverse-mapped with
+    /// bilinear sampling so no holes tear open. `strength` 0..=1 scales
+    /// the push; falloff is smooth to the rim. Honors the active
+    /// selection for writes (graduated-mask mixed, like blur). Caller
+    /// checkpoints once per stroke; zero push is a no-op.
+    #[allow(clippy::too_many_arguments)]
+    pub fn liquify(
+        &mut self,
+        index: usize,
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+        size: f32,
+        strength: f32,
+    ) {
+        if index >= self.layers.len() || size < 1.0 || strength <= 0.0 {
+            return;
+        }
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let radius = size * 0.5;
+        let bx0 = ((x - radius).floor().max(0.0)) as u32;
+        let by0 = ((y - radius).floor().max(0.0)) as u32;
+        let bx1 = ((x + radius).ceil().min(w as f32 - 1.0).max(0.0)) as u32;
+        let by1 = ((y + radius).ceil().min(h as f32 - 1.0).max(0.0)) as u32;
+        if bx0 > bx1 || by0 > by1 {
+            return;
+        }
+        let src = self.layers[index].pixels.clone();
+        let sample = |sx: f32, sy: f32, ch: usize| -> f32 {
+            let sx = sx.clamp(0.0, w as f32 - 1.0);
+            let sy = sy.clamp(0.0, h as f32 - 1.0);
+            let (x0, y0) = (sx.floor() as u32, sy.floor() as u32);
+            let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+            let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+            let at = |x: u32, y: u32| src[((y * w + x) as usize * 4) + ch] as f32;
+            at(x0, y0) * (1.0 - fx) * (1.0 - fy)
+                + at(x1, y0) * fx * (1.0 - fy)
+                + at(x0, y1) * (1.0 - fx) * fy
+                + at(x1, y1) * fx * fy
+        };
+        let sel = self.selection;
+        let mask = self.selection_mask.as_deref();
+        let pixels = &mut self.layers[index].pixels;
+        for py in by0..=by1 {
+            for px in bx0..=bx1 {
+                let dist = (((px as f32 + 0.5 - x).powi(2) + (py as f32 + 0.5 - y).powi(2)).sqrt()
+                    / radius)
+                    .min(1.0);
+                // Smooth falloff: full push at the center, zero at the rim.
+                let f = 0.5 + 0.5 * (std::f32::consts::PI * dist).cos();
+                let (ox, oy) = (px as f32 - dx * strength * f, py as f32 - dy * strength * f);
+                if (ox - px as f32).abs() < f32::EPSILON && (oy - py as f32).abs() < f32::EPSILON {
+                    continue;
+                }
+                let selected = !matches!(sel, Some((a, b, c, d)) if px < a || px > c || py < b || py > d)
+                    && match mask {
+                        Some(m) => m[(py * w + px) as usize] != 0,
+                        None => true,
+                    };
+                if !selected {
+                    continue;
+                }
+                let o = ((py * w + px) * 4) as usize;
+                if o + 3 >= pixels.len() {
+                    continue;
+                }
+                let k = Self::sel_k(mask, w, px, py);
+                for ch in 0..4 {
+                    let v = sample(ox, oy, ch);
+                    pixels[o + ch] = (pixels[o + ch] as f32 * (1.0 - k) + v * k).round() as u8;
+                }
+            }
+        }
+        self.mark_dirty(bx0, by0, bx1, by1);
+    }
+
     /// Save the composite as PNG.
     pub fn save_png(&self, path: &std::path::Path) -> Result<(), String> {
         image::save_buffer(
@@ -4626,5 +4710,48 @@ mod tests {
         doc.color_balance(0, 51, 51, 51);
         assert_eq!(doc.layers[0].pixels[0], 151);
         assert_eq!(doc.layers[0].pixels[20], 100);
+    }
+
+    #[test]
+    fn liquify_pushes_pixels_along_the_drag() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(32, 32);
+        let brush = Brush {
+            size: 30.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        // Solid white bar on the left half.
+        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 4, 4, 11, 27);
+        // Push right at the bar's edge: the bar's rim must advance.
+        doc.liquify(0, 11.5, 15.5, 6.0, 0.0, 16.0, 1.0);
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 32 + x) * 4) as usize];
+        assert!(at(&doc, 14, 15) > 200, "rim advanced");
+        assert_eq!(at(&doc, 24, 15), 0, "far field untouched");
+        // Zero push and zero strength are no-ops.
+        let before = doc.layers[0].pixels.clone();
+        doc.liquify(0, 11.5, 15.5, 0.0, 0.0, 16.0, 1.0);
+        doc.liquify(0, 11.5, 15.5, 6.0, 0.0, 16.0, 0.0);
+        assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
+    fn liquify_honors_selection() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(32, 32);
+        let brush = Brush {
+            size: 30.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 4, 4, 27, 27);
+        // Selection far from the push keeps its pixels (warp still runs).
+        doc.selection = Some((24, 24, 31, 31));
+        let before = doc.layers[0].pixels.clone();
+        doc.liquify(0, 8.5, 8.5, 6.0, 0.0, 12.0, 1.0);
+        let o = ((25 * 32 + 25) * 4) as usize;
+        assert_eq!(doc.layers[0].pixels[o], before[o]);
     }
 }

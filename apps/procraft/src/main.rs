@@ -54,6 +54,7 @@ enum Tool {
     Fill,
     Picker,
     Move,
+    Liquify,
     Crop,
     Shapes,
     Text,
@@ -372,6 +373,10 @@ struct ProCraftApp {
     ghost_dirty: bool,
     move_from: Option<(f32, f32)>,
     move_acc: (f32, f32),
+    /// M40 Liquify: drag anchor plus brush size/strength.
+    liquify_from: Option<(f32, f32)>,
+    liquify_size: f32,
+    liquify_strength: f32,
     shape_anchor: Option<(f32, f32)>,
     shape_current: Option<(f32, f32)>,
     shape_kind: ShapeKind,
@@ -545,6 +550,9 @@ impl ProCraftApp {
             ghost_dirty: true,
             move_from: None,
             move_acc: (0.0, 0.0),
+            liquify_from: None,
+            liquify_size: 128.0,
+            liquify_strength: 0.5,
             shape_anchor: None,
             shape_current: None,
             shape_kind: ShapeKind::Rect,
@@ -1177,6 +1185,7 @@ impl ProCraftApp {
         self.crop_anchor = None;
         self.crop_current = None;
         self.move_from = None;
+        self.liquify_from = None;
         self.canvas_sync = (self.doc.w, self.doc.h);
         self.canvas_w = self.doc.w;
         self.canvas_h = self.doc.h;
@@ -1788,13 +1797,14 @@ impl eframe::App for ProCraftApp {
             }
         }
         // Keep frames coming while painting, selecting, lassoing, moving,
-        // shaping, or marching ants.
+        // liquifying, shaping, or marching ants.
         if self.painting
             || self.sel_anchor.is_some()
             || self.crop_anchor.is_some()
             || !self.lasso_points.is_empty()
             || self.shape_anchor.is_some()
             || self.move_from.is_some()
+            || self.liquify_from.is_some()
             || self.doc.selection.is_some()
             || self.doc.selection_mask.is_some()
         {
@@ -2534,6 +2544,7 @@ impl eframe::App for ProCraftApp {
             ui.radio_value(&mut self.tool, Tool::Fill, "◧ Fill");
             ui.radio_value(&mut self.tool, Tool::Picker, "◉ Pick");
             ui.radio_value(&mut self.tool, Tool::Move, "↔ Move");
+            ui.radio_value(&mut self.tool, Tool::Liquify, "➰ Liquify");
             ui.radio_value(&mut self.tool, Tool::Crop, "◫ Crop");
             ui.radio_value(&mut self.tool, Tool::Shapes, "○ Shapes");
             ui.radio_value(&mut self.tool, Tool::Text, "T Text");
@@ -2547,6 +2558,11 @@ impl eframe::App for ProCraftApp {
             if self.tool == Tool::Smudge {
                 stepped_slider(ui, &mut self.smudge_strength, 0.0..=1.0, 0.05, "Strength");
                 ui.label("Drag to push paint around (color layers).");
+            }
+            if self.tool == Tool::Liquify {
+                stepped_slider(ui, &mut self.liquify_size, 8.0..=512.0, 1.0, "Size");
+                stepped_slider(ui, &mut self.liquify_strength, 0.05..=1.0, 0.05, "Strength");
+                ui.label("Drag to push pixels (one undo step per stroke).");
             }
             if self.tool == Tool::Crop {
                 ui.label("Drag a rect on the canvas, then Apply.");
@@ -4247,6 +4263,7 @@ impl eframe::App for ProCraftApp {
                 self.shape_anchor = None;
                 self.shape_current = None;
                 self.move_from = None;
+                self.liquify_from = None;
                 self.fill_preview = None;
                 self.vp_grab = None;
                 self.sym_grab = false;
@@ -4844,6 +4861,38 @@ impl eframe::App for ProCraftApp {
                     if resp.drag_stopped() {
                         self.move_from = None;
                         self.status = "Layer moved.".to_string();
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                }
+
+                if self.tool == Tool::Liquify {
+                    // M40 push: warp the active layer along each drag
+                    // segment (one checkpoint per stroke, like paint).
+                    if resp.drag_started() && !gesture {
+                        if let Some(pos) = resp.hover_pos() {
+                            self.doc.checkpoint();
+                            self.liquify_from = Some(to_canvas(pos));
+                        }
+                    }
+                    if self.liquify_from.is_some() && resp.dragged() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            let (fx, fy) = self.liquify_from.unwrap();
+                            let (dx, dy) = (x - fx, y - fy);
+                            if dx != 0.0 || dy != 0.0 {
+                                let active = self.doc.active;
+                                let (size, strength) = (self.liquify_size, self.liquify_strength);
+                                self.doc.liquify(active, x, y, dx, dy, size, strength);
+                                self.ghost_dirty = true;
+                                self.liquify_from = Some((x, y));
+                            }
+                        }
+                    }
+                    if resp.drag_stopped() {
+                        self.liquify_from = None;
+                        self.status = "Liquified.".to_string();
                     }
                     self.painting = false;
                     self.last = None;

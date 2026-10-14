@@ -7,15 +7,15 @@
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
 // iOS has no rfd backend: same call shape, every dialog declined.
 use procraft_engine::{
-    analogous, clamp_frame, complementary, curves_lut, export_gif_ext, export_tip_png,
+    analogous, check_font, clamp_frame, complementary, curves_lut, export_gif_ext, export_tip_png,
     gallery_thumb, import_brush_file, import_gif_document, import_gpl_file, levels_lut, next_frame,
     onion_ghost, open_brush_library, open_palette, open_psd, palette_from_rgba, prev_frame,
     rasterize_frame, rasterize_frame_region, save_brush_library, save_palette, save_psd,
     starter_palette, step_playback_visible, triadic, AssistLine, BlendMode, Brush, BrushPreset,
     Color, DabDynamics, Document, GuideKind, Guides, LoopMode, PaintTarget, Palette, PaletteSet,
-    ShapePoly, SymmetryMode, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS,
-    MAX_LIBRARY_BRUSHES, MAX_PALETTES, MAX_PALETTE_COLORS, MIN_ANIM_FPS, MIN_ANIM_HOLD,
-    MIN_TEXT_PX,
+    ShapePoly, SymmetryMode, TextStyle, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE,
+    MAX_IMAGE_COLORS, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS,
+    MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
 };
 #[cfg(target_os = "ios")]
 use rfd_shim as rfd;
@@ -167,6 +167,7 @@ enum PendingOpen {
     ImagePalette,
     Gif,
     Reference,
+    Font,
 }
 
 impl Theme {
@@ -379,6 +380,15 @@ struct ProCraftApp {
     text_open: bool,
     text_body: String,
     text_size: f32,
+    /// M38 Typography: imported face (session-only bytes + name),
+    /// spacing, and outline. Render bakes through `TextStyle`.
+    text_font_name: Option<String>,
+    text_font_bytes: Option<Vec<u8>>,
+    text_leading: f32,
+    text_tracking: f32,
+    text_outline: bool,
+    text_outline_w: u32,
+    text_outline_rgb: [u8; 3],
     zoom: f32,
     status: String,
     /// M33 Gallery: recent project paths (newest first, max 10),
@@ -543,6 +553,13 @@ impl ProCraftApp {
             text_open: false,
             text_body: String::new(),
             text_size: 48.0,
+            text_font_name: None,
+            text_font_bytes: None,
+            text_leading: 0.0,
+            text_tracking: 0.0,
+            text_outline: false,
+            text_outline_w: 3,
+            text_outline_rgb: [0, 0, 0],
             zoom: 1.0,
             status:
                 "Drag on the canvas to paint. Ctrl+Z undoes, Ctrl+Y redoes, Esc clears selection."
@@ -836,6 +853,18 @@ impl ProCraftApp {
                     self.set_reference(img.into_raw(), w, h, &format!("{}", path.display()));
                 }
                 Err(e) => self.status = format!("Reference load failed: {e}"),
+            },
+            // M38 Typography: validate an imported face, keep its bytes.
+            PendingOpen::Font => match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("font")
+                        .to_string();
+                    self.status = self.absorb_font(&bytes, &name);
+                }
+                Err(e) => self.status = format!("Font import failed: {e}"),
             },
         }
     }
@@ -1276,6 +1305,38 @@ impl ProCraftApp {
                 let img = ColorImage::from_rgba_unmultiplied([*w as usize, *h as usize], bytes);
                 self.ref_tex = Some(ctx.load_texture("reference", img, TextureOptions::LINEAR));
             }
+        }
+    }
+
+    /// M38 Typography: validate imported TTF/OTF bytes and keep them as
+    /// the session face (shared by desktop Import and the iOS resolve).
+    fn absorb_font(&mut self, bytes: &[u8], name: &str) -> String {
+        match check_font(bytes) {
+            Ok(()) => {
+                self.text_font_name = Some(name.to_string());
+                self.text_font_bytes = Some(bytes.to_vec());
+                format!("Font {name} ready.")
+            }
+            Err(e) => format!("Font import failed: {e}"),
+        }
+    }
+
+    /// M38 Typography: the current dialog settings as an engine style.
+    fn text_style(&self) -> TextStyle {
+        TextStyle {
+            font_bytes: self.text_font_bytes.clone(),
+            leading: self.text_leading,
+            tracking: self.text_tracking,
+            outline: self.text_outline.then(|| {
+                (
+                    Color::rgb(
+                        self.text_outline_rgb[0],
+                        self.text_outline_rgb[1],
+                        self.text_outline_rgb[2],
+                    ),
+                    self.text_outline_w,
+                )
+            }),
         }
     }
 }
@@ -2321,17 +2382,90 @@ impl eframe::App for ProCraftApp {
                         field.request_focus();
                     }
                     stepped_slider(ui, &mut self.text_size, MIN_TEXT_PX..=128.0, 1.0, "Size px");
+                    // M38 Typography: face + spacing + outline.
+                    ui.horizontal(|ui| {
+                        let face = self.text_font_name.as_deref().unwrap_or("Inter (bundled)");
+                        ui.label(format!("Face: {face}"));
+                        if ui.button("Import…").clicked() {
+                            #[cfg(not(target_os = "ios"))]
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Fonts", &["ttf", "otf"])
+                                .pick_file()
+                            {
+                                match std::fs::read(&path) {
+                                    Ok(bytes) => {
+                                        let name = path
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("font")
+                                            .to_string();
+                                        self.status = self.absorb_font(&bytes, &name);
+                                    }
+                                    Err(e) => self.status = format!("Font import failed: {e}"),
+                                }
+                            }
+                            #[cfg(target_os = "ios")]
+                            {
+                                let _ = rfd::FileDialog::new()
+                                    .add_filter("Fonts", &["ttf", "otf"])
+                                    .pick_file();
+                                self.pending_open = Some(PendingOpen::Font);
+                                self.status = "Pick a font…".to_string();
+                            }
+                        }
+                        if self.text_font_name.is_some() && ui.button("Bundled").clicked() {
+                            self.text_font_name = None;
+                            self.text_font_bytes = None;
+                            self.status = "Back to Inter.".to_string();
+                        }
+                    });
+                    stepped_slider(
+                        ui,
+                        &mut self.text_leading,
+                        -MAX_TEXT_SPACING..=MAX_TEXT_SPACING,
+                        1.0,
+                        "Leading",
+                    );
+                    stepped_slider(
+                        ui,
+                        &mut self.text_tracking,
+                        -MAX_TEXT_SPACING..=MAX_TEXT_SPACING,
+                        1.0,
+                        "Tracking",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.text_outline, "Outline");
+                        if self.text_outline {
+                            stepped_slider(
+                                ui,
+                                &mut self.text_outline_w,
+                                1..=MAX_OUTLINE_PX,
+                                1.0,
+                                "px",
+                            );
+                        }
+                    });
+                    if self.text_outline {
+                        ui.horizontal(|ui| {
+                            ui.label("Outline color:");
+                            stepped_slider(ui, &mut self.text_outline_rgb[0], 0..=255, 1.0, "R");
+                            stepped_slider(ui, &mut self.text_outline_rgb[1], 0..=255, 1.0, "G");
+                            stepped_slider(ui, &mut self.text_outline_rgb[2], 0..=255, 1.0, "B");
+                        });
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Render").clicked() {
                             match self.text_anchor {
                                 Some((ax, ay)) => {
+                                    let style = self.text_style();
                                     self.doc.checkpoint();
-                                    match self.doc.draw_text(
+                                    match self.doc.draw_text_styled(
                                         ink,
                                         ax,
                                         ay,
                                         self.text_size,
                                         &self.text_body,
+                                        &style,
                                     ) {
                                         Ok((w, h)) => {
                                             self.status = format!("Text placed ({w}x{h}px).");

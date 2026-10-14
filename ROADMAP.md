@@ -52,7 +52,16 @@ people touch daily. Ranked by user-visible value per effort.
   selection (nudge/flip); on-canvas fill-tolerance sweep pre-existed.
 - [x] **M36 — Adjustments I.** Curves + Levels.
 - [x] **M37 — Adjustments II.** HSL + Color Balance + Recolor.
-  **→ PC checkpoint #3 (you are here).**
+  **→ PC checkpoint #3 (passed, pushed).**
+
+## Batch 4: M38–M42 (in progress — depth + polish-at-IPA)
+
+- [ ] **M38 — Typography.** TTF/OTF import, leading/tracking, outline text.
+- [ ] **M39 — Brush depth.** Dual-tip, wet-edge/glaze, per-brush blend mode.
+- [ ] **M40 — Liquify-lite.** Push/smudge-field on layer.
+- [ ] **M41 — Time-lapse recording.** Staged snapshots.
+- [ ] **M42 — iPad layout polish pass.**
+  **→ PC checkpoint #4 + iPad check #2 (IPA) (you are here when done).**
 
 ## P0 backlog (done)
 

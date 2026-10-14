@@ -168,6 +168,7 @@ enum PendingOpen {
     Gif,
     Reference,
     Font,
+    DualTip,
 }
 
 impl Theme {
@@ -866,6 +867,10 @@ impl ProCraftApp {
                 }
                 Err(e) => self.status = format!("Font import failed: {e}"),
             },
+            // M39 Brush depth: take the first stamp tip in the file.
+            PendingOpen::DualTip => {
+                self.status = self.absorb_dual_tip(&path);
+            }
         }
     }
 
@@ -1318,6 +1323,22 @@ impl ProCraftApp {
                 format!("Font {name} ready.")
             }
             Err(e) => format!("Font import failed: {e}"),
+        }
+    }
+
+    /// M39 Brush depth: take the first stamp tip in a brush file as the
+    /// current brush's dual tip (shared by desktop Import and iOS resolve).
+    fn absorb_dual_tip(&mut self, path: &std::path::Path) -> String {
+        match load_brush_file(path) {
+            Ok(libs) => match libs.into_iter().find_map(|p| p.brush.tip) {
+                Some(tip) => {
+                    let (w, h) = (tip.w, tip.h);
+                    self.brush.dual_tip = Some(tip);
+                    format!("Dual tip set ({w}x{h}).")
+                }
+                None => "No stamp tip in that file.".to_string(),
+            },
+            Err(e) => format!("Dual import failed: {e}"),
         }
     }
 
@@ -3175,6 +3196,46 @@ impl eframe::App for ProCraftApp {
             ui.collapsing("Texture", |ui| {
                 stepped_slider(ui, &mut self.brush.grain, 0.0..=1.0, 0.05, "Grain");
                 stepped_slider(ui, &mut self.brush.grain_scale, 0.25..=4.0, 0.05, "Grain size");
+            });
+            ui.collapsing("Depth", |ui| {
+                // M39 per-brush blend mode (Normal = classic source-over).
+                ui.horizontal_wrapped(|ui| {
+                    for m in BlendMode::ALL {
+                        ui.radio_value(&mut self.brush.blend, m, m.name());
+                    }
+                });
+                stepped_slider(ui, &mut self.brush.wet_edge, 0.0..=1.0, 0.05, "Wet edge");
+                // M39 dual-tip: a stamp from any brush file textures the dab.
+                ui.horizontal(|ui| {
+                    match &self.brush.dual_tip {
+                        Some(t) => ui.label(format!("Dual: {}x{} tip", t.w, t.h)),
+                        None => ui.label("Dual: off"),
+                    };
+                    if ui.button("Import…").clicked() {
+                        #[cfg(not(target_os = "ios"))]
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Brushes", &["pcbrush", "json", "abr", "brushset"])
+                            .pick_file()
+                        {
+                            self.status = self.absorb_dual_tip(&path);
+                        }
+                        #[cfg(target_os = "ios")]
+                        {
+                            let _ = rfd::FileDialog::new()
+                                .add_filter("Brushes", &["pcbrush", "json", "abr", "brushset"])
+                                .pick_file();
+                            self.pending_open = Some(PendingOpen::DualTip);
+                            self.status = "Pick a dual tip…".to_string();
+                        }
+                    }
+                    if self.brush.dual_tip.is_some() && ui.button("Clear").clicked() {
+                        self.brush.dual_tip = None;
+                        self.status = "Dual tip cleared.".to_string();
+                    }
+                });
+                if self.brush.dual_tip.is_some() {
+                    stepped_slider(ui, &mut self.brush.dual_scale, 0.1..=2.0, 0.05, "Dual size");
+                }
             });
             ui.collapsing("Dab shape", |ui| {
                 stepped_slider(ui, &mut self.brush.roundness, 0.1..=1.0, 0.05, "Roundness");

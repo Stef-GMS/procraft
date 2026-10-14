@@ -1,7 +1,7 @@
 //! Layers, documents, compositing and undo.
 
 /// How a layer's pixels combine with what's beneath.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BlendMode {
     #[default]
     Normal,
@@ -45,7 +45,7 @@ impl BlendMode {
         }
     }
 
-    fn apply(self, src: f32, dst: f32) -> f32 {
+    pub(crate) fn apply(self, src: f32, dst: f32) -> f32 {
         match self {
             BlendMode::Normal => src,
             BlendMode::Multiply => src * dst / 255.0,

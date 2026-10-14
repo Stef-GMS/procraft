@@ -110,6 +110,9 @@ fn def_scatter() -> f32 {
 fn def_stabilizer() -> f32 {
     0.35
 }
+fn def_dual_scale() -> f32 {
+    0.5
+}
 
 /// Deterministic 0.0..=1.0 hash for scatter offsets and grain. Position
 /// based (not counter based) so strokes replay identically across
@@ -129,6 +132,58 @@ fn hash01(x: i32, y: i32) -> f32 {
 fn grain_at(px: u32, py: u32, scale: f32) -> f32 {
     let cell = ((3.0 * scale.clamp(0.25, 4.0)).round() as u32).max(1);
     hash01((px / cell) as i32, (py / cell) as i32)
+}
+
+/// M39 dual-tip multiplier 0.0..=1.0 at canvas offset (`ox`, `oy`) from
+/// the dab center, for a secondary tip spanning `size * dual_scale` px
+/// (nearest-neighbor, unrotated, like the primary stamp path). Absent or
+/// degenerate tips return 1.0 (single-tip behavior, bit-for-bit).
+fn dual_factor(dual: &Option<BrushTip>, dual_scale: f32, size: f32, ox: f32, oy: f32) -> f32 {
+    let Some(tip) = dual.as_ref() else {
+        return 1.0;
+    };
+    if tip.w == 0 || tip.h == 0 || tip.mask.len() != (tip.w * tip.h) as usize {
+        return 1.0;
+    }
+    let span = (size * dual_scale.clamp(0.1, 2.0)).max(1.0);
+    let scale = span / tip.w as f32;
+    let (half_w, half_h) = (span * 0.5, tip.h as f32 * scale * 0.5);
+    let tx = ((ox + half_w) / scale) as i32;
+    let ty = ((oy + half_h) / scale) as i32;
+    if tx < 0 || ty < 0 || tx >= tip.w as i32 || ty >= tip.h as i32 {
+        return 0.0;
+    }
+    tip.mask[(ty as u32 * tip.w + tx as u32) as usize] as f32 / 255.0
+}
+
+/// M39 wet-edge boost: lifts mid-coverage fringe dabs toward full
+/// strength (peaks at 50% coverage, zero at 0/1), so strokes dry with a
+/// darker rim. `wet` 0.0 is a no-op.
+fn wet_boost(fa: f32, wet: f32) -> f32 {
+    (fa + wet.clamp(0.0, 1.0) * fa * (1.0 - fa)).clamp(0.0, 1.0)
+}
+
+/// M39 dab composite: the blend mode mixes brush color with the
+/// backdrop, then alpha composites source-over. Normal reproduces the
+/// classic path bit-for-bit; the eraser keeps destination-out upstream.
+fn composite_dab(
+    pixels: &mut [u8],
+    o: usize,
+    color: [u8; 4],
+    src_a: f32,
+    mode: super::document::BlendMode,
+) {
+    let dst_a = pixels[o + 3] as f32 / 255.0;
+    let out_a = src_a + dst_a * (1.0 - src_a);
+    if out_a <= 0.0 {
+        return;
+    }
+    for ch in 0..3 {
+        let b = mode.apply(color[ch] as f32, pixels[o + ch] as f32);
+        pixels[o + ch] =
+            ((b * src_a + pixels[o + ch] as f32 * dst_a * (1.0 - src_a)) / out_a).round() as u8;
+    }
+    pixels[o + 3] = (out_a * 255.0).round() as u8;
 }
 
 /// Brush shape settings. All original math: a radial falloff stamp laid down
@@ -186,6 +241,20 @@ pub struct Brush {
     /// Pointer smoothing amount, 0.0 (raw) ..= 1.0 (heavy streamline).
     #[serde(default = "def_stabilizer")]
     pub stabilizer: f32,
+    /// Per-brush paint blend mode (Normal = classic source-over). The
+    /// eraser always uses destination-out regardless of this setting.
+    #[serde(default)]
+    pub blend: super::document::BlendMode,
+    /// Wet edge / glaze: boosts mid-coverage fringe dabs, 0.0 (off) ..= 1.0.
+    #[serde(default)]
+    pub wet_edge: f32,
+    /// Secondary stamp tip multiplied into dab coverage (dual-brush
+    /// texture; None = single tip). Imported via "dual tip" in the app.
+    #[serde(default)]
+    pub dual_tip: Option<BrushTip>,
+    /// Secondary tip span as a fraction of `size`, 0.1 ..= 2.0.
+    #[serde(default = "def_dual_scale")]
+    pub dual_scale: f32,
 }
 
 impl Default for Brush {
@@ -207,6 +276,10 @@ impl Default for Brush {
             angle_follow: def_angle_follow(),
             scatter: def_scatter(),
             stabilizer: def_stabilizer(),
+            blend: super::document::BlendMode::Normal,
+            wet_edge: 0.0,
+            dual_tip: None,
+            dual_scale: def_dual_scale(),
         }
     }
 }
@@ -597,6 +670,11 @@ impl Document {
                 if grain > 0.0 {
                     fa *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
                 }
+                // M39 depth: dual-tip texture, then wet-edge fringe boost.
+                if brush.dual_tip.is_some() {
+                    fa *= dual_factor(&brush.dual_tip, brush.dual_scale, size, dx, dy);
+                }
+                fa = wet_boost(fa, brush.wet_edge);
                 let a = (fa * 255.0).round() as u8;
                 if a == 0 {
                     continue;
@@ -615,25 +693,7 @@ impl Document {
                     let keep = 255u16.saturating_sub(a as u16);
                     layer.pixels[o + 3] = ((layer.pixels[o + 3] as u16 * keep) / 255) as u8;
                 } else {
-                    let src_a = a as f32 / 255.0;
-                    let dst_a = layer.pixels[o + 3] as f32 / 255.0;
-                    let out_a = src_a + dst_a * (1.0 - src_a);
-                    if out_a > 0.0 {
-                        let c = color.0;
-                        layer.pixels[o] = ((c[0] as f32 * src_a
-                            + layer.pixels[o] as f32 * dst_a * (1.0 - src_a))
-                            / out_a)
-                            .round() as u8;
-                        layer.pixels[o + 1] = ((c[1] as f32 * src_a
-                            + layer.pixels[o + 1] as f32 * dst_a * (1.0 - src_a))
-                            / out_a)
-                            .round() as u8;
-                        layer.pixels[o + 2] = ((c[2] as f32 * src_a
-                            + layer.pixels[o + 2] as f32 * dst_a * (1.0 - src_a))
-                            / out_a)
-                            .round() as u8;
-                        layer.pixels[o + 3] = (out_a * 255.0).round() as u8;
-                    }
+                    composite_dab(&mut layer.pixels, o, color.0, a as f32 / 255.0, brush.blend);
                 }
             }
         }
@@ -732,6 +792,11 @@ impl Document {
                 if grain > 0.0 {
                     fa *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
                 }
+                // M39 depth: dual-tip texture, then wet-edge fringe boost.
+                if brush.dual_tip.is_some() {
+                    fa *= dual_factor(&brush.dual_tip, brush.dual_scale, size, ox, oy);
+                }
+                fa = wet_boost(fa, brush.wet_edge);
                 let a = (fa * 255.0).round() as u8;
                 if a == 0 {
                     continue;
@@ -749,25 +814,7 @@ impl Document {
                     let keep = 255u16.saturating_sub(a as u16);
                     layer.pixels[o + 3] = ((layer.pixels[o + 3] as u16 * keep) / 255) as u8;
                 } else {
-                    let src_a = a as f32 / 255.0;
-                    let dst_a = layer.pixels[o + 3] as f32 / 255.0;
-                    let out_a = src_a + dst_a * (1.0 - src_a);
-                    if out_a > 0.0 {
-                        let c = color.0;
-                        layer.pixels[o] = ((c[0] as f32 * src_a
-                            + layer.pixels[o] as f32 * dst_a * (1.0 - src_a))
-                            / out_a)
-                            .round() as u8;
-                        layer.pixels[o + 1] = ((c[1] as f32 * src_a
-                            + layer.pixels[o + 1] as f32 * dst_a * (1.0 - src_a))
-                            / out_a)
-                            .round() as u8;
-                        layer.pixels[o + 2] = ((c[2] as f32 * src_a
-                            + layer.pixels[o + 2] as f32 * dst_a * (1.0 - src_a))
-                            / out_a)
-                            .round() as u8;
-                        layer.pixels[o + 3] = (out_a * 255.0).round() as u8;
-                    }
+                    composite_dab(&mut layer.pixels, o, color.0, a as f32 / 255.0, brush.blend);
                 }
             }
         }
@@ -1228,6 +1275,10 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 angle_follow: false,
                 scatter: 0.05,
                 stabilizer: 0.25,
+                blend: super::document::BlendMode::Normal,
+                wet_edge: 0.0,
+                dual_tip: None,
+                dual_scale: 0.5,
             },
         ),
         (
@@ -1249,6 +1300,10 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 angle_follow: true,
                 scatter: 0.0,
                 stabilizer: 0.5,
+                blend: super::document::BlendMode::Normal,
+                wet_edge: 0.0,
+                dual_tip: None,
+                dual_scale: 0.5,
             },
         ),
         (
@@ -1270,6 +1325,10 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 angle_follow: false,
                 scatter: 0.0,
                 stabilizer: 0.35,
+                blend: super::document::BlendMode::Normal,
+                wet_edge: 0.0,
+                dual_tip: None,
+                dual_scale: 0.5,
             },
         ),
         (
@@ -1291,6 +1350,10 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 angle_follow: true,
                 scatter: 0.0,
                 stabilizer: 0.3,
+                blend: super::document::BlendMode::Normal,
+                wet_edge: 0.0,
+                dual_tip: None,
+                dual_scale: 0.5,
             },
         ),
         (
@@ -1312,6 +1375,10 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 angle_follow: false,
                 scatter: 0.0,
                 stabilizer: 0.4,
+                blend: super::document::BlendMode::Normal,
+                wet_edge: 0.0,
+                dual_tip: None,
+                dual_scale: 0.5,
             },
         ),
         (
@@ -1333,6 +1400,10 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 angle_follow: false,
                 scatter: 0.12,
                 stabilizer: 0.2,
+                blend: super::document::BlendMode::Normal,
+                wet_edge: 0.0,
+                dual_tip: None,
+                dual_scale: 0.5,
             },
         ),
     ]
@@ -2552,5 +2623,105 @@ mod tests {
             let o = pxo(16, x, 1);
             assert_eq!(doc.layers[0].pixels[o + 3], 0, "x={x}");
         }
+    }
+
+    #[test]
+    fn per_brush_blend_difference_mixes_backdrop() {
+        use crate::document::{BlendMode, Document};
+        let paint = |mode: BlendMode| {
+            let mut doc = Document::new(8, 8);
+            let base = Brush {
+                size: 20.0,
+                softness: 0.0,
+                opacity: 1.0,
+                ..Default::default()
+            };
+            doc.dab(&base, Color::rgb(0, 255, 0), 3.5, 3.5);
+            let mut brush = Brush {
+                size: 20.0,
+                softness: 0.0,
+                opacity: 1.0,
+                blend: mode,
+                ..Default::default()
+            };
+            brush.tip = None;
+            doc.dab(&brush, Color::rgb(255, 0, 0), 3.5, 3.5);
+            let o = ((3 * 8 + 3) * 4) as usize;
+            [
+                doc.layers[0].pixels[o],
+                doc.layers[0].pixels[o + 1],
+                doc.layers[0].pixels[o + 2],
+                doc.layers[0].pixels[o + 3],
+            ]
+        };
+        // Normal covers; Difference(|red - green|) lands on yellow.
+        assert_eq!(paint(BlendMode::Normal), [255, 0, 0, 255]);
+        assert_eq!(paint(BlendMode::Difference), [255, 255, 0, 255]);
+    }
+
+    #[test]
+    fn wet_edge_lifts_fringe_alpha() {
+        use crate::document::Document;
+        let sum_alpha = |wet: f32| {
+            let mut doc = Document::new(24, 24);
+            let brush = Brush {
+                size: 16.0,
+                softness: 0.8,
+                opacity: 0.5,
+                wet_edge: wet,
+                ..Default::default()
+            };
+            doc.dab(&brush, Color::rgb(255, 255, 255), 11.5, 11.5);
+            doc.layers[0]
+                .pixels
+                .iter()
+                .skip(3)
+                .step_by(4)
+                .map(|&a| a as u32)
+                .sum::<u32>()
+        };
+        let dry = sum_alpha(0.0);
+        let wet = sum_alpha(1.0);
+        assert!(dry > 0 && wet > dry, "dry={dry} wet={wet}");
+    }
+
+    #[test]
+    fn dual_tip_suppresses_where_secondary_is_clear() {
+        use crate::document::Document;
+        // 2x2 secondary: ink only at its top-left texel.
+        let dual = BrushTip::from_mask(2, 2, vec![255, 0, 0, 0]).unwrap();
+        let mut doc = Document::new(16, 16);
+        let brush = Brush {
+            size: 8.0,
+            softness: 0.0,
+            opacity: 1.0,
+            dual_tip: Some(dual),
+            dual_scale: 1.0,
+            ..Default::default()
+        };
+        doc.dab(&brush, Color::rgb(255, 255, 255), 7.5, 7.5);
+        let on = doc.layers[0].pixels.iter().filter(|&&b| b != 0).count();
+        let mut plain = Document::new(16, 16);
+        plain.dab(
+            &Brush {
+                size: 8.0,
+                softness: 0.0,
+                opacity: 1.0,
+                ..Default::default()
+            },
+            Color::rgb(255, 255, 255),
+            7.5,
+            7.5,
+        );
+        let full = plain.layers[0].pixels.iter().filter(|&&b| b != 0).count();
+        assert!(full > 0 && on < full, "full={full} dual={on}");
+    }
+
+    #[test]
+    fn old_brush_files_default_the_new_depth_fields() {
+        // Pre-M39 library JSON has no blend/wet/dual keys: same defaults.
+        let old = r#"{"size":24.0,"opacity":1.0,"softness":0.6,"spacing":0.15,"eraser":false,"tip":null,"pressure_size":0.7,"pressure_opacity":0.6,"velocity_size":0.6,"velocity_opacity":0.6,"grain":0.0,"grain_scale":1.0,"roundness":1.0,"angle_follow":false,"scatter":0.0,"stabilizer":0.35}"#;
+        let brush: Brush = serde_json::from_str(old).unwrap();
+        assert_eq!(brush, Brush::default());
     }
 }

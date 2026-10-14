@@ -1769,7 +1769,11 @@ impl eframe::App for ProCraftApp {
                         }
                     });
                 });
-            self.recovery_offer = open;
+            // The X button snoozes (file kept, offered again next launch);
+            // Recover/Discard already dismissed above and must stick.
+            if !open {
+                self.recovery_offer = false;
+            }
         }
 
         // About box: version, builder, home page, updates. Version comes

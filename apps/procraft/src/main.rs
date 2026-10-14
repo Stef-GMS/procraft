@@ -1432,10 +1432,10 @@ fn vp_handle_pos(rect: egui::Rect, z: f32, vx: f32, vy: f32) -> (egui::Pos2, boo
     (egui::Pos2::new(cx, cy), true)
 }
 
-/// Slider with −/+ step buttons flush at its ends: one compact control
+/// Slider with −/+ step buttons flush before it: one compact control
 /// instead of three widgets spread across the row. `stepped_slider` puts
-/// the name first (`Size [−|slider|+]`); `stepped_slider_label_end` puts
-/// it last (`[−|slider|+] Size`, the Filters convention). `step` is in
+/// the name first (`Size [−][+]slider`); `stepped_slider_label_end` puts
+/// it last (`[−][+]slider Size`, the Filters convention). `step` is in
 /// value units, endpoints clamp. Rows wrap on narrow screens; the step
 /// buttons are 28x20.
 const SLIDER_W: f32 = 100.0;
@@ -1479,13 +1479,13 @@ fn stepped_slider_inner<Num: egui::emath::Numeric>(
             if ui.add_sized([28.0, 20.0], egui::Button::new("−")).clicked() {
                 *value = Num::from_f64((value.to_f64() - step).clamp(lo, hi));
             }
+            if ui.add_sized([28.0, 20.0], egui::Button::new("+")).clicked() {
+                *value = Num::from_f64((value.to_f64() + step).clamp(lo, hi));
+            }
             ui.add_sized(
                 egui::Vec2::new(SLIDER_W, 20.0),
                 egui::Slider::new(value, range),
             );
-            if ui.add_sized([28.0, 20.0], egui::Button::new("+")).clicked() {
-                *value = Num::from_f64((value.to_f64() + step).clamp(lo, hi));
-            }
         });
         if label_end {
             ui.label(text);

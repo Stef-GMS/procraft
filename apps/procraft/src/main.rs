@@ -2148,9 +2148,9 @@ impl eframe::App for ProCraftApp {
                 .open(&mut open)
                 .resizable(true)
                 .collapsible(false)
-                .min_width(320.0)
+                .min_width(280.0)
                 .show(ui.ctx(), |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.add(
                             egui::DragValue::new(&mut self.gallery_new_w)
                                 .range(1..=MAX_CANVAS_SIDE)
@@ -2203,14 +2203,21 @@ impl eframe::App for ProCraftApp {
                                     .and_then(|n| n.to_str())
                                     .unwrap_or(path);
                                 ui.label(name);
-                                ui.horizontal(|ui| {
-                                    if ui.button("Open").clicked() {
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .add_sized([56.0, 28.0], egui::Button::new("Open"))
+                                        .clicked()
+                                    {
                                         open_idx = Some(idx);
                                     }
-                                    if ui.button("Duplicate").clicked() {
+                                    if ui
+                                        .add_sized([86.0, 28.0], egui::Button::new("Duplicate"))
+                                        .clicked()
+                                    {
                                         dup_idx = Some(idx);
                                     }
-                                    if ui.button("✕").clicked() {
+                                    if ui.add_sized([36.0, 28.0], egui::Button::new("✕")).clicked()
+                                    {
                                         remove_idx = Some(idx);
                                     }
                                 });
@@ -2293,11 +2300,18 @@ impl eframe::App for ProCraftApp {
                 .collapsible(false)
                 .min_width(200.0)
                 .show(ui.ctx(), |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("Load…").clicked() {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_sized([70.0, 28.0], egui::Button::new("Load…"))
+                            .clicked()
+                        {
                             load = true;
                         }
-                        if self.ref_image.is_some() && ui.button("Clear").clicked() {
+                        if self.ref_image.is_some()
+                            && ui
+                                .add_sized([70.0, 28.0], egui::Button::new("Clear"))
+                                .clicked()
+                        {
                             clear = true;
                         }
                     });
@@ -2432,7 +2446,7 @@ impl eframe::App for ProCraftApp {
             egui::Window::new("Text")
                 .open(&mut open)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .resizable(false)
+                .resizable(true)
                 .collapsible(false)
                 .show(ui.ctx(), |ui| {
                     ui.label("Click the canvas to move the anchor, then Render.");
@@ -2448,10 +2462,13 @@ impl eframe::App for ProCraftApp {
                     }
                     stepped_slider(ui, &mut self.text_size, MIN_TEXT_PX..=128.0, 1.0, "Size px");
                     // M38 Typography: face + spacing + outline.
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let face = self.text_font_name.as_deref().unwrap_or("Inter (bundled)");
                         ui.label(format!("Face: {face}"));
-                        if ui.button("Import…").clicked() {
+                        if ui
+                            .add_sized([80.0, 28.0], egui::Button::new("Import…"))
+                            .clicked()
+                        {
                             #[cfg(not(target_os = "ios"))]
                             if let Some(path) = rfd::FileDialog::new()
                                 .add_filter("Fonts", &["ttf", "otf"])
@@ -2478,7 +2495,11 @@ impl eframe::App for ProCraftApp {
                                 self.status = "Pick a font…".to_string();
                             }
                         }
-                        if self.text_font_name.is_some() && ui.button("Bundled").clicked() {
+                        if self.text_font_name.is_some()
+                            && ui
+                                .add_sized([86.0, 28.0], egui::Button::new("Bundled"))
+                                .clicked()
+                        {
                             self.text_font_name = None;
                             self.text_font_bytes = None;
                             self.status = "Back to Inter.".to_string();
@@ -2511,15 +2532,16 @@ impl eframe::App for ProCraftApp {
                         }
                     });
                     if self.text_outline {
-                        ui.horizontal(|ui| {
-                            ui.label("Outline color:");
-                            stepped_slider(ui, &mut self.text_outline_rgb[0], 0..=255, 1.0, "R");
-                            stepped_slider(ui, &mut self.text_outline_rgb[1], 0..=255, 1.0, "G");
-                            stepped_slider(ui, &mut self.text_outline_rgb[2], 0..=255, 1.0, "B");
-                        });
+                        ui.label("Outline color:");
+                        stepped_slider(ui, &mut self.text_outline_rgb[0], 0..=255, 1.0, "R");
+                        stepped_slider(ui, &mut self.text_outline_rgb[1], 0..=255, 1.0, "G");
+                        stepped_slider(ui, &mut self.text_outline_rgb[2], 0..=255, 1.0, "B");
                     }
-                    ui.horizontal(|ui| {
-                        if ui.button("Render").clicked() {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_sized([80.0, 28.0], egui::Button::new("Render"))
+                            .clicked()
+                        {
                             match self.text_anchor {
                                 Some((ax, ay)) => {
                                     let style = self.text_style();
@@ -2546,7 +2568,10 @@ impl eframe::App for ProCraftApp {
                                 }
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui
+                            .add_sized([80.0, 28.0], egui::Button::new("Cancel"))
+                            .clicked()
+                        {
                             self.text_open = false;
                         }
                     });
@@ -2800,7 +2825,7 @@ impl eframe::App for ProCraftApp {
                 }
                 stepped_slider(ui, &mut self.sel_nudge_x, -64..=64, 1.0, "Nudge x");
                 stepped_slider(ui, &mut self.sel_nudge_y, -64..=64, 1.0, "Nudge y");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Apply nudge").clicked() {
                         let (dx, dy) = (self.sel_nudge_x, self.sel_nudge_y);
                         if self.doc.translate_selection(dx, dy) {
@@ -3257,7 +3282,7 @@ impl eframe::App for ProCraftApp {
                 });
                 stepped_slider(ui, &mut self.brush.wet_edge, 0.0..=1.0, 0.05, "Wet edge");
                 // M39 dual-tip: a stamp from any brush file textures the dab.
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     match &self.brush.dual_tip {
                         Some(t) => ui.label(format!("Dual: {}x{} tip", t.w, t.h)),
                         None => ui.label("Dual: off"),
@@ -3904,8 +3929,11 @@ impl eframe::App for ProCraftApp {
                     ui.label(format!("{} frames", self.lapse_frames.len()));
                 });
                 if !self.lapse_frames.is_empty() {
-                    ui.horizontal(|ui| {
-                        if ui.button("Export lapse").clicked() {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_sized([110.0, 28.0], egui::Button::new("Export lapse"))
+                            .clicked()
+                        {
                             if let Some(path) = rfd::FileDialog::new()
                                 .add_filter("GIF image", &["gif"])
                                 .save_file()
@@ -3932,7 +3960,10 @@ impl eframe::App for ProCraftApp {
                                 }
                             }
                         }
-                        if ui.button("Clear lapse").clicked() {
+                        if ui
+                            .add_sized([110.0, 28.0], egui::Button::new("Clear lapse"))
+                            .clicked()
+                        {
                             self.lapse_frames.clear();
                             self.status = "Time-lapse cleared.".to_string();
                         }

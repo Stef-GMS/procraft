@@ -341,6 +341,10 @@ const MAX_UNDO_ENTRIES: usize = 32;
 /// cap binds on small ones (32 steps x ~5 MiB at 1280x800).
 const MAX_UNDO_BYTES: usize = 256 * 1024 * 1024;
 
+/// Canvas side cap for crop/resize: bounds reallocations (one 4096x4096
+/// layer is 64 MiB) and matches the GIF import dimension cap.
+pub const MAX_CANVAS_SIDE: u32 = 4096;
+
 #[derive(Clone, Debug)]
 struct UndoEntry {
     layer: usize,
@@ -782,6 +786,99 @@ impl Document {
         layer.ox = (layer.ox + dx).clamp(-LIM, LIM);
         layer.oy = (layer.oy + dy).clamp(-LIM, LIM);
         self.mark_full_dirty();
+    }
+
+    /// Re-seat the canvas: the old canvas lands at `(dx, dy)` in the new
+    /// `new_w` x `new_h` canvas. Buffers are reallocated and copied at
+    /// identical buffer coordinates while the layer offsets absorb the
+    /// shift, so every canvas pixel keeps reading its old buffer cell and
+    /// off-canvas tails survive wherever the new buffer still holds them.
+    /// New areas start transparent; anything outside the new canvas is
+    /// trimmed. Crop is this with `dx = -x0`, `dy = -y0`. Clears
+    /// undo/redo: old pixel snapshots no longer match the buffer size
+    /// (same precedent as [`Self::load_background`]).
+    pub fn rehome_canvas(
+        &mut self,
+        new_w: u32,
+        new_h: u32,
+        dx: i32,
+        dy: i32,
+    ) -> Result<(), String> {
+        if new_w == 0 || new_h == 0 || new_w > MAX_CANVAS_SIDE || new_h > MAX_CANVAS_SIDE {
+            return Err(format!(
+                "bad canvas size: {new_w}x{new_h} (want 1-{MAX_CANVAS_SIDE} each)"
+            ));
+        }
+        if new_w == self.w && new_h == self.h && dx == 0 && dy == 0 {
+            return Ok(());
+        }
+        // Top-left-aligned overlapping copy; short/corrupt sources read as
+        // transparent instead of panicking (the invariant is w*h*bpp, but a
+        // crop must never be the place that finds out otherwise).
+        fn carry(buf: &[u8], old_w: u32, old_h: u32, new_w: u32, new_h: u32, bpp: u32) -> Vec<u8> {
+            let mut out = vec![0u8; (new_w * new_h * bpp) as usize];
+            let cw = old_w.min(new_w);
+            let ch = old_h.min(new_h);
+            for y in 0..ch {
+                let src = ((y * old_w) * bpp) as usize;
+                let dst = ((y * new_w) * bpp) as usize;
+                let n = (cw * bpp) as usize;
+                let chunk = buf.get(src..src + n).unwrap_or(&[]);
+                out[dst..dst + chunk.len()].copy_from_slice(chunk);
+            }
+            out
+        }
+        let (old_w, old_h) = (self.w, self.h);
+        for layer in self.layers.iter_mut() {
+            layer.pixels = carry(&layer.pixels, old_w, old_h, new_w, new_h, 4);
+            if let Some(m) = layer.mask.take() {
+                layer.mask = Some(carry(&m, old_w, old_h, new_w, new_h, 1));
+            }
+            layer.ox = (layer.ox + dx).clamp(-16384, 16384);
+            layer.oy = (layer.oy + dy).clamp(-16384, 16384);
+        }
+        if let Some(sm) = self.selection_mask.take() {
+            self.selection_mask = Some(carry(&sm, old_w, old_h, new_w, new_h, 1));
+        }
+        // Rect selection rides along; drops when fully outside.
+        if let Some((x0, y0, x1, y1)) = self.selection {
+            let (sx0, sy0) = (x0 as i32 + dx, y0 as i32 + dy);
+            let (sx1, sy1) = (x1 as i32 + dx, y1 as i32 + dy);
+            let (nw, nh) = (new_w as i32, new_h as i32);
+            if sx1 < 0 || sy1 < 0 || sx0 >= nw || sy0 >= nh {
+                self.selection = None;
+            } else {
+                self.selection = Some((
+                    sx0.clamp(0, nw - 1) as u32,
+                    sy0.clamp(0, nh - 1) as u32,
+                    sx1.clamp(0, nw - 1) as u32,
+                    sy1.clamp(0, nh - 1) as u32,
+                ));
+            }
+        }
+        if self.symmetry_center.is_some() {
+            let (cx, cy) = self.symmetry_center_px();
+            self.set_symmetry_center(cx + dx as f32, cy + dy as f32);
+        }
+        self.w = new_w;
+        self.h = new_h;
+        self.undo.clear();
+        self.redo.clear();
+        self.undo_bytes = 0;
+        self.redo_bytes = 0;
+        self.mark_full_dirty();
+        Ok(())
+    }
+
+    /// Crop to the inclusive rect: content inside keeps its picture, only
+    /// re-based at the new top-left (offsets absorb the shift). Validates
+    /// before touching anything; clears undo/redo like
+    /// [`Self::rehome_canvas`].
+    pub fn crop(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) -> Result<(), String> {
+        if x0 > x1 || y0 > y1 || x1 >= self.w || y1 >= self.h {
+            return Err("crop rect is outside the canvas".to_string());
+        }
+        self.rehome_canvas(x1 - x0 + 1, y1 - y0 + 1, -(x0 as i32), -(y0 as i32))
     }
 
     fn sample_bilinear(pixels: &[u8], w: u32, h: u32, x: f32, y: f32) -> [u8; 4] {
@@ -2482,6 +2579,76 @@ mod tests {
         let img = image::load_from_memory(&raw).unwrap().to_rgba8();
         assert_eq!((img.width(), img.height()), (8, 6));
         assert_eq!(img.as_raw(), &doc.flatten());
+    }
+
+    #[test]
+    fn crop_keeps_content_and_shifts_offsets() {
+        // 6x4 with a red block in buffer x=0..=1, layer shifted ox=2 so it
+        // shows at canvas x=2..=3. Crop x=1..=4: the block lands at x=1..=2.
+        let mut doc = Document::new(6, 4);
+        let px = &mut doc.layers[0].pixels;
+        for y in 0..4u32 {
+            for x in 0..2u32 {
+                let o = ((y * 6 + x) * 4) as usize;
+                px[o] = 255;
+                px[o + 3] = 255;
+            }
+        }
+        doc.layers[0].ox = 2;
+        assert_eq!(&doc.flatten()[8..12], &[255, 0, 0, 255]);
+        doc.selection = Some((0, 0, 0, 0));
+        doc.crop(1, 0, 4, 3).unwrap();
+        assert_eq!((doc.w, doc.h), (4, 4));
+        let flat = doc.flatten();
+        assert_eq!(&flat[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&flat[4..8], &[255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].ox, 1);
+        // The corner selection shifted fully outside, so it drops.
+        assert!(doc.selection.is_none());
+    }
+
+    #[test]
+    fn rehome_pad_and_trim_carry_content() {
+        let mut doc = Document::new(4, 4);
+        let o = (5 * 4) as usize;
+        let px = &mut doc.layers[0].pixels;
+        px[o + 2] = 255;
+        px[o + 3] = 255;
+        doc.selection = Some((1, 1, 2, 2));
+        doc.set_symmetry_center(1.0, 1.0);
+        // Pad to 8x8: old canvas sits at (2, 2).
+        doc.rehome_canvas(8, 8, 2, 2).unwrap();
+        assert_eq!((doc.w, doc.h), (8, 8));
+        let flat = doc.flatten();
+        assert_eq!(&flat[((3 * 8 + 3) * 4) as usize..][..4], &[0, 0, 255, 255]);
+        assert_eq!(&flat[0..4], &[255, 255, 255, 255]);
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (2, 2));
+        assert_eq!(doc.selection, Some((3, 3, 4, 4)));
+        assert_eq!(doc.symmetry_center_px(), (3.0, 3.0));
+        // Trim back: content returns home.
+        doc.rehome_canvas(4, 4, -2, -2).unwrap();
+        let flat = doc.flatten();
+        assert_eq!(&flat[(5 * 4)..][..4], &[0, 0, 255, 255]);
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (0, 0));
+        assert_eq!(doc.selection, Some((1, 1, 2, 2)));
+    }
+
+    #[test]
+    fn canvas_ops_reject_bad_sizes_and_clear_history() {
+        let mut doc = Document::new(6, 4);
+        doc.checkpoint();
+        assert!(doc.undo());
+        doc.checkpoint();
+        doc.rehome_canvas(8, 8, 0, 0).unwrap();
+        // Old snapshots mismatch the new buffers, so history is gone.
+        assert!(!doc.undo());
+        assert!(!doc.redo());
+        assert!(doc.crop(5, 0, 9, 3).is_err());
+        assert!(doc.crop(3, 0, 1, 3).is_err());
+        assert!(doc.rehome_canvas(0, 8, 0, 0).is_err());
+        assert!(doc.rehome_canvas(5000, 8, 0, 0).is_err());
+        // Failed ops touch nothing.
+        assert_eq!((doc.w, doc.h), (8, 8));
     }
 
     #[test]

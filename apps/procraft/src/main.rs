@@ -13,8 +13,8 @@ use procraft_engine::{
     save_brush_library, save_palette, save_psd, starter_palette, step_playback_visible, triadic,
     AssistLine, BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides,
     LoopMode, PaintTarget, Palette, PaletteSet, ShapePoly, SymmetryMode, MAX_ANIM_FPS,
-    MAX_ANIM_HOLD, MAX_LIBRARY_BRUSHES, MAX_PALETTES, MAX_PALETTE_COLORS, MIN_ANIM_FPS,
-    MIN_ANIM_HOLD, MIN_TEXT_PX,
+    MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_LIBRARY_BRUSHES, MAX_PALETTES, MAX_PALETTE_COLORS,
+    MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
 };
 #[cfg(target_os = "ios")]
 use rfd_shim as rfd;
@@ -52,6 +52,7 @@ enum Tool {
     Lasso,
     Fill,
     Move,
+    Crop,
     Shapes,
     Text,
 }
@@ -222,6 +223,19 @@ struct ProCraftApp {
     smooth_pressure: f32,
     sel_anchor: Option<(f32, f32)>,
     sel_current: Option<(f32, f32)>,
+    /// Drag-crop state: the live drag plus the committed rect (inclusive
+    /// canvas px) waiting for Apply. Re-drag replaces, Esc cancels.
+    crop_anchor: Option<(f32, f32)>,
+    crop_current: Option<(f32, f32)>,
+    crop_rect: Option<(u32, u32, u32, u32)>,
+    /// Canvas-size panel: wanted dimensions plus where the old canvas sits
+    /// (-1 left/top, 0 center, 1 right/bottom per axis). `canvas_sync`
+    /// tracks the doc dims so the fields re-adopt the real size after an
+    /// open/crop/apply without clobbering typing mid-edit.
+    canvas_w: u32,
+    canvas_h: u32,
+    canvas_sync: (u32, u32),
+    canvas_anchor: (i32, i32),
     lasso_points: Vec<(f32, f32)>,
     lasso_poly: Vec<(f32, f32)>,
     /// Cached mask-edge points for marching ants, rebuilt when
@@ -362,6 +376,13 @@ impl ProCraftApp {
             smooth_pressure: 1.0,
             sel_anchor: None,
             sel_current: None,
+            crop_anchor: None,
+            crop_current: None,
+            crop_rect: None,
+            canvas_w: 1280,
+            canvas_h: 800,
+            canvas_sync: (1280, 800),
+            canvas_anchor: (0, 0),
             lasso_points: Vec::new(),
             lasso_poly: Vec::new(),
             sel_edges: Vec::new(),
@@ -892,6 +913,24 @@ impl ProCraftApp {
     fn clear_recovery(&self) {
         let _ = std::fs::remove_file(&self.recovery_path);
     }
+
+    /// Reset view-side state after the canvas changes size (crop, canvas
+    /// resize): the texture rebuilds at the new dims, ghosts and mask
+    /// edges recompute, transient drags die, and the size panel re-adopts
+    /// the real dimensions.
+    fn after_canvas_change(&mut self) {
+        self.texture = None;
+        self.ghost_dirty = true;
+        self.sel_edges_dirty = true;
+        self.lasso_poly.clear();
+        self.crop_rect = None;
+        self.crop_anchor = None;
+        self.crop_current = None;
+        self.move_from = None;
+        self.canvas_sync = (self.doc.w, self.doc.h);
+        self.canvas_w = self.doc.w;
+        self.canvas_h = self.doc.h;
+    }
 }
 
 /// Screen position of a vanishing-point handle: the true point when it is
@@ -1172,6 +1211,9 @@ impl eframe::App for ProCraftApp {
             self.doc.clear_selection();
             self.sel_anchor = None;
             self.sel_current = None;
+            self.crop_anchor = None;
+            self.crop_current = None;
+            self.crop_rect = None;
             self.lasso_points.clear();
             self.lasso_poly.clear();
             self.sel_edges_dirty = true;
@@ -1229,6 +1271,7 @@ impl eframe::App for ProCraftApp {
         // shaping, or marching ants.
         if self.painting
             || self.sel_anchor.is_some()
+            || self.crop_anchor.is_some()
             || !self.lasso_points.is_empty()
             || self.shape_anchor.is_some()
             || self.move_from.is_some()
@@ -1660,6 +1703,7 @@ impl eframe::App for ProCraftApp {
             ui.radio_value(&mut self.tool, Tool::Lasso, "◌ Lasso");
             ui.radio_value(&mut self.tool, Tool::Fill, "◧ Fill");
             ui.radio_value(&mut self.tool, Tool::Move, "↔ Move");
+            ui.radio_value(&mut self.tool, Tool::Crop, "◫ Crop");
             ui.radio_value(&mut self.tool, Tool::Shapes, "○ Shapes");
             ui.radio_value(&mut self.tool, Tool::Text, "T Text");
             if self.tool == Tool::Fill {
@@ -1669,6 +1713,76 @@ impl eframe::App for ProCraftApp {
             if self.tool == Tool::Smudge {
                 stepped_slider(ui, &mut self.smudge_strength, 0.0..=1.0, 0.05, "Strength");
                 ui.label("Drag to push paint around (color layers).");
+            }
+            if self.tool == Tool::Crop {
+                ui.label("Drag a rect on the canvas, then Apply.");
+                if let Some((x0, y0, x1, y1)) = self.crop_rect {
+                    ui.label(format!("Crop {}x{} px.", x1 - x0 + 1, y1 - y0 + 1));
+                    if ui.button("Apply crop").clicked() {
+                        match self.doc.crop(x0, y0, x1, y1) {
+                            Ok(()) => {
+                                let (w, h) = (self.doc.w, self.doc.h);
+                                self.after_canvas_change();
+                                self.status =
+                                    format!("Cropped to {w}x{h} (history cleared).");
+                            }
+                            Err(e) => self.status = format!("Crop failed: {e}"),
+                        }
+                    }
+                    if ui.button("Cancel crop").clicked() {
+                        self.crop_rect = None;
+                        self.status = "Crop cancelled.".to_string();
+                    }
+                }
+                ui.collapsing("Canvas size", |ui| {
+                    // Re-adopt the real dims after an open/crop/apply; typing
+                    // never changes the doc, so edits are never clobbered.
+                    if self.canvas_sync != (self.doc.w, self.doc.h) {
+                        self.canvas_sync = (self.doc.w, self.doc.h);
+                        self.canvas_w = self.doc.w;
+                        self.canvas_h = self.doc.h;
+                    }
+                    stepped_slider(ui, &mut self.canvas_w, 1..=MAX_CANVAS_SIDE, 1.0, "Width");
+                    stepped_slider(ui, &mut self.canvas_h, 1..=MAX_CANVAS_SIDE, 1.0, "Height");
+                    ui.label("Anchor (old canvas sits here):");
+                    for ay in -1..=1 {
+                        ui.horizontal(|ui| {
+                            for ax in -1..=1 {
+                                let mark =
+                                    if self.canvas_anchor == (ax, ay) { "■" } else { "□" };
+                                if ui
+                                    .add_sized([32.0, 24.0], egui::Button::new(mark))
+                                    .clicked()
+                                {
+                                    self.canvas_anchor = (ax, ay);
+                                }
+                            }
+                        });
+                    }
+                    if ui.button("Apply size").clicked() {
+                        let (ax, ay) = self.canvas_anchor;
+                        let place = |new: u32, old: u32, a: i32| {
+                            let rest = new as i32 - old as i32;
+                            match a {
+                                -1 => 0,
+                                1 => rest,
+                                _ => rest / 2,
+                            }
+                        };
+                        let dx = place(self.canvas_w, self.doc.w, ax);
+                        let dy = place(self.canvas_h, self.doc.h, ay);
+                        match self.doc.rehome_canvas(self.canvas_w, self.canvas_h, dx, dy) {
+                            Ok(()) => {
+                                let (w, h) = (self.doc.w, self.doc.h);
+                                self.after_canvas_change();
+                                self.status =
+                                    format!("Canvas {w}x{h} (history cleared).");
+                            }
+                            Err(e) => self.status = format!("Resize failed: {e}"),
+                        }
+                    }
+                    ui.label("Crop and resize clear undo history.");
+                });
             }
             if self.tool == Tool::Shapes {
                 ui.horizontal_wrapped(|ui| {
@@ -2908,6 +3022,8 @@ impl eframe::App for ProCraftApp {
                 self.assist_lock = None;
                 self.sel_anchor = None;
                 self.sel_current = None;
+                self.crop_anchor = None;
+                self.crop_current = None;
                 self.lasso_points.clear();
                 self.shape_anchor = None;
                 self.shape_current = None;
@@ -3474,6 +3590,77 @@ impl eframe::App for ProCraftApp {
                     if resp.drag_stopped() {
                         self.move_from = None;
                         self.status = "Layer moved.".to_string();
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                }
+
+                if self.tool == Tool::Crop {
+                    // Drag-crop rect: commits to `crop_rect` on release; Apply
+                    // (in the Tools panel) crops, re-drag replaces, Esc cancels.
+                    if resp.drag_started() && !gesture {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            self.crop_anchor = Some(clamp_pt(x, y));
+                            self.crop_current = self.crop_anchor;
+                        }
+                    }
+                    if self.crop_anchor.is_some() && resp.dragged() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            self.crop_current = Some(clamp_pt(x, y));
+                        }
+                    }
+                    if resp.drag_stopped() {
+                        if let (Some((ax, ay)), Some((bx, by))) =
+                            (self.crop_anchor, self.crop_current)
+                        {
+                            let (x0, x1) = if ax <= bx {
+                                (ax as u32, bx as u32)
+                            } else {
+                                (bx as u32, ax as u32)
+                            };
+                            let (y0, y1) = if ay <= by {
+                                (ay as u32, by as u32)
+                            } else {
+                                (by as u32, ay as u32)
+                            };
+                            if x1.saturating_sub(x0) >= 2 && y1.saturating_sub(y0) >= 2 {
+                                self.crop_rect = Some((x0, y0, x1, y1));
+                                self.status = format!(
+                                    "Crop {}x{} — Apply or re-drag.",
+                                    x1 - x0 + 1,
+                                    y1 - y0 + 1
+                                );
+                            } else {
+                                self.crop_rect = None;
+                            }
+                        }
+                        self.crop_anchor = None;
+                        self.crop_current = None;
+                    }
+                    // Live rubber band + committed rect (rotation-mapped like
+                    // the selection overlay).
+                    let band = match (self.crop_anchor, self.crop_current) {
+                        (Some(a), Some(b)) => Some((a, b)),
+                        _ => self.crop_rect.map(|(x0, y0, x1, y1)| {
+                            ((x0 as f32, y0 as f32), ((x1 + 1) as f32, (y1 + 1) as f32))
+                        }),
+                    };
+                    if let Some(((ax, ay), (bx, by))) = band {
+                        let (x0, x1) = if ax <= bx { (ax, bx) } else { (bx, ax) };
+                        let (y0, y1) = if ay <= by { (ay, by) } else { (by, ay) };
+                        paint_selection(
+                            ui.painter(),
+                            [
+                                to_screen(x0, y0),
+                                to_screen(x1, y0),
+                                to_screen(x1, y1),
+                                to_screen(x0, y1),
+                            ],
+                            ctx.input(|i| i.time),
+                        );
                     }
                     self.painting = false;
                     self.last = None;

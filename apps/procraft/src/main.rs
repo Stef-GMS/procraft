@@ -2026,10 +2026,9 @@ impl eframe::App for ProCraftApp {
             }
         }
 
-        // Top bar: pinned browser buttons plus grouped menus (File / Edit
-        // / View) — one row on every screen instead of the old wrapping
-        // button soup that clipped Rotate° off the iPad edge. Actions
-        // close their menu; sliders/steppers stay open for repeat tweaks.
+        // Top bar: pinned browser + edit buttons plus File/View menus —
+        // one row on every screen. About lives in the Layers header.
+        // Menu actions close their menu; sliders/steppers stay open.
         egui::Panel::top("menu").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Gallery").clicked() {
@@ -2037,6 +2036,19 @@ impl eframe::App for ProCraftApp {
                 }
                 if ui.button("Reference").clicked() {
                     self.ref_open = !self.ref_open;
+                }
+                if ui.button("Clear layer").clicked() {
+                    self.doc.checkpoint();
+                    if let Some(layer) = self.doc.active_layer_mut() {
+                        layer.clear();
+                    }
+                    self.doc.mark_full_dirty();
+                }
+                if ui.button("Undo").clicked() && self.doc.undo() {
+                    self.status = "Undone.".to_string();
+                }
+                if ui.button("Redo").clicked() && self.doc.redo() {
+                    self.status = "Redone.".to_string();
                 }
                 ui.menu_button("File", |ui| {
                     if ui.button("Save PNG").clicked() {
@@ -2229,28 +2241,6 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                 });
-                ui.menu_button("Edit", |ui| {
-                    if ui.button("Clear layer").clicked() {
-                        self.doc.checkpoint();
-                        if let Some(layer) = self.doc.active_layer_mut() {
-                            layer.clear();
-                        }
-                        self.doc.mark_full_dirty();
-                        ui.close();
-                    }
-                    if ui.button("Undo").clicked() {
-                        if self.doc.undo() {
-                            self.status = "Undone.".to_string();
-                        }
-                        ui.close();
-                    }
-                    if ui.button("Redo").clicked() {
-                        if self.doc.redo() {
-                            self.status = "Redone.".to_string();
-                        }
-                        ui.close();
-                    }
-                });
                 ui.menu_button("View", |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Theme:");
@@ -2279,10 +2269,6 @@ impl eframe::App for ProCraftApp {
                     self.view_angle = deg.to_radians();
                     if ui.button("Reset rotation").clicked() {
                         self.view_angle = 0.0;
-                        ui.close();
-                    }
-                    if ui.button("ⓘ About").clicked() {
-                        self.show_about = !self.show_about;
                         ui.close();
                     }
                 });
@@ -2373,7 +2359,9 @@ impl eframe::App for ProCraftApp {
                                     {
                                         dup_idx = Some(idx);
                                     }
-                                    if ui.add_sized([36.0, 28.0], egui::Button::new("✕")).clicked()
+                                    if ui
+                                        .add_sized([44.0, 28.0], egui::Button::new("Del"))
+                                        .clicked()
                                     {
                                         remove_idx = Some(idx);
                                     }
@@ -2766,13 +2754,13 @@ impl eframe::App for ProCraftApp {
             ui.radio_value(&mut self.tool, Tool::Brush, "✏ Brush");
             ui.radio_value(&mut self.tool, Tool::Eraser, "⌫ Eraser");
             ui.radio_value(&mut self.tool, Tool::Smudge, "💧 Smudge");
-            ui.radio_value(&mut self.tool, Tool::Select, "⬚ Select");
-            ui.radio_value(&mut self.tool, Tool::Lasso, "◌ Lasso");
-            ui.radio_value(&mut self.tool, Tool::Fill, "◧ Fill");
-            ui.radio_value(&mut self.tool, Tool::Picker, "◉ Pick");
+            ui.radio_value(&mut self.tool, Tool::Select, "Select");
+            ui.radio_value(&mut self.tool, Tool::Lasso, "Lasso");
+            ui.radio_value(&mut self.tool, Tool::Fill, "Fill");
+            ui.radio_value(&mut self.tool, Tool::Picker, "Pick");
             ui.radio_value(&mut self.tool, Tool::Move, "↔ Move");
-            ui.radio_value(&mut self.tool, Tool::Liquify, "➰ Liquify");
-            ui.radio_value(&mut self.tool, Tool::Crop, "◫ Crop");
+            ui.radio_value(&mut self.tool, Tool::Liquify, "Liquify");
+            ui.radio_value(&mut self.tool, Tool::Crop, "Crop");
             ui.radio_value(&mut self.tool, Tool::Shapes, "○ Shapes");
             ui.radio_value(&mut self.tool, Tool::Text, "T Text");
             if self.tool == Tool::Fill {
@@ -3180,7 +3168,7 @@ impl eframe::App for ProCraftApp {
                                     }
                                 }
                             });
-                            if ui.small_button("✕").clicked() {
+                            if ui.small_button("Del").clicked() {
                                 remove = Some(idx);
                             }
                         });
@@ -3569,6 +3557,12 @@ impl eframe::App for ProCraftApp {
                     self.show_layers = false;
                 }
                 ui.heading("Layers");
+                // About parks in the Layers corner (top bar has no room).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("About").clicked() {
+                        self.show_about = !self.show_about;
+                    }
+                });
             });
             ui.horizontal(|ui| {
                 if ui.button("Add layer").clicked() {
@@ -3678,10 +3672,10 @@ impl eframe::App for ProCraftApp {
                                 ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
                             let mut commit = resp.lost_focus() || enter;
                             let mut cancel = false;
-                            if ui.add_sized([44.0, 28.0], egui::Button::new("✓")).clicked() {
+                            if ui.add_sized([44.0, 28.0], egui::Button::new("OK")).clicked() {
                                 commit = true;
                             }
-                            if ui.add_sized([44.0, 28.0], egui::Button::new("✕")).clicked() {
+                            if ui.add_sized([44.0, 28.0], egui::Button::new("X")).clicked() {
                                 cancel = true;
                             }
                             if commit && !cancel {
@@ -3755,15 +3749,15 @@ impl eframe::App for ProCraftApp {
                         if !resp.has_focus() {
                             resp.request_focus();
                         }
-                        let enter = ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
-                        let mut commit = resp.lost_focus() || enter;
-                        let mut cancel = false;
-                        if ui.add_sized([44.0, 28.0], egui::Button::new("✓")).clicked() {
-                            commit = true;
-                        }
-                        if ui.add_sized([44.0, 28.0], egui::Button::new("✕")).clicked() {
-                            cancel = true;
-                        }
+                            let enter = ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
+                            let mut commit = resp.lost_focus() || enter;
+                            let mut cancel = false;
+                            if ui.add_sized([44.0, 28.0], egui::Button::new("OK")).clicked() {
+                                commit = true;
+                            }
+                            if ui.add_sized([44.0, 28.0], egui::Button::new("X")).clicked() {
+                                cancel = true;
+                            }
                         if commit && !cancel {
                             if self.renaming_text.trim().is_empty() {
                                 self.renaming_text = format!("Layer {}", i + 1);
@@ -4150,22 +4144,22 @@ impl eframe::App for ProCraftApp {
                 }
             });
             ui.horizontal(|ui| {
-                if ui.button("⟲ −15°").clicked() {
+                if ui.button("−15°").clicked() {
                     self.doc.checkpoint();
                     self.doc.affine_layer(self.doc.active, 1.0, -15.0);
                 }
-                if ui.button("⟳ +15°").clicked() {
+                if ui.button("+15°").clicked() {
                     self.doc.checkpoint();
                     self.doc.affine_layer(self.doc.active, 1.0, 15.0);
                 }
             });
             ui.horizontal(|ui| {
-                if ui.button("⇄ Flip H").clicked() {
+                if ui.button("Flip H").clicked() {
                     self.doc.checkpoint();
                     self.doc.flip_layer_horizontal(self.doc.active);
                     self.status = "Layer flipped horizontally.".to_string();
                 }
-                if ui.button("⇅ Flip V").clicked() {
+                if ui.button("Flip V").clicked() {
                     self.doc.checkpoint();
                     self.doc.flip_layer_vertical(self.doc.active);
                     self.status = "Layer flipped vertically.".to_string();

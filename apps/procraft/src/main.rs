@@ -7,13 +7,13 @@
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
 // iOS has no rfd backend: same call shape, every dialog declined.
 use procraft_engine::{
-    analogous, clamp_frame, complementary, export_gif_ext, export_tip_png, gallery_thumb,
-    import_brush_file, import_gif_document, import_gpl_file, next_frame, onion_ghost,
-    open_brush_library, open_palette, open_psd, palette_from_rgba, prev_frame, rasterize_frame,
-    rasterize_frame_region, save_brush_library, save_palette, save_psd, starter_palette,
-    step_playback_visible, triadic, AssistLine, BlendMode, Brush, BrushPreset, Color, DabDynamics,
-    Document, GuideKind, Guides, LoopMode, PaintTarget, Palette, PaletteSet, ShapePoly,
-    SymmetryMode, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS,
+    analogous, clamp_frame, complementary, curves_lut, export_gif_ext, export_tip_png,
+    gallery_thumb, import_brush_file, import_gif_document, import_gpl_file, levels_lut, next_frame,
+    onion_ghost, open_brush_library, open_palette, open_psd, palette_from_rgba, prev_frame,
+    rasterize_frame, rasterize_frame_region, save_brush_library, save_palette, save_psd,
+    starter_palette, step_playback_visible, triadic, AssistLine, BlendMode, Brush, BrushPreset,
+    Color, DabDynamics, Document, GuideKind, Guides, LoopMode, PaintTarget, Palette, PaletteSet,
+    ShapePoly, SymmetryMode, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS,
     MAX_LIBRARY_BRUSHES, MAX_PALETTES, MAX_PALETTE_COLORS, MIN_ANIM_FPS, MIN_ANIM_HOLD,
     MIN_TEXT_PX,
 };
@@ -292,6 +292,14 @@ struct ProCraftApp {
     filt_contrast: f32,
     filt_blur: i32,
     filt_sharpen: f32,
+    /// M36 Adjustments I: Levels black/white points + mid gamma (%).
+    filt_levels_shadow: u8,
+    filt_levels_gamma: f32,
+    filt_levels_high: u8,
+    /// M36 Curves (parametric): shadow/mid/highlight lift (+) or crush (-).
+    filt_curve_shadow: i32,
+    filt_curve_mid: i32,
+    filt_curve_high: i32,
     renaming: Option<usize>,
     renaming_text: String,
     group_renaming: Option<u32>,
@@ -450,6 +458,12 @@ impl ProCraftApp {
             filt_contrast: 100.0,
             filt_blur: 0,
             filt_sharpen: 0.0,
+            filt_levels_shadow: 0,
+            filt_levels_gamma: 100.0,
+            filt_levels_high: 255,
+            filt_curve_shadow: 0,
+            filt_curve_mid: 0,
+            filt_curve_high: 0,
             renaming: None,
             renaming_text: String::new(),
             group_renaming: None,
@@ -3699,6 +3713,62 @@ impl eframe::App for ProCraftApp {
                 }
                 self.filter_preview = None;
                 self.status = "Sharpen applied.".to_string();
+            }
+            // M36 Levels: black/white points + mid gamma, same live
+            // preview + Apply rhythm as tone (preview kind 3).
+            let levels_before =
+                (self.filt_levels_shadow, self.filt_levels_gamma, self.filt_levels_high);
+            stepped_slider(ui, &mut self.filt_levels_shadow, 0..=255, 1.0, "Shadow");
+            stepped_slider(ui, &mut self.filt_levels_gamma, 10.0..=400.0, 1.0, "Gamma %");
+            stepped_slider(ui, &mut self.filt_levels_high, 0..=255, 1.0, "Highlight");
+            if (self.filt_levels_shadow, self.filt_levels_gamma, self.filt_levels_high)
+                != levels_before
+            {
+                let (s, g, h) =
+                    (self.filt_levels_shadow, self.filt_levels_gamma / 100.0, self.filt_levels_high);
+                let lut = levels_lut(s, g, h);
+                self.filter_scrub(3, move |doc, layer| {
+                    doc.apply_lut(layer, &lut);
+                });
+                self.status = "Previewing levels — Apply to keep.".to_string();
+            }
+            if ui.button("Apply levels").clicked() {
+                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 3) {
+                    let lut = levels_lut(
+                        self.filt_levels_shadow,
+                        self.filt_levels_gamma / 100.0,
+                        self.filt_levels_high,
+                    );
+                    self.doc.checkpoint();
+                    self.doc.apply_lut(self.doc.active, &lut);
+                }
+                self.filter_preview = None;
+                self.status = "Levels applied.".to_string();
+            }
+            // M36 Curves (parametric shadows/mids/highlights through a
+            // pinned-endpoint LUT; preview kind 4).
+            let curves_before = (self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high);
+            stepped_slider(ui, &mut self.filt_curve_shadow, -100..=100, 1.0, "Shadows");
+            stepped_slider(ui, &mut self.filt_curve_mid, -100..=100, 1.0, "Midtones");
+            stepped_slider(ui, &mut self.filt_curve_high, -100..=100, 1.0, "Highlights");
+            if (self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high) != curves_before
+            {
+                let (s, m, h) = (self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high);
+                let lut = curves_lut(s, m, h);
+                self.filter_scrub(4, move |doc, layer| {
+                    doc.apply_lut(layer, &lut);
+                });
+                self.status = "Previewing curves — Apply to keep.".to_string();
+            }
+            if ui.button("Apply curves").clicked() {
+                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 4) {
+                    let lut =
+                        curves_lut(self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high);
+                    self.doc.checkpoint();
+                    self.doc.apply_lut(self.doc.active, &lut);
+                }
+                self.filter_preview = None;
+                self.status = "Curves applied.".to_string();
             }
         });
         });

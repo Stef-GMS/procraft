@@ -1979,6 +1979,44 @@ impl Document {
         self.mark_full_dirty();
     }
 
+    /// Remap the RGB channels through `lut` (alpha untouched). Honors the
+    /// active selection with graduated-mask mixing. Caller checkpoints
+    /// for undo first. Powers Curves + Levels (M36) and the M37 pack.
+    pub fn apply_lut(&mut self, index: usize, lut: &[u8; 256]) {
+        if index >= self.layers.len() {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
+        let sel = self.selection;
+        let mask = self.selection_mask.as_deref();
+        let pixels = &mut self.layers[index].pixels;
+        for y in 0..h {
+            for x in 0..w {
+                if let Some((a, b, c, d)) = sel {
+                    if x < a || x > c || y < b || y > d {
+                        continue;
+                    }
+                }
+                if let Some(m) = mask {
+                    if m[(y * w + x) as usize] == 0 {
+                        continue;
+                    }
+                }
+                let o = ((y * w + x) * 4) as usize;
+                if o + 2 >= pixels.len() {
+                    continue;
+                }
+                let k = Self::sel_k(mask, w, x, y);
+                for ch in 0..3 {
+                    let v = lut[pixels[o + ch] as usize] as f32;
+                    let mixed = pixels[o + ch] as f32 * (1.0 - k) + v * k;
+                    pixels[o + ch] = mixed.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        self.mark_full_dirty();
+    }
+
     /// Save the composite as PNG.
     pub fn save_png(&self, path: &std::path::Path) -> Result<(), String> {
         image::save_buffer(
@@ -2581,6 +2619,54 @@ pub fn gallery_thumb(src: &[u8], w: u32, h: u32, max_side: u32) -> (Vec<u8>, u32
         }
     }
     (out, tw, th)
+}
+
+/// M36 Levels: stretch `[shadow, highlight]` to `[0, 255]` with `gamma`
+/// (1.0 = linear; >1 darkens mids, <1 lifts them). Degenerate ranges
+/// (`highlight <= shadow`) yield identity; gamma clamps to 0.1..=10.
+pub fn levels_lut(shadow: u8, gamma: f32, highlight: u8) -> [u8; 256] {
+    if highlight <= shadow {
+        return std::array::from_fn(|i| i as u8);
+    }
+    let gamma = gamma.clamp(0.1, 10.0);
+    let (lo, hi) = (shadow as f32, highlight as f32);
+    std::array::from_fn(|i| {
+        let t = ((i as f32 - lo) / (hi - lo)).clamp(0.0, 1.0);
+        (t.powf(gamma) * 255.0).round().clamp(0.0, 255.0) as u8
+    })
+}
+
+/// M36 Curves (parametric 3-point): `shadow`/`mid`/`high` lift (+) or
+/// crush (-) the 64/128/192 control points; endpoints stay pinned, so
+/// pure black/white never clip. Piecewise-linear between the five
+/// points; all-zero is identity.
+pub fn curves_lut(shadow: i32, mid: i32, high: i32) -> [u8; 256] {
+    let pts = [
+        (0u8, 0u8),
+        (64, (64 + shadow).clamp(0, 255) as u8),
+        (128, (128 + mid).clamp(0, 255) as u8),
+        (192, (192 + high).clamp(0, 255) as u8),
+        (255, 255),
+    ];
+    let mut lut = [0u8; 256];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        let v = i as u8;
+        let mut y = 255u8;
+        for w in pts.windows(2) {
+            let ((x0, y0), (x1, y1)) = ((w[0].0, w[0].1), (w[1].0, w[1].1));
+            if v >= x0 && v <= x1 {
+                if x1 == x0 {
+                    y = y1;
+                } else {
+                    let t = (v - x0) as f32 / (x1 - x0) as f32;
+                    y = (y0 as f32 + (y1 as f32 - y0 as f32) * t).round() as u8;
+                }
+                break;
+            }
+        }
+        *slot = y;
+    }
+    lut
 }
 
 #[cfg(test)]
@@ -4286,5 +4372,61 @@ mod tests {
         assert!(doc.flip_selection_v());
         let m = doc.selection_mask.clone().unwrap();
         assert_eq!(m[15], 128);
+    }
+
+    #[test]
+    fn levels_lut_identity_and_crush() {
+        let id = levels_lut(0, 1.0, 255);
+        for (i, v) in id.iter().enumerate() {
+            assert_eq!(*v, i as u8);
+        }
+        // Degenerate range refuses to clip: identity, not black.
+        assert_eq!(levels_lut(200, 1.0, 100)[64], 64);
+        let crush = levels_lut(128, 1.0, 255);
+        assert_eq!(crush[64], 0);
+        assert_eq!(crush[255], 255);
+        // Gamma > 1 darkens mids; < 1 lifts them.
+        assert!(levels_lut(0, 2.0, 255)[128] < 128);
+        assert!(levels_lut(0, 0.5, 255)[128] > 128);
+    }
+
+    #[test]
+    fn curves_lut_identity_pins_ends() {
+        let id = curves_lut(0, 0, 0);
+        for (i, v) in id.iter().enumerate() {
+            assert_eq!(*v, i as u8);
+        }
+        let lift = curves_lut(100, 0, 0);
+        assert_eq!(lift[0], 0);
+        assert_eq!(lift[255], 255);
+        assert_eq!(lift[64], 164);
+        // Between-point interpolation is linear.
+        assert_eq!(lift[32], 82);
+    }
+
+    #[test]
+    fn apply_lut_honors_selection() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(4, 4);
+        let brush = Brush {
+            size: 20.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.dab(&brush, Color::rgb(100, 100, 100), 1.5, 1.5);
+        let lut = levels_lut(128, 1.0, 255);
+        // Only pixel (0,0) selected: it crushes, the rest is untouched.
+        doc.selection = Some((0, 0, 0, 0));
+        doc.apply_lut(0, &lut);
+        assert_eq!(doc.layers[0].pixels[0], 0);
+        // Pixel (1,1) offset 20 in the 4x4 RGBA buffer.
+        let o = 20usize;
+        assert_eq!(doc.layers[0].pixels[o], 100);
+        // Whole canvas: mid gray crushes to 0, alpha stays 255.
+        doc.clear_selection();
+        doc.apply_lut(0, &lut);
+        assert_eq!(doc.layers[0].pixels[o], 0);
+        assert_eq!(doc.layers[0].pixels[o + 3], 255);
     }
 }

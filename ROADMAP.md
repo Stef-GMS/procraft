@@ -27,19 +27,20 @@ people touch daily. Ranked by user-visible value per effort.
   120 s, centered Recover/Discard prompt, cleared on save/load/clean
   exit. **→ PC checkpoint #1 (you are here).**
 
-## Batch 2: M28–M32 (PC check #2 + iPad check #1)
+## Batch 2: M28–M32 (done, awaiting PC check #2 + iPad check #1)
 
-- [ ] **M28 — JPEG/TIFF export.** Quality slider for JPEG, plain TIFF
-  (PNG/PSD/GIF exist).
-- [ ] **M29 — Crop + canvas resize.** Drag-crop rect + pad/trim resize
-  (lossless offsets carry content).
-- [ ] **M30 — Group opacity + PSD groups.** Finish the M23 gaps: group
-  opacity in compositing, PSD group round-trip.
-- [ ] **M31 — Color from image + loupe.** Eyedropper loupe ring +
-  palette-from-image import (touch-friendly, iPad-visible).
-- [ ] **M32 — Animation frame UI.** Duplicate frame, per-frame hold,
-  onion strength per side (engine exists). **→ PC check #2 + iPad
-  check #1 (IPA).**
+- [x] **M28 — JPEG/TIFF export.** Quality slider for JPEG (1–100),
+  plain lossless TIFF (PNG/PSD/GIF existed).
+- [x] **M29 — Crop + canvas resize.** Drag-crop rect + pad/trim resize
+  with anchor (lossless offsets carry content, history clears).
+- [x] **M30 — Group opacity + PSD groups.** Pass-through group opacity
+  in compositing/frames/GIF, v9 project format, PSD section-divisor
+  round-trip (nested, open/closed, empty groups).
+- [x] **M31 — Color from image + loupe.** Pick tool + magnifier ring on
+  pick/Alt (touch-first), palette from image file or canvas.
+- [x] **M32 — Animation frame UI.** Duplicate frame, per-frame hold
+  (v10 format, GIF round-trips timing), onion strength per side.
+  **→ PC checkpoint #2 + iPad check #1 (IPA) (you are here).**
 
 ## P0 backlog (batch 3)
 
@@ -55,10 +56,7 @@ people touch daily. Ranked by user-visible value per effort.
   color-fill tolerance.
 - [ ] Typography: import TTF/OTF, leading/tracking, outline text.
 - [ ] Brush depth: dual-tip, wet-edge/glaze, per-brush blend mode.
-- [ ] Color from image + loupe picker.
 - [ ] Reference companion window.
-- [ ] Animation frame management UI (duplicate, per-frame hold, onion
-  strength per side).
 
 ## P2 — performance + platform (when P0 hurts)
 

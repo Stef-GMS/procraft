@@ -116,13 +116,24 @@ struct FillPreview {
 
 /// Live filter preview baseline: scrubbing a filter slider restores these
 /// pixels then re-applies the slider value, so a whole preview gesture
-/// costs one undo step instead of compounding per change.
+/// costs one undo step instead of compounding per change. Re-applies are
+/// throttled (see `PREVIEW_MIN_DT`): skipped ticks flag `stale`, and
+/// Apply restamps the latest values so nothing is lost.
 struct FilterPreview {
-    /// 0 = tone, 1 = blur, 2 = sharpen.
+    /// 0 = tone, 1 = blur, 2 = sharpen, 3 = levels, 4 = curves,
+    /// 5 = HSL, 6 = balance, 7 = recolor.
     kind: u8,
     layer: usize,
     pixels: Vec<u8>,
+    last: std::time::Instant,
+    stale: bool,
 }
+
+/// Minimum time between live preview re-applies while a slider is
+/// scrubbed. Full-canvas filters cost 15–60 ms at 1280x800 plus a
+/// re-flatten and texture upload per tick; without a floor, every slider
+/// tick queues one and the UI visibly hangs during the drag.
+const PREVIEW_MIN_DT: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// M35 Selection upgrades: saved snapshot (canvas dims, rect, mask).
 type SavedSelection = ((u32, u32), Option<(u32, u32, u32, u32)>, Option<Vec<u8>>);
@@ -984,10 +995,12 @@ impl ProCraftApp {
     }
 
     /// Scrub a filter slider with a live preview: checkpoint + snapshot on
-    /// first touch, then restore-and-reapply on every change, so the whole
+    /// first touch, then restore-and-reapply on change, so the whole
     /// gesture is one undo step and values never compound. `kind` selects
-    /// the baseline slot (0 = tone, 1 = blur, 2 = sharpen); a changed
-    /// layer (or mismatched pixels after undo/layer edits) restarts it.
+    /// the baseline slot (see [`FilterPreview`]); a changed layer (or
+    /// mismatched pixels after undo/layer edits) restarts it. Re-applies
+    /// closer than [`PREVIEW_MIN_DT`] are skipped and flag the preview
+    /// `stale` — Apply restamps the latest values (see `restamp_preview`).
     fn filter_scrub(&mut self, kind: u8, apply: impl Fn(&mut Document, usize)) {
         let layer = self.doc.active;
         let fresh = match &self.filter_preview {
@@ -1010,6 +1023,8 @@ impl ProCraftApp {
                         kind,
                         layer,
                         pixels: l.pixels.clone(),
+                        last: std::time::Instant::now() - PREVIEW_MIN_DT,
+                        stale: false,
                     });
                 }
                 None => {
@@ -1018,14 +1033,38 @@ impl ProCraftApp {
                 }
             }
         }
+        if let Some(mut fp) = self.filter_preview.take() {
+            if self.doc.layers.get(fp.layer).is_none() {
+                return;
+            }
+            // Throttle: the layer keeps the last preview; Apply catches up.
+            if !fresh && fp.last.elapsed() < PREVIEW_MIN_DT {
+                fp.stale = true;
+                self.filter_preview = Some(fp);
+                return;
+            }
+            if let Some(l) = self.doc.layers.get_mut(fp.layer) {
+                l.pixels = fp.pixels.clone();
+            }
+            apply(&mut self.doc, fp.layer);
+            fp.last = std::time::Instant::now();
+            fp.stale = false;
+            self.filter_preview = Some(fp);
+        }
+    }
+
+    /// Re-apply current slider values over the scrub snapshot (for a
+    /// throttled-stale preview at Apply time, or to refresh a current
+    /// one). The scrub's checkpoint still covers undo — no new step.
+    fn restamp_preview(&mut self, apply: impl Fn(&mut Document, usize)) {
         if let Some(fp) = self.filter_preview.take() {
             if self.doc.layers.get(fp.layer).is_some() {
                 if let Some(l) = self.doc.layers.get_mut(fp.layer) {
                     l.pixels = fp.pixels.clone();
                 }
                 apply(&mut self.doc, fp.layer);
-                self.filter_preview = Some(fp);
             }
+            self.filter_preview = Some(fp);
         }
     }
 
@@ -1998,6 +2037,10 @@ impl eframe::App for ProCraftApp {
                         );
                         if ui.button("New canvas").clicked() {
                             create = true;
+                        }
+                        if ui.button("Reset").clicked() {
+                            self.gallery_new_w = 1280;
+                            self.gallery_new_h = 800;
                         }
                         if ui.button("Open…").clicked() {
                             browse = true;
@@ -3692,6 +3735,13 @@ impl eframe::App for ProCraftApp {
                         (b as f32 * 2.55).round() as i32,
                         c / 100.0,
                     );
+                } else {
+                    // Throttled-stale preview (or a fresh one): stamp the
+                    // latest values over the scrub snapshot — same undo step.
+                    let (b, c) = (self.filt_brightness, self.filt_contrast);
+                    self.restamp_preview(move |doc, layer| {
+                        doc.adjust_tone(layer, (b as f32 * 2.55).round() as i32, c / 100.0);
+                    });
                 }
                 self.filter_preview = None;
                 self.status = "Tone applied.".to_string();
@@ -3709,6 +3759,11 @@ impl eframe::App for ProCraftApp {
                 if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 1) {
                     self.doc.checkpoint();
                     self.doc.blur_layer(self.doc.active, self.filt_blur.max(0) as u32);
+                } else {
+                    let r = self.filt_blur.max(0) as u32;
+                    self.restamp_preview(move |doc, layer| {
+                        doc.blur_layer(layer, r);
+                    });
                 }
                 self.filter_preview = None;
                 self.status = "Blur applied.".to_string();
@@ -3726,6 +3781,11 @@ impl eframe::App for ProCraftApp {
                 if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 2) {
                     self.doc.checkpoint();
                     self.doc.sharpen_layer(self.doc.active, self.filt_sharpen / 100.0);
+                } else {
+                    let s = self.filt_sharpen / 100.0;
+                    self.restamp_preview(move |doc, layer| {
+                        doc.sharpen_layer(layer, s);
+                    });
                 }
                 self.filter_preview = None;
                 self.status = "Sharpen applied.".to_string();
@@ -3757,6 +3817,15 @@ impl eframe::App for ProCraftApp {
                     );
                     self.doc.checkpoint();
                     self.doc.apply_lut(self.doc.active, &lut);
+                } else {
+                    let lut = levels_lut(
+                        self.filt_levels_shadow,
+                        self.filt_levels_gamma / 100.0,
+                        self.filt_levels_high,
+                    );
+                    self.restamp_preview(move |doc, layer| {
+                        doc.apply_lut(layer, &lut);
+                    });
                 }
                 self.filter_preview = None;
                 self.status = "Levels applied.".to_string();
@@ -3782,6 +3851,12 @@ impl eframe::App for ProCraftApp {
                         curves_lut(self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high);
                     self.doc.checkpoint();
                     self.doc.apply_lut(self.doc.active, &lut);
+                } else {
+                    let lut =
+                        curves_lut(self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high);
+                    self.restamp_preview(move |doc, layer| {
+                        doc.apply_lut(layer, &lut);
+                    });
                 }
                 self.filter_preview = None;
                 self.status = "Curves applied.".to_string();
@@ -3809,6 +3884,12 @@ impl eframe::App for ProCraftApp {
                         self.filt_sat / 100.0,
                         self.filt_light as f32 / 100.0,
                     );
+                } else {
+                    let (h, s, l) =
+                        (self.filt_hue, self.filt_sat / 100.0, self.filt_light as f32 / 100.0);
+                    self.restamp_preview(move |doc, layer| {
+                        doc.adjust_hsl(layer, h, s, l);
+                    });
                 }
                 self.filter_preview = None;
                 self.status = "HSL applied.".to_string();
@@ -3839,6 +3920,15 @@ impl eframe::App for ProCraftApp {
                     );
                     self.doc.checkpoint();
                     self.doc.color_balance(self.doc.active, r, g, b);
+                } else {
+                    let (r, g, b) = (
+                        (self.filt_bal_r as f32 * 2.55).round() as i32,
+                        (self.filt_bal_g as f32 * 2.55).round() as i32,
+                        (self.filt_bal_b as f32 * 2.55).round() as i32,
+                    );
+                    self.restamp_preview(move |doc, layer| {
+                        doc.color_balance(layer, r, g, b);
+                    });
                 }
                 self.filter_preview = None;
                 self.status = "Balance applied.".to_string();
@@ -3863,6 +3953,11 @@ impl eframe::App for ProCraftApp {
                     self.doc.checkpoint();
                     let active = self.doc.active;
                     self.doc.colorize(active, self.color, self.filt_recolor_strength / 100.0);
+                } else {
+                    let (target, s) = (self.color, self.filt_recolor_strength / 100.0);
+                    self.restamp_preview(move |doc, layer| {
+                        doc.colorize(layer, target, s);
+                    });
                 }
                 self.filter_preview = None;
                 self.status = "Recolor applied.".to_string();

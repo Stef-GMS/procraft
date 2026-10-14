@@ -849,6 +849,102 @@ impl Document {
         self.mark_full_dirty();
     }
 
+    /// Shift to fit a canvas bbox into a w×h buffer at offset (`ox`,`oy`):
+    /// minimal slide so the bbox maps inside (`(0, 0)` when already
+    /// inside). Always safe: the slide preserves every on-canvas-visible
+    /// pixel (only off-canvas tails trim — provable from clamping, since
+    /// the lost window never overlaps `[0, w)`), so even fully-displaced
+    /// bboxes absorb instead of refusing. Pure math; [`Self::absorb_offset`]
+    /// applies it to both buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn fit_shift(
+        w: u32,
+        h: u32,
+        ox: i32,
+        oy: i32,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+    ) -> (i32, i32) {
+        if w == 0 || h == 0 {
+            return (0, 0);
+        }
+        let (b0x, b1x) = (x0 as i32 - ox, x1 as i32 - ox);
+        let (b0y, b1y) = (y0 as i32 - oy, y1 as i32 - oy);
+        let sx = if b0x < 0 {
+            -b0x
+        } else if b1x >= w as i32 {
+            -(b1x - w as i32 + 1)
+        } else {
+            0
+        };
+        let sy = if b0y < 0 {
+            -b0y
+        } else if b1y >= h as i32 {
+            -(b1y - h as i32 + 1)
+        } else {
+            0
+        };
+        (sx, sy)
+    }
+
+    /// Slide a layer buffer by (`sx`,`sy`) with zero-fill (far-edge tails
+    /// trim). `stride` is 4 for pixels, 1 for masks.
+    fn slide_buffer(buf: &mut [u8], w: u32, h: u32, stride: usize, sx: i32, sy: i32) {
+        if (sx == 0 && sy == 0) || w == 0 || h == 0 {
+            return;
+        }
+        let mut next = vec![0u8; buf.len()];
+        for y in 0..h {
+            let old_y = y as i32 - sy;
+            if old_y < 0 || old_y >= h as i32 {
+                continue;
+            }
+            for x in 0..w {
+                let old_x = x as i32 - sx;
+                if old_x < 0 || old_x >= w as i32 {
+                    continue;
+                }
+                let s = ((old_y as u32 * w + old_x as u32) as usize) * stride;
+                let d = ((y * w + x) as usize) * stride;
+                if s + stride <= buf.len() && d + stride <= next.len() {
+                    next[d..d + stride].copy_from_slice(&buf[s..s + stride]);
+                }
+            }
+        }
+        buf.copy_from_slice(&next);
+    }
+
+    /// Make canvas bbox [`x0`..=`x1`]×[`y0`..=`y1`] paintable on a moved
+    /// layer: slide pixels (and mask) so the bbox maps inside the buffer,
+    /// adjusting the offset equally — on-screen content does not move and
+    /// no visible pixel is ever trimmed (see [`Self::fit_shift`]). No-op
+    /// when already inside. Returns true when the buffer slid (the caller
+    /// then marks the whole layer dirty — content moved outside the dab
+    /// rect too). Caller checkpoints first (paint strokes do, so undo
+    /// restores buffer and offset together).
+    pub fn absorb_offset(&mut self, index: usize, x0: u32, y0: u32, x1: u32, y1: u32) -> bool {
+        if index >= self.layers.len() {
+            return false;
+        }
+        let (w, h) = (self.w, self.h);
+        let (ox, oy) = (self.layers[index].ox, self.layers[index].oy);
+        let (sx, sy) = Self::fit_shift(w, h, ox, oy, x0, y0, x1, y1);
+        if sx == 0 && sy == 0 {
+            return false;
+        }
+        Self::slide_buffer(&mut self.layers[index].pixels, w, h, 4, sx, sy);
+        if let Some(m) = self.layers[index].mask.as_mut() {
+            Self::slide_buffer(m, w, h, 1, sx, sy);
+        }
+        // Content slid +s in the buffer reads at the same screen cell
+        // exactly when the offset drops by s.
+        self.layers[index].ox = ox - sx;
+        self.layers[index].oy = oy - sy;
+        true
+    }
+
     /// Re-seat the canvas: the old canvas lands at `(dx, dy)` in the new
     /// `new_w` x `new_h` canvas. Buffers are reallocated and copied at
     /// identical buffer coordinates while the layer offsets absorb the
@@ -3946,11 +4042,11 @@ mod tests {
         // ...stored shifted in the buffer (local 5, 10).
         let o = ((10 * 32 + 5) * 4) as usize;
         assert_eq!(&doc.layers[0].pixels[o..o + 4], &[255, 0, 0, 255]);
-        // And off-canvas dabs on a shifted layer still paint nothing.
-        let before = doc.layers[0].pixels.clone();
+        // A far-moved layer still paints the page: the buffer slides
+        // home (only invisible tails trim) instead of refusing the dab.
         doc.translate_layer(0, 1000, 0);
         doc.dab(&brush, Color::rgb(0, 255, 0), 10.5, 10.5);
-        assert_eq!(doc.layers[0].pixels, before);
+        assert_eq!(at(&doc, 10, 10), [0, 255, 0, 255]);
     }
 
     #[test]
@@ -4892,5 +4988,65 @@ mod tests {
         doc.liquify(0, 8.5, 8.5, 6.0, 0.0, 12.0, 1.0);
         let o = ((25 * 32 + 25) * 4) as usize;
         assert_eq!(doc.layers[0].pixels[o], before[o]);
+    }
+
+    #[test]
+    fn fit_shift_math() {
+        // Inside: no slide.
+        assert_eq!(Document::fit_shift(100, 100, 30, 0, 40, 10, 50, 20), (0, 0));
+        // Left overhang slides right; right overhang slides left.
+        assert_eq!(
+            Document::fit_shift(100, 100, 60, 0, 10, 10, 20, 20),
+            (50, 0)
+        );
+        assert_eq!(
+            Document::fit_shift(100, 100, -60, 0, 80, 10, 90, 20),
+            (-51, 0)
+        );
+        // Fully displaced bboxes still absorb (only invisible tails trim).
+        assert_eq!(
+            Document::fit_shift(100, 100, 5000, 0, 10, 10, 20, 20),
+            (4990, 0)
+        );
+        assert_eq!(Document::fit_shift(0, 0, 0, 0, 0, 0, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn absorb_keeps_content_on_screen() {
+        let mut doc = Document::new(32, 32);
+        // Paint a marker, move the layer, absorb where the marker shows.
+        doc.layers[0].pixels[((4 * 32 + 4) * 4) as usize] = 255;
+        doc.layers[0].pixels[((4 * 32 + 4) * 4 + 3) as usize] = 255;
+        doc.translate_layer(0, 10, 0);
+        // Canvas (0,4) maps outside the buffer: slide home, marker rides
+        // along and still shows at canvas (14,4).
+        assert!(doc.absorb_offset(0, 0, 4, 0, 4));
+        let flat = doc.flatten();
+        assert_eq!(flat[((4 * 32 + 14) * 4) as usize], 255);
+        // Offset shrank by the slide; second absorb is a no-op.
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (0, 0));
+        assert!(!doc.absorb_offset(0, 14, 4, 14, 4));
+    }
+
+    #[test]
+    fn paint_works_full_page_after_move() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(32, 32);
+        doc.translate_layer(0, 20, 0);
+        // The strip the offset pushed out of the buffer paints again.
+        let brush = Brush {
+            size: 4.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.dab(&brush, Color::rgb(255, 255, 255), 2.0, 16.0);
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 32 + x) * 4) as usize];
+        // Composite shows the dab where the user put it.
+        let flat = doc.flatten();
+        assert!(flat[((16 * 32 + 2) * 4) as usize] > 200);
+        // And pre-move content survived the slide (moved, not wiped).
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (0, 0));
+        let _ = at;
     }
 }

@@ -406,6 +406,11 @@ impl Document {
         if active >= self.layers.len() {
             return;
         }
+        // Moved layers stay fully paintable: absorb the offset (slides
+        // buffer, trims far tails, content unmoved) before resolving slots.
+        if self.absorb_offset(active, x0, y0, x1, y1) {
+            self.mark_full_dirty();
+        }
         let sel_mask = self.selection_mask.as_deref();
         let w = w_u32;
         let value = if brush.eraser {
@@ -525,6 +530,11 @@ impl Document {
         if active >= self.layers.len() {
             return;
         }
+        // Moved layers stay fully paintable: absorb the offset (slides
+        // buffer, trims far tails, content unmoved) before resolving slots.
+        if self.absorb_offset(active, x0, y0, x1, y1) {
+            self.mark_full_dirty();
+        }
         let sel_mask = self.selection_mask.as_deref();
         let w = w_u32;
         let value = if brush.eraser {
@@ -626,6 +636,11 @@ impl Document {
         let active = self.active;
         if active >= self.layers.len() {
             return;
+        }
+        // Moved layers stay fully paintable: absorb the offset (slides
+        // buffer, trims far tails, content unmoved) before resolving slots.
+        if self.absorb_offset(active, x0, y0, x1, y1) {
+            self.mark_full_dirty();
         }
         let mask = self.selection_mask.as_deref();
         let w = w_u32;
@@ -745,6 +760,11 @@ impl Document {
         let active = self.active;
         if active >= self.layers.len() {
             return;
+        }
+        // Moved layers stay fully paintable: absorb the offset (slides
+        // buffer, trims far tails, content unmoved) before resolving slots.
+        if self.absorb_offset(active, x0, y0, x1, y1) {
+            self.mark_full_dirty();
         }
         let mask = self.selection_mask.as_deref();
         let w = w_u32;

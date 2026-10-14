@@ -1429,7 +1429,7 @@ impl ProCraftApp {
                 self.text_font_bytes = Some(bytes.to_vec());
                 format!("Font {name} ready.")
             }
-            Err(e) => format!("Font import failed: {e}"),
+            Err(e) => format!("Font {name} failed: {e}"),
         }
     }
 
@@ -2018,8 +2018,10 @@ impl eframe::App for ProCraftApp {
                     // more frame so opens appear at once.
                     ui.ctx().request_repaint();
                 }
-                rfd::PickPoll::Cancelled => {
-                    self.status = "Pick cancelled.".to_string();
+                rfd::PickPoll::Cancelled(reason) => {
+                    // Reasoned cancels (no-main-thread, no window, timed
+                    // out) diagnose a dead picker on device at a glance.
+                    self.status = reason.unwrap_or("Pick cancelled.").to_string();
                 }
             }
         }
@@ -2570,131 +2572,141 @@ impl eframe::App for ProCraftApp {
                 .resizable(true)
                 .collapsible(false)
                 .show(ui.ctx(), |ui| {
-                    ui.label("Click the canvas to move the anchor, then Render.");
-                    // Explicit focus like the layer rename: iOS shows no
-                    // keyboard for an unfocused multiline field.
-                    let field = ui.add(
-                        egui::TextEdit::multiline(&mut self.text_body)
-                            .desired_rows(3)
-                            .hint_text("Type here (Enter = new line)"),
-                    );
-                    if !field.has_focus() {
-                        field.request_focus();
-                    }
-                    stepped_slider(ui, &mut self.text_size, MIN_TEXT_PX..=128.0, 1.0, "Size px");
-                    // M38 Typography: face + spacing + outline.
-                    ui.horizontal_wrapped(|ui| {
-                        let face = self.text_font_name.as_deref().unwrap_or("Inter (bundled)");
-                        ui.label(format!("Face: {face}"));
-                        if ui
-                            .add_sized([80.0, 28.0], egui::Button::new("Import…"))
-                            .clicked()
-                        {
-                            #[cfg(not(target_os = "ios"))]
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Fonts", &["ttf", "otf"])
-                                .pick_file()
-                            {
-                                match std::fs::read(&path) {
-                                    Ok(bytes) => {
-                                        let name = path
-                                            .file_name()
-                                            .and_then(|n| n.to_str())
-                                            .unwrap_or("font")
-                                            .to_string();
-                                        self.status = self.absorb_font(&bytes, &name);
-                                    }
-                                    Err(e) => self.status = format!("Font import failed: {e}"),
-                                }
-                            }
-                            #[cfg(target_os = "ios")]
-                            {
-                                let _ = rfd::FileDialog::new()
-                                    .add_filter("Fonts", &["ttf", "otf"])
-                                    .pick_file();
-                                self.pending_open = Some(PendingOpen::Font);
-                                self.status = "Pick a font…".to_string();
-                            }
+                    // Scrollable: on small screens (iPad keyboard up) the
+                    // tall dialog clips Import/Render below the fold.
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.label("Click the canvas to move the anchor, then Render.");
+                        // Explicit focus like the layer rename: iOS shows no
+                        // keyboard for an unfocused multiline field.
+                        let field = ui.add(
+                            egui::TextEdit::multiline(&mut self.text_body)
+                                .desired_rows(3)
+                                .hint_text("Type here (Enter = new line)"),
+                        );
+                        if !field.has_focus() {
+                            field.request_focus();
                         }
-                        if self.text_font_name.is_some()
-                            && ui
-                                .add_sized([86.0, 28.0], egui::Button::new("Bundled"))
+                        stepped_slider(
+                            ui,
+                            &mut self.text_size,
+                            MIN_TEXT_PX..=128.0,
+                            1.0,
+                            "Size px",
+                        );
+                        // M38 Typography: face + spacing + outline.
+                        ui.horizontal_wrapped(|ui| {
+                            let face = self.text_font_name.as_deref().unwrap_or("Inter (bundled)");
+                            ui.label(format!("Face: {face}"));
+                            if ui
+                                .add_sized([80.0, 28.0], egui::Button::new("Import…"))
                                 .clicked()
-                        {
-                            self.text_font_name = None;
-                            self.text_font_bytes = None;
-                            self.status = "Back to Inter.".to_string();
-                        }
-                    });
-                    stepped_slider(
-                        ui,
-                        &mut self.text_leading,
-                        -MAX_TEXT_SPACING..=MAX_TEXT_SPACING,
-                        1.0,
-                        "Leading",
-                    );
-                    stepped_slider(
-                        ui,
-                        &mut self.text_tracking,
-                        -MAX_TEXT_SPACING..=MAX_TEXT_SPACING,
-                        1.0,
-                        "Tracking",
-                    );
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.text_outline, "Outline");
-                        if self.text_outline {
-                            stepped_slider(
-                                ui,
-                                &mut self.text_outline_w,
-                                1..=MAX_OUTLINE_PX,
-                                1.0,
-                                "px",
-                            );
-                        }
-                    });
-                    if self.text_outline {
-                        ui.label("Outline color:");
-                        stepped_slider(ui, &mut self.text_outline_rgb[0], 0..=255, 1.0, "R");
-                        stepped_slider(ui, &mut self.text_outline_rgb[1], 0..=255, 1.0, "G");
-                        stepped_slider(ui, &mut self.text_outline_rgb[2], 0..=255, 1.0, "B");
-                    }
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add_sized([80.0, 28.0], egui::Button::new("Render"))
-                            .clicked()
-                        {
-                            match self.text_anchor {
-                                Some((ax, ay)) => {
-                                    let style = self.text_style();
-                                    self.doc.checkpoint();
-                                    match self.doc.draw_text_styled(
-                                        ink,
-                                        ax,
-                                        ay,
-                                        self.text_size,
-                                        &self.text_body,
-                                        &style,
-                                    ) {
-                                        Ok((w, h)) => {
-                                            self.status = format!("Text placed ({w}x{h}px).");
-                                            self.text_open = false;
-                                            self.capture_timelapse();
+                            {
+                                #[cfg(not(target_os = "ios"))]
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Fonts", &["ttf", "otf"])
+                                    .pick_file()
+                                {
+                                    match std::fs::read(&path) {
+                                        Ok(bytes) => {
+                                            let name = path
+                                                .file_name()
+                                                .and_then(|n| n.to_str())
+                                                .unwrap_or("font")
+                                                .to_string();
+                                            self.status = self.absorb_font(&bytes, &name);
                                         }
-                                        Err(e) => self.status = format!("Text failed: {e}"),
+                                        Err(e) => self.status = format!("Font import failed: {e}"),
                                     }
                                 }
-                                None => {
-                                    self.status =
-                                        "Click the canvas to anchor the text first.".to_string()
+                                #[cfg(target_os = "ios")]
+                                {
+                                    let _ = rfd::FileDialog::new()
+                                        .add_filter("Fonts", &["ttf", "otf"])
+                                        .pick_file();
+                                    self.pending_open = Some(PendingOpen::Font);
+                                    self.status = "Pick a font…".to_string();
                                 }
                             }
+                            if self.text_font_name.is_some()
+                                && ui
+                                    .add_sized([86.0, 28.0], egui::Button::new("Bundled"))
+                                    .clicked()
+                            {
+                                self.text_font_name = None;
+                                self.text_font_bytes = None;
+                                self.status = "Back to Inter.".to_string();
+                            }
+                        });
+                        stepped_slider(
+                            ui,
+                            &mut self.text_leading,
+                            -MAX_TEXT_SPACING..=MAX_TEXT_SPACING,
+                            1.0,
+                            "Leading",
+                        );
+                        stepped_slider(
+                            ui,
+                            &mut self.text_tracking,
+                            -MAX_TEXT_SPACING..=MAX_TEXT_SPACING,
+                            1.0,
+                            "Tracking",
+                        );
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.text_outline, "Outline");
+                            if self.text_outline {
+                                stepped_slider(
+                                    ui,
+                                    &mut self.text_outline_w,
+                                    1..=MAX_OUTLINE_PX,
+                                    1.0,
+                                    "px",
+                                );
+                            }
+                        });
+                        if self.text_outline {
+                            ui.label("Outline color:");
+                            stepped_slider(ui, &mut self.text_outline_rgb[0], 0..=255, 1.0, "R");
+                            stepped_slider(ui, &mut self.text_outline_rgb[1], 0..=255, 1.0, "G");
+                            stepped_slider(ui, &mut self.text_outline_rgb[2], 0..=255, 1.0, "B");
                         }
-                        if ui
-                            .add_sized([80.0, 28.0], egui::Button::new("Cancel"))
-                            .clicked()
-                        {
-                            self.text_open = false;
-                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_sized([80.0, 28.0], egui::Button::new("Render"))
+                                .clicked()
+                            {
+                                match self.text_anchor {
+                                    Some((ax, ay)) => {
+                                        let style = self.text_style();
+                                        self.doc.checkpoint();
+                                        match self.doc.draw_text_styled(
+                                            ink,
+                                            ax,
+                                            ay,
+                                            self.text_size,
+                                            &self.text_body,
+                                            &style,
+                                        ) {
+                                            Ok((w, h)) => {
+                                                self.status = format!("Text placed ({w}x{h}px).");
+                                                self.text_open = false;
+                                                self.capture_timelapse();
+                                            }
+                                            Err(e) => self.status = format!("Text failed: {e}"),
+                                        }
+                                    }
+                                    None => {
+                                        self.status =
+                                            "Click the canvas to anchor the text first.".to_string()
+                                    }
+                                }
+                            }
+                            if ui
+                                .add_sized([80.0, 28.0], egui::Button::new("Cancel"))
+                                .clicked()
+                            {
+                                self.text_open = false;
+                            }
+                        });
                     });
                 });
             self.text_open = open;

@@ -116,6 +116,10 @@ fn uti_for_ext(ext: &str) -> &'static str {
         "bmp" => "com.microsoft.bmp",
         "webp" => "org.webmproject.webp",
         "pdf" => "com.adobe.pdf",
+        // M38 fonts: a real font UTI so the Files browser offers
+        // typefaces (falling back to public.item hid nothing, but some
+        // providers filter dimmer without an exact type).
+        "ttf" | "otf" | "ttc" => "public.font",
         _ => "public.item",
     }
 }
@@ -218,9 +222,9 @@ pub(super) fn poll() -> super::PickPoll {
     let Some(inner) = slot.as_ref() else {
         return super::PickPoll::NoRequest;
     };
-    if inner.error.is_some() {
+    if let Some(reason) = inner.error {
         *slot = None;
-        return super::PickPoll::Cancelled;
+        return super::PickPoll::Cancelled(Some(reason));
     }
     let done = inner.shared.lock().unwrap().done.take();
     match done {
@@ -228,13 +232,13 @@ pub(super) fn poll() -> super::PickPoll {
             *slot = None;
             match paths.pop() {
                 Some(p) => super::PickPoll::Picked(p),
-                None => super::PickPoll::Cancelled,
+                None => super::PickPoll::Cancelled(None),
             }
         }
         None => {
             if inner.presented_at.elapsed().as_secs() >= PICK_TIMEOUT_SECS {
                 *slot = None;
-                super::PickPoll::Cancelled
+                super::PickPoll::Cancelled(Some("picker timed out"))
             } else {
                 super::PickPoll::Waiting
             }

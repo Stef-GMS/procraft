@@ -70,8 +70,10 @@ pub enum PickPoll {
     Waiting,
     /// User picked a file (sandboxed, readable).
     Picked(PathBuf),
-    /// User cancelled, presentation failed, or the wait timed out.
-    Cancelled,
+    /// User cancelled (`None`), presentation failed, or the wait timed
+    /// out (both with a reason) — surfaced in the status line so a dead
+    /// picker reports WHY instead of vanishing silently.
+    Cancelled(Option<&'static str>),
 }
 
 /// Check a pending pick. Call once per frame after `pick_file`.

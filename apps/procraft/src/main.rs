@@ -124,6 +124,9 @@ struct FilterPreview {
     pixels: Vec<u8>,
 }
 
+/// M35 Selection upgrades: saved snapshot (canvas dims, rect, mask).
+type SavedSelection = ((u32, u32), Option<(u32, u32, u32, u32)>, Option<Vec<u8>>);
+
 /// In-progress multi-finger tap (undo/redo): tracks the widest finger
 /// count, start time/center, and whether it moved (a pan/pinch is not
 /// a tap). Fires on clean release; see the top of `App::ui`.
@@ -365,6 +368,11 @@ struct ProCraftApp {
     ref_image: Option<(Vec<u8>, u32, u32)>,
     ref_tex: Option<TextureHandle>,
     ref_scale: f32,
+    /// M35 Selection upgrades: saved snapshot ((w,h), rect, mask) plus
+    /// the nudge steppers. Session-only; Load refuses size mismatches.
+    saved_sel: Option<SavedSelection>,
+    sel_nudge_x: i32,
+    sel_nudge_y: i32,
 }
 
 impl ProCraftApp {
@@ -508,6 +516,9 @@ impl ProCraftApp {
             ref_image: None,
             ref_tex: None,
             ref_scale: 1.0,
+            saved_sel: None,
+            sel_nudge_x: 0,
+            sel_nudge_y: 0,
         };
         // Restore disk-persisted UI state (theme, panels, zoom); defaults
         // stand when nothing was saved yet.
@@ -2461,6 +2472,85 @@ impl eframe::App for ProCraftApp {
                         self.status = "No selection to outline.".to_string();
                     }
                 }
+                // M35 Selection upgrades: save/load slot (session-only;
+                // Load refuses size mismatches) plus nudge/flip transform.
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Save selection").clicked() {
+                        if self.doc.selection.is_some() || self.doc.selection_mask.is_some()
+                        {
+                            self.saved_sel = Some((
+                                (self.doc.w, self.doc.h),
+                                self.doc.selection,
+                                self.doc.selection_mask.clone(),
+                            ));
+                            self.status = format!(
+                                "Selection saved ({} px).",
+                                self.doc.selection_pixel_count()
+                            );
+                        } else {
+                            self.status = "No selection to save.".to_string();
+                        }
+                    }
+                    if ui
+                        .add_enabled(self.saved_sel.is_some(), egui::Button::new("Load selection"))
+                        .clicked()
+                    {
+                        let dims_ok = self
+                            .saved_sel
+                            .as_ref()
+                            .is_some_and(|(dims, _, _)| *dims == (self.doc.w, self.doc.h));
+                        if dims_ok {
+                            if let Some((_, rect, mask)) = self.saved_sel.clone() {
+                                self.doc.selection = rect;
+                                self.doc.selection_mask = mask;
+                                self.sel_edges_dirty = true;
+                                self.status = format!(
+                                    "Selection loaded ({} px).",
+                                    self.doc.selection_pixel_count()
+                                );
+                            }
+                        } else {
+                            self.status =
+                                "Saved selection is a different canvas size.".to_string();
+                        }
+                    }
+                });
+                if let Some(((w, h), _, _)) = &self.saved_sel {
+                    ui.label(format!("Saved slot: {w}x{h} canvas."));
+                }
+                stepped_slider(ui, &mut self.sel_nudge_x, -64..=64, 1.0, "Nudge x");
+                stepped_slider(ui, &mut self.sel_nudge_y, -64..=64, 1.0, "Nudge y");
+                ui.horizontal(|ui| {
+                    if ui.button("Apply nudge").clicked() {
+                        let (dx, dy) = (self.sel_nudge_x, self.sel_nudge_y);
+                        if self.doc.translate_selection(dx, dy) {
+                            self.status = format!(
+                                "Nudged ({dx},{dy}, {} px).",
+                                self.doc.selection_pixel_count()
+                            );
+                        } else {
+                            self.status = "Nudge cleared the selection.".to_string();
+                        }
+                        self.sel_edges_dirty = true;
+                    }
+                    if ui.button("Flip H").clicked() {
+                        if self.doc.flip_selection_h() {
+                            self.status = "Flipped horizontal.".to_string();
+                        } else {
+                            self.status = "No selection to flip.".to_string();
+                        }
+                        self.sel_edges_dirty = true;
+                    }
+                    if ui.button("Flip V").clicked() {
+                        if self.doc.flip_selection_v() {
+                            self.status = "Flipped vertical.".to_string();
+                        } else {
+                            self.status = "No selection to flip.".to_string();
+                        }
+                        self.sel_edges_dirty = true;
+                    }
+                });
             });
             ui.separator();
             ui.heading("Brushes");

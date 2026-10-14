@@ -1615,6 +1615,80 @@ impl Document {
         self.selection_mask.is_some()
     }
 
+    /// Nudge the selection by `(dx, dy)` canvas px (rect corners clamp to
+    /// the canvas; masks shift with zero-fill, so content pushed off the
+    /// edge is lost). Shrinking to nothing clears it. Returns false when
+    /// nothing remains. Not undoable.
+    pub fn translate_selection(&mut self, dx: i32, dy: i32) -> bool {
+        let (w, h) = (self.w, self.h);
+        if w == 0 || h == 0 || !self.bake_rect_to_mask() {
+            return false;
+        }
+        if dx == 0 && dy == 0 {
+            return true;
+        }
+        let Some(m) = self.selection_mask.take() else {
+            return false;
+        };
+        let n = (w * h) as usize;
+        let mut out = vec![0u8; n];
+        for y in 0..h {
+            for x in 0..w {
+                let (sx, sy) = (x as i32 - dx, y as i32 - dy);
+                if sx >= 0 && sy >= 0 && sx < w as i32 && sy < h as i32 {
+                    out[(y * w + x) as usize] = m[(sy as u32 * w + sx as u32) as usize];
+                }
+            }
+        }
+        if out.iter().all(|&b| b == 0) {
+            self.clear_selection();
+            return false;
+        }
+        self.selection_mask = Some(out);
+        self.retighten_selection();
+        true
+    }
+
+    /// Mirror the selection left-right (rect corners remap, masks flip).
+    /// Returns false when there was no selection. Not undoable.
+    pub fn flip_selection_h(&mut self) -> bool {
+        let (w, h) = (self.w, self.h);
+        if w == 0 || h == 0 || !self.bake_rect_to_mask() {
+            return false;
+        }
+        if let Some(m) = self.selection_mask.take() {
+            let mut out = vec![0u8; (w * h) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    out[(y * w + x) as usize] = m[(y * w + (w - 1 - x)) as usize];
+                }
+            }
+            self.selection_mask = Some(out);
+        }
+        self.retighten_selection();
+        self.selection_mask.is_some()
+    }
+
+    /// Mirror the selection top-bottom. Returns false when there was no
+    /// selection. Not undoable.
+    pub fn flip_selection_v(&mut self) -> bool {
+        let (w, h) = (self.w, self.h);
+        if w == 0 || h == 0 || !self.bake_rect_to_mask() {
+            return false;
+        }
+        if let Some(m) = self.selection_mask.take() {
+            let mut out = vec![0u8; (w * h) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    out[(y * w + x) as usize] = m[((h - 1 - y) * w + x) as usize];
+                }
+            }
+            self.selection_mask = Some(out);
+        }
+        self.retighten_selection();
+        self.selection_mask.is_some()
+    }
+
     /// Select the active layer's pixels more opaque than `threshold`
     /// (offset-aware; uncovered canvas counts as transparent). Replaces any
     /// selection; empty layers clear it. Returns false when nothing is
@@ -4165,5 +4239,52 @@ mod tests {
         assert!(out.is_empty() && w == 0 && h == 0);
         let (out, w, h) = gallery_thumb(&[], 0, 0, 96);
         assert!(out.is_empty() && w == 0 && h == 0);
+    }
+
+    #[test]
+    fn translate_selection_moves_rect() {
+        let mut doc = Document::new(10, 10);
+        doc.selection = Some((2, 2, 5, 5));
+        assert!(doc.translate_selection(3, 1));
+        assert_eq!(doc.selection, Some((5, 3, 8, 6)));
+        // Weights survive a mask nudge (bake materializes the rect first).
+        let m = doc.selection_mask.clone().unwrap();
+        assert!(m.iter().all(|&b| b == 0 || b == 255));
+    }
+
+    #[test]
+    fn translate_selection_off_canvas_clears() {
+        let mut doc = Document::new(4, 4);
+        doc.selection = Some((0, 0, 1, 1));
+        assert!(!doc.translate_selection(10, 0));
+        assert!(doc.selection.is_none() && doc.selection_mask.is_none());
+        // Partial push keeps the on-canvas tail.
+        let mut doc = Document::new(4, 4);
+        doc.selection = Some((0, 0, 1, 1));
+        assert!(doc.translate_selection(3, 0));
+        assert_eq!(doc.selection, Some((3, 0, 3, 1)));
+    }
+
+    #[test]
+    fn flip_selection_mirrors_rect_and_mask() {
+        let mut doc = Document::new(10, 10);
+        doc.selection = Some((1, 2, 4, 6));
+        assert!(doc.flip_selection_h());
+        assert_eq!(doc.selection, Some((5, 2, 8, 6)));
+        let mut doc = Document::new(10, 10);
+        doc.selection = Some((1, 2, 4, 6));
+        assert!(doc.flip_selection_v());
+        assert_eq!(doc.selection, Some((1, 3, 4, 7)));
+        // Weighted mask pixels land mirrored (feather fringe included).
+        let mut doc = Document::new(4, 4);
+        let mut mask = vec![0u8; 16];
+        mask[0] = 128;
+        doc.selection_mask = Some(mask);
+        assert!(doc.flip_selection_h());
+        let m = doc.selection_mask.clone().unwrap();
+        assert_eq!(m[3], 128);
+        assert!(doc.flip_selection_v());
+        let m = doc.selection_mask.clone().unwrap();
+        assert_eq!(m[15], 128);
     }
 }

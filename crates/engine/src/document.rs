@@ -969,36 +969,87 @@ impl Document {
         out
     }
 
-    /// Scale (about the canvas center) then rotate (degrees clockwise) a
-    /// layer with bilinear sampling. Masks travel with their layer.
+    /// Scale then rotate (degrees clockwise) a layer about the paint's
+    /// own center (opaque-pixel bbox; canvas center for empty layers),
+    /// so the paint spins/grows in place instead of orbiting the canvas.
+    /// Multiples of 90° resample exactly (nearest), so repeated
+    /// quarter-turns never blur; other angles/scales resample once per
+    /// call (repeated fractional transforms are inherently lossy — fewer,
+    /// deliberate clicks keep paint crisp). Masks travel with their layer.
     /// Caller checkpoints for undo first.
     pub fn affine_layer(&mut self, index: usize, scale: f32, degrees: f32) {
         if index >= self.layers.len() || (scale - 1.0).abs() < 1e-6 && degrees.abs() < 1e-6 {
             return;
         }
         let (w, h) = (self.w, self.h);
+        // Pivot: content bbox center keeps paint in place; empty layers
+        // keep the old canvas-center behavior (invisible either way).
+        let center = Self::content_center(&self.layers[index].pixels, w, h);
+        let pivot = center.unwrap_or((w as f32 * 0.5, h as f32 * 0.5));
+        let quarters = (degrees / 90.0).round();
+        let exact = (scale - 1.0).abs() < 1e-6 && (degrees - quarters * 90.0).abs() < 1e-3;
         let src = self.layers[index].pixels.clone();
-        self.layers[index].pixels = Self::affine_buffer(&src, w, h, scale, degrees);
+        self.layers[index].pixels =
+            Self::affine_buffer(&src, w, h, scale, degrees, pivot.0, pivot.1, exact);
         if let Some(m) = self.layers[index].mask.clone() {
             let rgba: Vec<u8> = m.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
-            let out = Self::affine_buffer(&rgba, w, h, scale, degrees);
+            let out = Self::affine_buffer(&rgba, w, h, scale, degrees, pivot.0, pivot.1, exact);
             self.layers[index].mask = Some(out.as_chunks::<4>().0.iter().map(|p| p[0]).collect());
         }
-        // Carry the offset through the same forward map (scale, then
-        // rotate about the canvas center) so transformed content lands
-        // where the pixels do. Matches affine_buffer's inverse map.
-        let theta = degrees.to_radians();
-        let (sin, cos) = theta.sin_cos();
-        let s = scale.max(0.01);
-        let (ox, oy) = (self.layers[index].ox as f32, self.layers[index].oy as f32);
-        self.layers[index].ox = (s * (ox * cos - oy * sin)).round() as i32;
-        self.layers[index].oy = (s * (ox * sin + oy * cos)).round() as i32;
+        if center.is_none() {
+            // Empty layer: carry the offset through the forward map about
+            // the canvas center, exactly as before (invisible, but stable).
+            let theta = degrees.to_radians();
+            let (sin, cos) = theta.sin_cos();
+            let s = scale.max(0.01);
+            let (ox, oy) = (self.layers[index].ox as f32, self.layers[index].oy as f32);
+            self.layers[index].ox = (s * (ox * cos - oy * sin)).round() as i32;
+            self.layers[index].oy = (s * (ox * sin + oy * cos)).round() as i32;
+        }
+        // Content path: the buffer rotates about its own center, so the
+        // layer offset stays valid untouched (no rounding damage).
         self.mark_full_dirty();
     }
 
-    /// Shared scale-then-rotate resampler over RGBA bytes.
-    fn affine_buffer(src: &[u8], w: u32, h: u32, scale: f32, degrees: f32) -> Vec<u8> {
-        let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
+    /// Center of the opaque-pixel bbox as the mean of indices (so the
+    /// discrete set maps onto itself under quarter-turns; the continuous
+    /// midpoint would drift a pixel per turn). None when nothing is
+    /// painted.
+    fn content_center(pixels: &[u8], w: u32, h: u32) -> Option<(f32, f32)> {
+        if w == 0 || h == 0 || pixels.len() != (w * h * 4) as usize {
+            return None;
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                if pixels[((y * w + x) * 4 + 3) as usize] != 0 {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        if x0 == u32::MAX {
+            return None;
+        }
+        Some(((x0 + x1) as f32 * 0.5, (y0 + y1) as f32 * 0.5))
+    }
+
+    /// Shared scale-then-rotate resampler over RGBA bytes about pivot
+    /// (`cx`, `cy`). Exact quarter-turns sample nearest (lossless
+    /// permutation); everything else blends bilinearly.
+    #[allow(clippy::too_many_arguments)]
+    fn affine_buffer(
+        src: &[u8],
+        w: u32,
+        h: u32,
+        scale: f32,
+        degrees: f32,
+        cx: f32,
+        cy: f32,
+        exact: bool,
+    ) -> Vec<u8> {
         let theta = degrees.to_radians();
         let (sin, cos) = theta.sin_cos();
         let s = scale.max(0.01);
@@ -1011,7 +1062,16 @@ impl Document {
                 let sx = (px * cos + py * sin) / s + cx;
                 let sy = (-px * sin + py * cos) / s + cy;
                 let o = ((y * w + x) * 4) as usize;
-                if sx >= 0.0 && sx < w as f32 && sy >= 0.0 && sy < h as f32 {
+                if exact {
+                    // Round first: float noise (±1e-6) around integer
+                    // sources must not drop pixels at the bounds.
+                    let xi = sx.round() as i32;
+                    let yi = sy.round() as i32;
+                    if xi >= 0 && xi < w as i32 && yi >= 0 && yi < h as i32 {
+                        let so = ((yi as u32 * w + xi as u32) * 4) as usize;
+                        next[o..o + 4].copy_from_slice(&src[so..so + 4]);
+                    }
+                } else if sx >= 0.0 && sx < w as f32 && sy >= 0.0 && sy < h as f32 {
                     next[o..o + 4].copy_from_slice(&Self::sample_bilinear(src, w, h, sx, sy));
                 }
             }
@@ -3950,6 +4010,85 @@ mod tests {
             .0
             .iter()
             .all(|p| p[0] == 100 && p[3] == 100));
+    }
+
+    fn opaque_bbox_center(doc: &Document) -> (f32, f32) {
+        let (w, h) = (doc.w, doc.h);
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                if doc.layers[0].pixels[((y * w + x) * 4 + 3) as usize] != 0 {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        ((x0 + x1 + 1) as f32 * 0.5, (y0 + y1 + 1) as f32 * 0.5)
+    }
+
+    #[test]
+    fn affine_spins_and_grows_about_paint_center() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(64, 64);
+        let brush = Brush {
+            size: 30.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        // Off-center hard rect: the old canvas-center pivot would orbit
+        // it ~6px per 15° click; rotating in place only turns corners.
+        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 12, 12, 19, 19);
+        let before = opaque_bbox_center(&doc);
+        assert!((before.0 - 16.0).abs() < 1.0 && (before.1 - 16.0).abs() < 1.0);
+        let painted = doc.layers[0].pixels.clone();
+        doc.affine_layer(0, 1.0, 15.0);
+        // Rotation applied (corners moved) but the paint stayed put.
+        assert_ne!(doc.layers[0].pixels, painted);
+        let after = opaque_bbox_center(&doc);
+        assert!(
+            (after.0 - before.0).abs() <= 2.0 && (after.1 - before.1).abs() <= 2.0,
+            "before={before:?} after={after:?}"
+        );
+        // Scale grows about the same center.
+        doc.affine_layer(0, 1.25, 0.0);
+        let grown = opaque_bbox_center(&doc);
+        assert!(
+            (grown.0 - before.0).abs() <= 3.0 && (grown.1 - before.1).abs() <= 3.0,
+            "before={before:?} grown={grown:?}"
+        );
+        // Offsets ride along untouched (no rounding damage).
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (0, 0));
+    }
+
+    #[test]
+    fn affine_quarter_turns_are_lossless() {
+        // Pivot-stable block: distinct values per pixel catch any smear,
+        // and the centered bbox keeps the pivot fixed across turns.
+        let mut doc = Document::new(16, 16);
+        for y in 4..12u32 {
+            for x in 4..12u32 {
+                let o = ((y * 16 + x) * 4) as usize;
+                doc.layers[0].pixels[o] = (x * 16 + y) as u8;
+                doc.layers[0].pixels[o + 1] = 200;
+                doc.layers[0].pixels[o + 2] = 100;
+                doc.layers[0].pixels[o + 3] = 255;
+            }
+        }
+        let before = doc.layers[0].pixels.clone();
+        let count: usize = before.chunks(4).filter(|p| p[3] != 0).count();
+        doc.affine_layer(0, 1.0, 90.0);
+        assert_eq!(
+            doc.layers[0].pixels.chunks(4).filter(|p| p[3] != 0).count(),
+            count
+        );
+        // Four quarter-turns return every byte exactly.
+        for _ in 0..3 {
+            doc.affine_layer(0, 1.0, 90.0);
+        }
+        assert_eq!(doc.layers[0].pixels, before);
     }
 
     #[test]

@@ -54,14 +54,14 @@ people touch daily. Ranked by user-visible value per effort.
 - [x] **M37 — Adjustments II.** HSL + Color Balance + Recolor.
   **→ PC checkpoint #3 (passed, pushed).**
 
-## Batch 4: M38–M42 (in progress — depth + polish-at-IPA)
+## Batch 4: M38–M42 (done — depth + polish-at-IPA)
 
-- [ ] **M38 — Typography.** TTF/OTF import, leading/tracking, outline text.
-- [ ] **M39 — Brush depth.** Dual-tip, wet-edge/glaze, per-brush blend mode.
-- [ ] **M40 — Liquify-lite.** Push/smudge-field on layer.
-- [ ] **M41 — Time-lapse recording.** Staged snapshots.
-- [ ] **M42 — iPad layout polish pass.**
-  **→ PC checkpoint #4 + iPad check #2 (IPA) (you are here when done).**
+- [x] **M38 — Typography.** TTF/OTF import, leading/tracking, outline text.
+- [x] **M39 — Brush depth.** Dual-tip, wet-edge/glaze, per-brush blend mode.
+- [x] **M40 — Liquify-lite.** Push/smudge-field on layer.
+- [x] **M41 — Time-lapse recording.** Staged snapshots.
+- [x] **M42 — iPad layout polish pass.**
+  **→ PC checkpoint #4 + iPad check #2 (IPA) (you are here).**
 
 ## P0 backlog (done)
 

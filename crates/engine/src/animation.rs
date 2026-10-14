@@ -277,14 +277,15 @@ pub fn onion_ghost(doc: &Document, index: usize, strength: f32) -> Vec<u8> {
 /// are skipped (documented in the app status line). Errors on bad rates,
 /// fully-hidden documents, and absurd frame counts.
 pub fn export_gif(doc: &Document, fps: u32) -> Result<Vec<u8>, String> {
-    export_gif_ext(doc, fps, LoopMode::Forward, MIN_ANIM_HOLD)
+    export_gif_ext(doc, fps, LoopMode::Forward)
 }
 
 /// Decode an animated GIF into a document: one layer per frame, bottom to
 /// top in file order, active on frame 1. Returns the document plus the
 /// first frame's rate (clamped, 12 fps fallback) so playback matches the
-/// source. Caps dimensions, frame count and input size; single-image GIFs
-/// import as one layer.
+/// source. Each frame's delay becomes its hold (ticks at that rate, so
+/// timing survives the round trip). Caps dimensions, frame count and input
+/// size; single-image GIFs import as one layer.
 pub fn import_gif_document(bytes: &[u8]) -> Result<(Document, u32), String> {
     use image::{codecs::gif::GifDecoder, AnimationDecoder, ImageDecoder};
     if bytes.len() > 64 * 1024 * 1024 {
@@ -295,23 +296,35 @@ pub fn import_gif_document(bytes: &[u8]) -> Result<(Document, u32), String> {
     if w == 0 || h == 0 || w > 4096 || h > 4096 {
         return Err("gif has bad dimensions".to_string());
     }
-    let mut layers = Vec::new();
-    let mut fps = 12u32;
-    let mut first = true;
+    // Buffer frames first: the rate comes from the first delay, but every
+    // frame keeps its own hold.
+    let mut buffered: Vec<(image::RgbaImage, u32)> = Vec::new();
     for frame in dec.into_frames() {
         let frame = frame.map_err(|e| e.to_string())?;
-        if first {
-            first = false;
-            let (n, d) = frame.delay().numer_denom_ms();
-            if n > 0 && d > 0 {
-                fps = ((1000 * d) as f32 / n as f32).round() as u32;
-                fps = fps.clamp(MIN_ANIM_FPS, MAX_ANIM_FPS);
-            }
-        }
+        let (n, d) = frame.delay().numer_denom_ms();
+        let ms = if n > 0 && d > 0 {
+            n as f32 / d as f32
+        } else {
+            1000.0 / 12.0
+        };
         let img = frame.into_buffer();
         if img.width() != w || img.height() != h {
             return Err("gif has ragged frames".to_string());
         }
+        buffered.push((img, ms.round() as u32));
+        if buffered.len() > MAX_GIF_FRAMES {
+            return Err(format!("too many frames (max {MAX_GIF_FRAMES})"));
+        }
+    }
+    if buffered.is_empty() {
+        return Err("gif has no frames".to_string());
+    }
+    // Missing delays defaulted to a 12 fps tick above, so the first frame
+    // always yields a sane rate.
+    let fps = ((1000.0 / buffered[0].1 as f32).round() as u32).clamp(MIN_ANIM_FPS, MAX_ANIM_FPS);
+    let mut layers = Vec::new();
+    for (img, ms) in buffered {
+        let hold = ((ms as f32 * fps as f32) / 1000.0).round() as u32;
         layers.push(Layer {
             name: format!("Frame {}", layers.len() + 1),
             visible: true,
@@ -322,32 +335,19 @@ pub fn import_gif_document(bytes: &[u8]) -> Result<(Document, u32), String> {
             clip: false,
             ox: 0,
             oy: 0,
+            hold: hold.clamp(MIN_ANIM_HOLD, MAX_ANIM_HOLD),
             group: None,
         });
-        if layers.len() > MAX_GIF_FRAMES {
-            return Err(format!("too many frames (max {MAX_GIF_FRAMES})"));
-        }
-    }
-    if layers.is_empty() {
-        return Err("gif has no frames".to_string());
     }
     Ok((Document::from_layers(w, h, layers, 0), fps))
 }
 
-/// [`export_gif`] plus loop mode and frame hold: ping-pong appends the
-/// interior frames in reverse (no duplicated endpoints), and `hold`
-/// stretches every frame delay (`hold` ticks at `fps`).
-pub fn export_gif_ext(
-    doc: &Document,
-    fps: u32,
-    mode: LoopMode,
-    hold: u32,
-) -> Result<Vec<u8>, String> {
+/// [`export_gif`] plus loop mode: ping-pong appends the interior frames in
+/// reverse (no duplicated endpoints). Every frame's delay is its own hold
+/// (ticks at `fps`), so per-frame timing reaches the file.
+pub fn export_gif_ext(doc: &Document, fps: u32, mode: LoopMode) -> Result<Vec<u8>, String> {
     if !(MIN_ANIM_FPS..=MAX_ANIM_FPS).contains(&fps) {
         return Err(format!("bad animation rate: {fps}"));
-    }
-    if !(MIN_ANIM_HOLD..=MAX_ANIM_HOLD).contains(&hold) {
-        return Err(format!("bad frame hold: {hold}"));
     }
     if doc.w == 0 || doc.h == 0 {
         return Err("nothing to animate: empty canvas".to_string());
@@ -375,10 +375,11 @@ pub fn export_gif_ext(
         let mut enc = GifEncoder::new(&mut buf);
         enc.set_repeat(Repeat::Infinite)
             .map_err(|e| e.to_string())?;
-        let delay = Delay::from_numer_denom_ms(1000 * hold, fps);
         for idx in seq {
             let px = rasterize_frame(doc, idx);
             let img = RgbaImage::from_raw(doc.w, doc.h, px).ok_or("frame raster failed")?;
+            let hold = doc.layers[idx].hold.clamp(MIN_ANIM_HOLD, MAX_ANIM_HOLD);
+            let delay = Delay::from_numer_denom_ms(1000 * hold, fps);
             let frame = Frame::from_parts(img, 0, 0, delay);
             enc.encode_frame(frame).map_err(|e| e.to_string())?;
         }
@@ -541,7 +542,7 @@ mod tests {
         paint_layer(&mut doc, 1, [0, 255, 0]);
         doc.add_layer("F3".to_string());
         paint_layer(&mut doc, 2, [0, 0, 255]);
-        let bytes = export_gif_ext(&doc, 12, LoopMode::PingPong, 1).unwrap();
+        let bytes = export_gif_ext(&doc, 12, LoopMode::PingPong).unwrap();
         let dec = GifDecoder::new(std::io::Cursor::new(&bytes[..])).unwrap();
         let frames: Vec<_> = dec.into_frames().collect::<Result<_, _>>().unwrap();
         // 0, 1, 2, 1: endpoints never duplicate.
@@ -551,18 +552,38 @@ mod tests {
         assert_eq!(&frames[3].buffer()[(0, 0)].0[0..3], &[0, 255, 0]);
         // Two frames: nothing to reverse, plain pair.
         doc.layers[2].visible = false;
-        let pair = export_gif_ext(&doc, 12, LoopMode::PingPong, 1).unwrap();
+        let pair = export_gif_ext(&doc, 12, LoopMode::PingPong).unwrap();
         let dec = GifDecoder::new(std::io::Cursor::new(&pair[..])).unwrap();
         let pframes: Vec<_> = dec.into_frames().collect::<Result<_, _>>().unwrap();
         assert_eq!(pframes.len(), 2);
         doc.layers[2].visible = true;
-        // Hold validates and still decodes to the same frame count.
-        assert!(export_gif_ext(&doc, 12, LoopMode::Forward, 0).is_err());
-        assert!(export_gif_ext(&doc, 12, LoopMode::Forward, 9).is_err());
-        let held = export_gif_ext(&doc, 12, LoopMode::Forward, 4).unwrap();
-        let dec = GifDecoder::new(std::io::Cursor::new(&held[..])).unwrap();
-        let hframes: Vec<_> = dec.into_frames().collect::<Result<_, _>>().unwrap();
-        assert_eq!(hframes.len(), 3);
+    }
+
+    #[test]
+    fn gif_export_uses_per_frame_holds() {
+        use image::{codecs::gif::GifDecoder, AnimationDecoder};
+        let mut doc = Document::new(16, 16);
+        paint_layer(&mut doc, 0, [255, 0, 0]);
+        doc.add_layer("F2".to_string());
+        paint_layer(&mut doc, 1, [0, 255, 0]);
+        doc.layers[0].hold = 1;
+        doc.layers[1].hold = 4;
+        // 10 fps keeps every delay on a centisecond boundary (100/400 ms).
+        let bytes = export_gif_ext(&doc, 10, LoopMode::Forward).unwrap();
+        let dec = GifDecoder::new(std::io::Cursor::new(&bytes[..])).unwrap();
+        let frames: Vec<_> = dec.into_frames().collect::<Result<_, _>>().unwrap();
+        assert_eq!(frames.len(), 2);
+        let ms = |f: &image::Frame| {
+            let (n, d) = f.delay().numer_denom_ms();
+            (n as f32 / d as f32).round() as u32
+        };
+        assert_eq!(ms(&frames[0]), 100);
+        assert_eq!(ms(&frames[1]), 400);
+        // Holds ride the GIF round trip back into per-frame holds.
+        let (back, fps) = import_gif_document(&bytes).unwrap();
+        assert_eq!(fps, 10);
+        assert_eq!(back.layers[0].hold, 1);
+        assert_eq!(back.layers[1].hold, 4);
     }
 
     fn three_layers() -> Document {

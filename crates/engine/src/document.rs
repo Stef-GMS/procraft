@@ -227,6 +227,10 @@ pub struct Layer {
     /// it. Saved to v6 project files (older versions read 0).
     pub ox: i32,
     pub oy: i32,
+    /// Frame hold in animation ticks (M32): how many `1/fps` steps this
+    /// frame shows during playback and GIF export. Saved to v10 project
+    /// files (older files read 1); clamped to 1..=8 at every use.
+    pub hold: u32,
     /// Owning layer group (id into [`Document::groups`); `None` lives at
     /// the top level. Saved to v8 project files (older versions read none).
     pub group: Option<u32>,
@@ -262,6 +266,7 @@ impl Layer {
             clip: false,
             ox: 0,
             oy: 0,
+            hold: 1,
             group: None,
         }
     }
@@ -1969,13 +1974,13 @@ impl Document {
 
     /// Save the full project (layers, opacity, blend, background, symmetry)
     /// to a `.procraft` file: magic + little-endian records, zlib-compressed
-    /// pixels. Version 9 adds group opacity (v1-v8 files still open, with
-    /// groups at full opacity; old app versions cleanly refuse v9 files at
-    /// the magic).
+    /// pixels. Version 10 adds per-layer frame holds (v1-v9 files still open,
+    /// with every frame held once; old app versions cleanly refuse v10 files
+    /// at the magic).
     pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        f.write_all(b"PCRAFT09").map_err(|e| e.to_string())?;
+        f.write_all(b"PCRAFT10").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes())
             .map_err(|e| e.to_string())?;
         f.write_all(&self.h.to_le_bytes())
@@ -2101,6 +2106,10 @@ impl Document {
                     f.write_all(&[0u8]).map_err(|e| e.to_string())?;
                 }
             }
+            // v10 stores the animation frame hold (ticks); older layer
+            // records end at the mask.
+            f.write_all(&layer.hold.to_le_bytes())
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -2121,7 +2130,8 @@ impl Document {
             Ok(head)
         };
         let magic = take(8)?.to_vec();
-        let v9 = magic == b"PCRAFT09";
+        let v10 = magic == b"PCRAFT10";
+        let v9 = v10 || magic == b"PCRAFT09";
         let v8 = v9 || magic == b"PCRAFT08";
         let v7 = v8 || magic == b"PCRAFT07";
         let v6 = v7 || magic == b"PCRAFT06";
@@ -2408,6 +2418,18 @@ impl Document {
             // can never orphan a layer.
             let known = groups.iter().map(|g| g.id).collect::<Vec<_>>();
             let group = group.filter(|id| known.contains(id));
+            // v10 appends the animation frame hold after the mask; older
+            // files hold every frame once. Absurd values clamp into range.
+            let hold = if v10 {
+                u32::from_le_bytes(
+                    take(4)?[..4]
+                        .try_into()
+                        .map_err(|_| "bad frame hold".to_string())?,
+                )
+                .clamp(crate::MIN_ANIM_HOLD, crate::MAX_ANIM_HOLD)
+            } else {
+                1
+            };
             layers.push(Layer {
                 name,
                 visible,
@@ -2418,6 +2440,7 @@ impl Document {
                 clip,
                 ox,
                 oy,
+                hold,
                 group,
             });
         }
@@ -2589,7 +2612,7 @@ mod tests {
         let path = dir.join("procraft-v8.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT09");
+        assert_eq!(&head[..8], b"PCRAFT10");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.groups.len(), 1);
@@ -2640,7 +2663,7 @@ mod tests {
         let path = dir.join("procraft-v9.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT09");
+        assert_eq!(&head[..8], b"PCRAFT10");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.groups.len(), 1);
@@ -2695,6 +2718,72 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.groups.len(), 1);
         assert_eq!(back.groups[0].opacity, 1.0);
+        assert_eq!(back.layers[0].group, Some(7));
+    }
+
+    #[test]
+    fn v10_roundtrip_keeps_frame_holds() {
+        let mut doc = Document::new(2, 1);
+        doc.add_layer("F2".to_string());
+        doc.layers[0].hold = 3;
+        doc.layers[1].hold = 8;
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v10.pcraft");
+        doc.save_project(&path).unwrap();
+        let head = std::fs::read(&path).unwrap();
+        assert_eq!(&head[..8], b"PCRAFT10");
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.layers[0].hold, 3);
+        assert_eq!(back.layers[1].hold, 8);
+    }
+
+    #[test]
+    fn v9_files_open_with_unit_holds() {
+        // Hand-build a minimal version-9 file (group opacity present, no
+        // layer hold tails).
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v9-compat.pcraft");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT09");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // Symmetry off.
+        buf.extend_from_slice(&[6]);
+        buf.extend_from_slice(&[0]); // No mirror center.
+        buf.extend_from_slice(&1u32.to_le_bytes()); // One group.
+        buf.extend_from_slice(&7u32.to_le_bytes()); // id
+        buf.extend_from_slice(&[0]); // No parent.
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"G");
+        buf.extend_from_slice(&[1]); // Visible.
+        buf.extend_from_slice(&[0]); // Expanded.
+        buf.extend_from_slice(&0.5f32.to_le_bytes()); // Group opacity.
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // Blend: Normal.
+        buf.extend_from_slice(&[0]); // Clip: off.
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&[1]); // In group 7.
+        buf.extend_from_slice(&7u32.to_le_bytes());
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&[9u8; 2 * 4]).unwrap();
+        let packed = enc.finish().unwrap();
+        buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&packed);
+        buf.extend_from_slice(&[0]); // No mask.
+        std::fs::write(&path, &buf).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.layers[0].hold, 1);
+        assert_eq!(back.groups[0].opacity, 0.5);
         assert_eq!(back.layers[0].group, Some(7));
     }
 
@@ -3000,7 +3089,7 @@ mod tests {
         let path = dir.join("procraft-v6.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT09");
+        assert_eq!(&head[..8], b"PCRAFT10");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].blend, BlendMode::Difference);
@@ -3723,7 +3812,7 @@ mod tests {
             meta.len()
         );
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT09");
+        assert_eq!(&head[..8], b"PCRAFT10");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].pixels, doc.layers[0].pixels);

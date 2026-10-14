@@ -469,6 +469,7 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
             clip: false,
             ox: 0,
             oy: 0,
+            hold: 1,
             group: None,
         });
     } else {
@@ -498,6 +499,7 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
                 clip: !pl.is_clipping_mask(),
                 ox: 0,
                 oy: 0,
+                hold: 1,
                 group: None,
             });
             if layers.len() >= 256 {

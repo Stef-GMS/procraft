@@ -306,17 +306,18 @@ struct ProCraftApp {
     anim_playing: bool,
     anim_fps: u32,
     anim_loop: LoopMode,
-    anim_hold: u32,
     /// JPEG export quality 1-100 (M28 slider; TIFF is lossless, no dial).
     jpeg_quality: u8,
     anim_fwd: bool,
     anim_last_t: f64,
     anim_shown: Option<usize>,
     onion: bool,
-    onion_amount: f32,
+    /// Onion ghost strengths per side (red = previous, blue = next).
+    onion_prev: f32,
+    onion_next: f32,
     ghost_prev: Option<TextureHandle>,
     ghost_next: Option<TextureHandle>,
-    ghost_key: (Option<usize>, Option<usize>, u32),
+    ghost_key: (Option<usize>, Option<usize>, u32, u32),
     ghost_dirty: bool,
     move_from: Option<(f32, f32)>,
     move_acc: (f32, f32),
@@ -438,16 +439,16 @@ impl ProCraftApp {
             anim_playing: false,
             anim_fps: 12,
             anim_loop: LoopMode::Forward,
-            anim_hold: 1,
             jpeg_quality: 90,
             anim_fwd: true,
             anim_last_t: 0.0,
             anim_shown: None,
             onion: true,
-            onion_amount: 0.3,
+            onion_prev: 0.3,
+            onion_next: 0.3,
             ghost_prev: None,
             ghost_next: None,
-            ghost_key: (None, None, 0),
+            ghost_key: (None, None, 0, 0),
             ghost_dirty: true,
             move_from: None,
             move_acc: (0.0, 0.0),
@@ -614,18 +615,20 @@ impl ProCraftApp {
     }
 
     /// Rebuild half-res onion ghost textures when the neighbor pair, the
-    /// amount, or layer content (`ghost_dirty`) changed. No-op otherwise.
+    /// per-side strengths, or layer content (`ghost_dirty`) changed.
+    /// No-op otherwise.
     fn refresh_ghosts(&mut self, ctx: &egui::Context) {
         let active = clamp_frame(&self.doc, self.doc.active).unwrap_or(0);
-        let bits = (self.onion_amount.clamp(0.05, 0.8) * 1000.0).round() as u32;
+        let bits = |v: f32| (v.clamp(0.05, 0.8) * 1000.0).round() as u32;
         let pair = if self.anim_assist && self.onion && !self.doc.layers.is_empty() {
             (
                 prev_frame(&self.doc, active),
                 next_frame(&self.doc, active),
-                bits,
+                bits(self.onion_prev),
+                bits(self.onion_next),
             )
         } else {
-            (None, None, bits)
+            (None, None, bits(self.onion_prev), bits(self.onion_next))
         };
         if !self.ghost_dirty && pair == self.ghost_key {
             return;
@@ -633,13 +636,16 @@ impl ProCraftApp {
         self.ghost_dirty = false;
         self.ghost_key = pair;
         let (w, h) = (self.doc.w as usize, self.doc.h as usize);
-        let amount = self.onion_amount;
-        let load = |ctx: &egui::Context, name: &str, idx: Option<usize>| -> Option<TextureHandle> {
+        let load = |ctx: &egui::Context,
+                    name: &str,
+                    idx: Option<usize>,
+                    amount: f32|
+         -> Option<TextureHandle> {
             let full = onion_ghost(&self.doc, idx?, amount);
             Some(ctx.load_texture(name, downsample_half(&full, w, h), TextureOptions::LINEAR))
         };
-        self.ghost_prev = load(ctx, "ghost-prev", pair.0);
-        self.ghost_next = load(ctx, "ghost-next", pair.1);
+        self.ghost_prev = load(ctx, "ghost-prev", pair.0, self.onion_prev);
+        self.ghost_next = load(ctx, "ghost-next", pair.1, self.onion_next);
     }
 
     fn set_page_color(&mut self, rgb: [u8; 3]) {
@@ -1443,11 +1449,18 @@ impl eframe::App for ProCraftApp {
             ui.ctx().request_repaint();
         }
         // Animation playback: advance the current frame on an fps clock.
+        // Each frame holds for its own tick count (per-frame hold).
         if self.anim_assist && self.anim_playing && !self.doc.layers.is_empty() {
             ui.ctx().request_repaint();
             let now = ui.ctx().input(|i| i.time);
             let fps = self.anim_fps.clamp(MIN_ANIM_FPS, MAX_ANIM_FPS);
-            let hold = self.anim_hold.clamp(MIN_ANIM_HOLD, MAX_ANIM_HOLD);
+            let hold = self
+                .doc
+                .layers
+                .get(self.doc.active)
+                .map(|l| l.hold)
+                .unwrap_or(MIN_ANIM_HOLD)
+                .clamp(MIN_ANIM_HOLD, MAX_ANIM_HOLD);
             if now - self.anim_last_t >= hold as f64 / fps as f64 {
                 self.anim_last_t = now;
                 // Visible frames only, so playback matches the GIF export.
@@ -2954,6 +2967,12 @@ impl eframe::App for ProCraftApp {
                         self.doc.active = (self.doc.active + 1) % n;
                         self.doc.mark_full_dirty();
                     }
+                    if ui.button("Duplicate frame").clicked() {
+                        let active = self.doc.active;
+                        self.doc.duplicate_layer(active);
+                        self.ghost_dirty = true;
+                        self.status = format!("Frame {} duplicated.", self.doc.active + 1);
+                    }
                 });
                 stepped_slider(ui, &mut self.anim_fps, MIN_ANIM_FPS..=MAX_ANIM_FPS, 1.0, "FPS");
                 ui.horizontal(|ui| {
@@ -2962,14 +2981,28 @@ impl eframe::App for ProCraftApp {
                         ui.radio_value(&mut self.anim_loop, m, m.name());
                     }
                 });
-                stepped_slider(ui, &mut self.anim_hold, MIN_ANIM_HOLD..=MAX_ANIM_HOLD, 1.0, "Hold");
+                // Per-frame hold: the stepper edits the current frame only.
+                let mut hold = self
+                    .doc
+                    .layers
+                    .get(self.doc.active)
+                    .map(|l| l.hold)
+                    .unwrap_or(MIN_ANIM_HOLD)
+                    .clamp(MIN_ANIM_HOLD, MAX_ANIM_HOLD);
+                stepped_slider(ui, &mut hold, MIN_ANIM_HOLD..=MAX_ANIM_HOLD, 1.0, "Frame hold");
+                if let Some(layer) = self.doc.layers.get_mut(self.doc.active) {
+                    if layer.hold != hold {
+                        layer.hold = hold;
+                    }
+                }
                 if ui.checkbox(&mut self.onion, "Onion skin").changed() {
                     self.ghost_dirty = true;
                 }
                 if self.onion {
-                    let before = self.onion_amount;
-                    stepped_slider(ui, &mut self.onion_amount, 0.05..=0.8, 0.05, "Amount");
-                    if self.onion_amount != before {
+                    let before = (self.onion_prev, self.onion_next);
+                    stepped_slider(ui, &mut self.onion_prev, 0.05..=0.8, 0.05, "Prev ghost");
+                    stepped_slider(ui, &mut self.onion_next, 0.05..=0.8, 0.05, "Next ghost");
+                    if (self.onion_prev, self.onion_next) != before {
                         self.ghost_dirty = true;
                     }
                 }
@@ -2977,7 +3010,7 @@ impl eframe::App for ProCraftApp {
                     if let Some(path) = rfd::FileDialog::new().add_filter("GIF image", &["gif"]).save_file()
                     {
                         let path = ensure_extension(path, "gif");
-                        match export_gif_ext(&self.doc, self.anim_fps, self.anim_loop, self.anim_hold) {
+                        match export_gif_ext(&self.doc, self.anim_fps, self.anim_loop) {
                             Ok(bytes) => match std::fs::write(&path, &bytes) {
                                 Ok(()) => {
                                     let shown =
@@ -2988,13 +3021,15 @@ impl eframe::App for ProCraftApp {
                                     } else {
                                         shown
                                     };
-                                    let extra = match (self.anim_loop, self.anim_hold) {
-                                        (LoopMode::PingPong, 1) => ", ping-pong".to_string(),
-                                        (LoopMode::Forward, h) if h > 1 => format!(", hold ×{h}"),
-                                        (LoopMode::PingPong, h) => {
-                                            format!(", ping-pong, hold ×{h}")
+                                    let held =
+                                        self.doc.layers.iter().filter(|l| l.hold > 1).count();
+                                    let extra = match (self.anim_loop, held) {
+                                        (LoopMode::PingPong, 0) => ", ping-pong".to_string(),
+                                        (LoopMode::PingPong, _) => {
+                                            format!(", ping-pong, {held} held")
                                         }
-                                        _ => String::new(),
+                                        (LoopMode::Forward, 0) => String::new(),
+                                        (LoopMode::Forward, _) => format!(", {held} held"),
                                     };
                                     self.status = format!(
                                         "GIF saved {} ({} frames, hidden skipped{extra}).",

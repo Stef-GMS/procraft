@@ -16,9 +16,9 @@ people touch daily. Ranked by user-visible value per effort.
 
 ## Batch 5: M43–M47 (transform depth → hardening → picker → Pencil)
 
-- [ ] **M43 — Distort (corner-pin).** Quad remap on layer, bilinear,
+- [x] **M43 — Distort (corner-pin).** Quad remap on layer, bilinear,
   identity is a no-op; masks travel.
-- [ ] **M44 — Warp mesh.** Movable lattice over the layer (distort's
+- [x] **M44 — Warp mesh.** Movable lattice over the layer (distort's
   freeform sibling).
 - [ ] **M45 — Stability hardening.** Fuzz project open, OOM guards on
   import.

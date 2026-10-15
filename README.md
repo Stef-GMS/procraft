@@ -11,6 +11,21 @@ original.
 > Interactive. ProCraft is an independent project with its own name, branding
 > and code, and is not affiliated with or endorsed by any other vendor.
 
+## Get ProCraft
+
+Signed builds for all three targets on the [releases page](https://github.com/surfrpt1/procraft/releases/latest):
+
+| Platform | File | Install |
+|---|---|---|
+| Windows 10/11 (x64) | `procraft-vX.Y.Z-windows-x64.zip` | Unzip, run `procraft.exe` |
+| iPhone / iPad (iOS 17+) | `ProCraft-ios-vX.Y.Z.ipa` | Sideload (Sideloadly / AltStore; free accounts re-sign weekly) |
+| Android 10+ (ARM64 + x86_64) | `ProCraft-android-vX.Y.Z.apk` | Allow unknown apps once, tap to install |
+
+Android files live in the app's external folder
+(`Android/data/com.surfrpt1.procraft/files`, reachable over USB): the
+in-app Import browser reads it, and saves land there, then appear in
+Photos after a media scan.
+
 ## Status: milestone 32
 
 - [x] Layered document model (add / hide / reorder / opacity / blend)
@@ -45,6 +60,8 @@ original.
 - [x] JPEG export with quality slider + lossless TIFF export; drag-crop rect + pad/trim canvas resize with anchor (offsets carry content)
 - [x] Pick tool with magnifier loupe ring (Alt-pick too), palette-from-image and palette-from-canvas import
 - [x] Animation frame UI: duplicate frame, per-frame hold (playback + GIF round-trip timing), onion strength per side
+- [x] Adaptive top bar: all groups flow inline and fold to 2+ lines on narrow displays (phone portrait, small windows) instead of overlapping
+- [x] Native Android build (NativeActivity + wgpu, cargo-apk sideload APK, ARM64 + x86_64 universal, release-signed): touch paint, adaptive bar, in-app Import browser over USB (`Android/data/...`), external saves with media scan
 
 ## Icon
 
@@ -62,10 +79,23 @@ cd procraft
 cargo run --release -p procraft
 ```
 
+### Mobile
+
+- iOS: `rustup target add aarch64-apple-ios && cargo check -p procraft --target aarch64-apple-ios`
+  (test IPAs are cut by the `ios-ipa` CI workflow).
+- Android: install the Android NDK, `cargo install cargo-apk`, then
+  `cargo apk build -p procraft --lib` (the `android-apk` CI workflow builds,
+  signs and uploads test APKs; the `release` profile needs the private
+  release keystore, maintainer-only).
+
 ## Layout
 
 - `crates/engine` — document, layers, brush dabs, undo, PNG I/O (no GUI).
-- `apps/procraft` — egui desktop app.
+- `apps/procraft` — egui app (Windows/macOS/Linux desktop, iOS, Android;
+  the app lives in `src/lib.rs`, with a thin `src/main.rs` desktop entry
+  and `android_main` for NativeActivity).
+- `crates/rfd-shim` — file-dialog shim for mobile (iOS document-picker
+  bridge, Android external-files + media scan).
 
 ## License
 

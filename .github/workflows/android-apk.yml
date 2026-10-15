@@ -33,7 +33,7 @@ jobs:
       - name: Verify + stage APK
         run: |
           set -euxo pipefail
-          APK=$(find target -name '*.apk' | head -n 1)
+          APK=$(find target -name '*.apk' ! -name '*unaligned*' | head -n 1)
           test -n "$APK"
           BT="$ANDROID_HOME/build-tools/35.0.0"
           "$BT/aapt" dump badging "$APK" | head -n 8

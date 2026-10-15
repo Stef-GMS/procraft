@@ -23,7 +23,7 @@ jobs:
       - name: Install cargo-apk
         run: cargo install cargo-apk
       - name: Build unsigned APK (debug)
-        run: cargo apk build -p procraft
+        run: cargo apk build -p procraft --lib
         env:
           ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/27.0.12077973
       - name: Verify + stage APK

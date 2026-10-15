@@ -2991,6 +2991,7 @@ dependencies = [
 name = "procraft"
 version = "0.8.0"
 dependencies = [
+ "android-activity",
  "eframe",
  "egui",
  "image",

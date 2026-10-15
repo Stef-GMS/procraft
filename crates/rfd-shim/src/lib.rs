@@ -1,6 +1,7 @@
 //! ProCraft file dialogs with the `rfd` 0.17 call shape the app uses.
 //!
 //! - Desktop: this crate is not compiled (real `rfd` is used instead).
+//! - Android: declining shape only, until the Storage Access bridge lands.
 //! - iOS: `rfd` has no backend, so this crate backs the same calls with a
 //!   `UIDocumentPickerViewController` bridge. Opens use Import mode (single
 //!   tap picks; the system copies into the sandbox, so no access claims are
@@ -10,7 +11,9 @@
 //!   UI). Saves resolve into the sandboxed Documents folder and the app
 //!   presents the share sheet afterwards for the real destination.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(target_os = "ios")]
+use std::path::Path;
 
 /// Builder matching the `rfd::FileDialog` calls in `apps/procraft`.
 #[derive(Clone, Debug, Default)]
@@ -97,6 +100,7 @@ pub fn ios_share_file(path: &Path) -> bool {
 }
 
 /// Timestamped stem so saves never silently overwrite.
+#[cfg(target_os = "ios")]
 fn unique_stem() -> String {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

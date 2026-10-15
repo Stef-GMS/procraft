@@ -24,6 +24,10 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Build app
         run: cargo build -p procraft
+      - name: Check Android target (no NDK link needed)
+        run: |
+          rustup target add aarch64-linux-android
+          cargo check -p procraft --target aarch64-linux-android
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

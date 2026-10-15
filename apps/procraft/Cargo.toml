@@ -7,7 +7,7 @@ authors.workspace = true
 description = "ProCraft painting studio (egui desktop app)"
 
 [lib]
-name = "procraft"
+name = "procraft_app"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 

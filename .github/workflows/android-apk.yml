@@ -1,6 +1,12 @@
 name: android-apk
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "debug = test build (debug-signed); release = versioned (release keystore)"
+        type: choice
+        default: debug
+        options: [debug, release]
 jobs:
   build-apk:
     runs-on: ubuntu-latest
@@ -9,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android, x86_64-linux-android
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -22,14 +28,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-apk
         run: cargo install cargo-apk
-      - name: Build test APK (debug, stripped)
-        run: cargo apk build -p procraft --lib
+      - name: Restore release keystore
+        if: inputs.profile == 'release'
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_B64 }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > /tmp/procraft-release.keystore
+          ls -la /tmp/procraft-release.keystore
+      - name: Build APK
+        run: cargo apk build ${{ inputs.profile == 'release' && '--release' || '' }} -p procraft --lib
         env:
           ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/27.0.12077973
           # Debug .so carries full debuginfo (~300MB APK); strip symbols for
-          # a sideloadable test build. Release signing (real keystore) waits
-          # for the next versioned release.
-          RUSTFLAGS: -C strip=symbols
+          # a sideloadable test build. Release profile strips via Cargo.
+          RUSTFLAGS: ${{ inputs.profile == 'release' && '' || '-C strip=symbols' }}
+          CARGO_APK_RELEASE_KEYSTORE: /tmp/procraft-release.keystore
+          CARGO_APK_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
       - name: Verify + stage APK
         run: |
           set -euxo pipefail
@@ -38,9 +52,11 @@ jobs:
           BT="$ANDROID_HOME/build-tools/35.0.0"
           "$BT/aapt" dump badging "$APK" | head -n 8
           "$BT/apksigner" verify --print-certs "$APK" | head -n 4
-          cp "$APK" ProCraft-android-v1.apk
-          ls -la ProCraft-android-v1.apk
+          VER=$(grep '^version' Cargo.toml | head -n 1 | cut -d'"' -f2)
+          if [ "${{ inputs.profile }}" = "release" ]; then OUT="ProCraft-android-v$VER.apk"; else OUT="ProCraft-android-v1.apk"; fi
+          cp "$APK" "$OUT"
+          ls -la "$OUT"
       - uses: actions/upload-artifact@v4
         with:
-          name: ProCraft-android-v1.apk
-          path: ProCraft-android-v1.apk
+          name: android-apk
+          path: ProCraft-android-*.apk

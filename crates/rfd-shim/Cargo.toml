@@ -6,6 +6,10 @@ license = "MIT"
 authors = ["surfrpt1"]
 description = "ProCraft file dialogs: real rfd call shape everywhere; on iOS a UIDocumentPicker bridge (Import mode) plus Documents-based save with share sheet"
 
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22"
+ndk-context = "0.1"
+
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [

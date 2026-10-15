@@ -21,6 +21,53 @@ use procraft_engine::{
 #[cfg(any(target_os = "ios", target_os = "android"))]
 use rfd_shim as rfd;
 
+/// Android: accepted extensions per open kind (mirrors the desktop filters).
+#[cfg(target_os = "android")]
+fn pending_open_exts(kind: PendingOpen) -> &'static [&'static str] {
+    match kind {
+        PendingOpen::Image | PendingOpen::Reference | PendingOpen::ImagePalette => {
+            &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"]
+        }
+        PendingOpen::Project => &["procraft"],
+        PendingOpen::Psd => &["psd"],
+        PendingOpen::Font => &["ttf", "otf"],
+        PendingOpen::Brushes => &[
+            "pcbrush", "json", "abr", "brush", "brushset", "kpp", "bundle", "gbr", "png", "jpg",
+            "jpeg", "webp", "bmp",
+        ],
+        PendingOpen::Palette => &["pcpalette", "json", "gpl"],
+        PendingOpen::DualTip => &["pcbrush", "json", "abr", "brushset"],
+        PendingOpen::Gif => &["gif"],
+    }
+}
+
+/// Android: importables for `kind` plus a note when the dir is unreadable.
+/// Returns `(files, note)`: `note` is `Some` only when listing failed.
+#[cfg(target_os = "android")]
+fn android_import_list(kind: PendingOpen) -> (Vec<std::path::PathBuf>, Option<String>) {
+    let exts = pending_open_exts(kind);
+    let dir = match rfd::android_external_files() {
+        Ok(d) => d,
+        Err(reason) => return (Vec::new(), Some(format!("Files unavailable: {reason}."))),
+    };
+    let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
+                            .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    (out, None)
+}
+
 /// Latest Apple Pencil / touch pressure (0.0..=1.0) seen in this frame's
 /// input events, if the backend forwarded any. egui 0.36 exposes pressure
 /// only on `Event::Touch.force` — desktop mice always yield `None`, and
@@ -239,8 +286,9 @@ enum Theme {
     Paper,
 }
 
-/// iOS asynchronous open: what to load once the picker resolves.
-#[cfg(target_os = "ios")]
+/// Mobile open: what to load once the picker resolves (iOS document
+/// picker) or the in-app browser picks (Android external files).
+#[cfg(any(target_os = "ios", target_os = "android"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PendingOpen {
     Image,
@@ -430,6 +478,9 @@ struct ProCraftApp {
     show_about: bool,
     #[cfg(target_os = "ios")]
     pending_open: Option<PendingOpen>,
+    /// Android in-app browser request (external files; no system picker).
+    #[cfg(target_os = "android")]
+    android_browse: Option<PendingOpen>,
     preview_theme: Option<Theme>,
     custom_brushes: Vec<BrushPreset>,
     new_brush_name: String,
@@ -622,6 +673,8 @@ impl ProCraftApp {
             show_about: false,
             #[cfg(target_os = "ios")]
             pending_open: None,
+            #[cfg(target_os = "android")]
+            android_browse: None,
             preview_theme: None,
             custom_brushes: Vec::new(),
             new_brush_name: String::new(),
@@ -891,9 +944,9 @@ impl ProCraftApp {
         self.doc.mark_full_dirty();
     }
 
-    /// iOS: load a file the document picker resolved. Mirrors the desktop
-    /// open arms (kept inline there so desktop behavior never changes).
-    #[cfg(target_os = "ios")]
+    /// Mobile: load a resolved file. Mirrors the desktop open arms (kept
+    /// inline there so desktop behavior never changes).
+    #[cfg(any(target_os = "ios", target_os = "android"))]
     fn open_picked(&mut self, kind: PendingOpen, path: std::path::PathBuf) {
         match kind {
             PendingOpen::Image => match self.doc.load_background(&path) {
@@ -2097,6 +2150,48 @@ impl eframe::App for ProCraftApp {
             }
         }
 
+        // Android file browser: external files dir (USB/`adb push` drop
+        // point), filtered by the requested kind. Synchronous UI — there is
+        // no system picker on NativeActivity. Picks reuse `open_picked`.
+        #[cfg(target_os = "android")]
+        if let Some(kind) = self.android_browse {
+            let mut picked: Option<std::path::PathBuf> = None;
+            let mut cancelled = false;
+            let (files, dir_note) = android_import_list(kind);
+            egui::Window::new("Import file")
+                .collapsible(false)
+                .resizable(true)
+                .min_width(280.0)
+                .show(ui.ctx(), |ui| {
+                    ui.label("USB drop point: Android/data/com.surfrpt1.procraft/files");
+                    if let Some(note) = dir_note {
+                        ui.label(note);
+                    } else if files.is_empty() {
+                        ui.label("No matching files yet — copy some over USB first.");
+                    }
+                    for path in &files {
+                        let name = path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        if ui.button(&name).clicked() {
+                            picked = Some(path.clone());
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            if let Some(path) = picked {
+                self.android_browse = None;
+                self.open_picked(kind, path);
+                ui.ctx().request_repaint();
+            } else if cancelled {
+                self.android_browse = None;
+                self.status = "Import cancelled.".to_string();
+            }
+        }
+
         // Top bar: browsers, File menu, direct edit buttons, zoom, fit,
         // rotate, then theme + About. All groups flow inline inside one
         // horizontal_wrapped so the bar folds to 2+ lines on narrow
@@ -2111,10 +2206,6 @@ impl eframe::App for ProCraftApp {
                     self.ref_open = !self.ref_open;
                 }
                 ui.menu_button("File", |ui| {
-                    if cfg!(target_os = "android") {
-                        ui.label("Files on Android: picker coming — paint + tools work, saving out not yet.");
-                        ui.separator();
-                    }
                     if ui.button("Save PNG").clicked() {
                         ui.close();
                         if let Some(path) = rfd::FileDialog::new()
@@ -2129,6 +2220,8 @@ impl eframe::App for ProCraftApp {
                                     self.status = format!("Saved {}", path.display());
                                     #[cfg(target_os = "ios")]
                                     rfd::ios_share_file(&path);
+                                    #[cfg(target_os = "android")]
+                                    rfd::android_scan_file(&path);
                                 }
                                 Err(e) => self.status = format!("Save failed: {e}"),
                             }
@@ -2151,6 +2244,8 @@ impl eframe::App for ProCraftApp {
                                     );
                                     #[cfg(target_os = "ios")]
                                     rfd::ios_share_file(&path);
+                                    #[cfg(target_os = "android")]
+                                    rfd::android_scan_file(&path);
                                 }
                                 Err(e) => self.status = format!("Save failed: {e}"),
                             }
@@ -2168,6 +2263,8 @@ impl eframe::App for ProCraftApp {
                                     self.status = format!("Saved {}", path.display());
                                     #[cfg(target_os = "ios")]
                                     rfd::ios_share_file(&path);
+                                    #[cfg(target_os = "android")]
+                                    rfd::android_scan_file(&path);
                                 }
                                 Err(e) => self.status = format!("Save failed: {e}"),
                             }
@@ -2205,6 +2302,10 @@ impl eframe::App for ProCraftApp {
                             self.pending_open = Some(PendingOpen::Image);
                             self.status = "Pick an image…".to_string();
                         }
+                        #[cfg(target_os = "android")]
+                        {
+                            self.android_browse = Some(PendingOpen::Image);
+                        }
                     }
                     ui.separator();
                     if ui.button("Save project").clicked() {
@@ -2223,6 +2324,8 @@ impl eframe::App for ProCraftApp {
                                     self.clear_recovery();
                                     #[cfg(target_os = "ios")]
                                     rfd::ios_share_file(&path);
+                                    #[cfg(target_os = "android")]
+                                    rfd::android_scan_file(&path);
                                 }
                                 Err(e) => self.status = format!("Project save failed: {e}"),
                             }
@@ -2251,6 +2354,10 @@ impl eframe::App for ProCraftApp {
                             self.pending_open = Some(PendingOpen::Project);
                             self.status = "Pick a project…".to_string();
                         }
+                        #[cfg(target_os = "android")]
+                        {
+                            self.android_browse = Some(PendingOpen::Project);
+                        }
                     }
                     ui.separator();
                     if ui.button("PSD export").clicked() {
@@ -2268,6 +2375,8 @@ impl eframe::App for ProCraftApp {
                                     );
                                     #[cfg(target_os = "ios")]
                                     rfd::ios_share_file(&path);
+                                    #[cfg(target_os = "android")]
+                                    rfd::android_scan_file(&path);
                                 }
                                 Err(e) => self.status = format!("PSD save failed: {e}"),
                             }
@@ -2302,6 +2411,10 @@ impl eframe::App for ProCraftApp {
                                 .pick_file();
                             self.pending_open = Some(PendingOpen::Psd);
                             self.status = "Pick a PSD…".to_string();
+                        }
+                        #[cfg(target_os = "android")]
+                        {
+                            self.android_browse = Some(PendingOpen::Psd);
                         }
                     }
                 });
@@ -2379,11 +2492,6 @@ impl eframe::App for ProCraftApp {
                 .collapsible(false)
                 .min_width(280.0)
                 .show(ui.ctx(), |ui| {
-                    if cfg!(target_os = "android") {
-                        ui.label(
-                            "Files on Android: picker coming — new canvases + paint fully work.",
-                        );
-                    }
                     ui.horizontal_wrapped(|ui| {
                         ui.add(
                             egui::DragValue::new(&mut self.gallery_new_w)
@@ -2498,6 +2606,10 @@ impl eframe::App for ProCraftApp {
                     self.pending_open = Some(PendingOpen::Project);
                     self.status = "Pick a project…".to_string();
                 }
+                #[cfg(target_os = "android")]
+                {
+                    self.android_browse = Some(PendingOpen::Project);
+                }
             }
             if let Some(idx) = open_idx {
                 if let Some(path) = self.recent.get(idx).cloned() {
@@ -2604,6 +2716,10 @@ impl eframe::App for ProCraftApp {
                         .pick_file();
                     self.pending_open = Some(PendingOpen::Reference);
                     self.status = "Pick a reference image…".to_string();
+                }
+                #[cfg(target_os = "android")]
+                {
+                    self.android_browse = Some(PendingOpen::Reference);
                 }
             }
         }
@@ -2743,6 +2859,10 @@ impl eframe::App for ProCraftApp {
                                         .pick_file();
                                     self.pending_open = Some(PendingOpen::Font);
                                     self.status = "Pick a font…".to_string();
+                                }
+                                #[cfg(target_os = "android")]
+                                {
+                                    self.android_browse = Some(PendingOpen::Font);
                                 }
                             }
                             if self.text_font_name.is_some()
@@ -3198,6 +3318,10 @@ impl eframe::App for ProCraftApp {
                         self.pending_open = Some(PendingOpen::Brushes);
                         self.status = "Pick brushes…".to_string();
                     }
+                    #[cfg(target_os = "android")]
+                    {
+                        self.android_browse = Some(PendingOpen::Brushes);
+                    }
                 }
                 if ui.button("Export set").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
@@ -3210,6 +3334,8 @@ impl eframe::App for ProCraftApp {
                                 self.status = format!("Brushes saved {}", path.display());
                                 #[cfg(target_os = "ios")]
                                 rfd::ios_share_file(&path);
+                                #[cfg(target_os = "android")]
+                                rfd::android_scan_file(&path);
                             }
                             Err(e) => self.status = format!("Brush save failed: {e}"),
                         }
@@ -3229,6 +3355,8 @@ impl eframe::App for ProCraftApp {
                                 self.status = format!("Tip saved {}", path.display());
                                 #[cfg(target_os = "ios")]
                                 rfd::ios_share_file(&path);
+                                #[cfg(target_os = "android")]
+                                rfd::android_scan_file(&path);
                             }
                             Err(e) => self.status = format!("Tip save failed: {e}"),
                         }
@@ -3422,6 +3550,10 @@ impl eframe::App for ProCraftApp {
                         self.pending_open = Some(PendingOpen::Palette);
                         self.status = "Pick palette…".to_string();
                     }
+                    #[cfg(target_os = "android")]
+                    {
+                        self.android_browse = Some(PendingOpen::Palette);
+                    }
                 }
                 if ui.button("Export").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
@@ -3438,6 +3570,8 @@ impl eframe::App for ProCraftApp {
                                 self.status = format!("Palette saved {}", path.display());
                                 #[cfg(target_os = "ios")]
                                 rfd::ios_share_file(&path);
+                                #[cfg(target_os = "android")]
+                                rfd::android_scan_file(&path);
                             }
                             Err(e) => self.status = format!("Palette save failed: {e}"),
                         }
@@ -3483,6 +3617,10 @@ impl eframe::App for ProCraftApp {
                             .pick_file();
                         self.pending_open = Some(PendingOpen::ImagePalette);
                         self.status = "Pick an image…".to_string();
+                    }
+                    #[cfg(target_os = "android")]
+                    {
+                        self.android_browse = Some(PendingOpen::ImagePalette);
                     }
                 }
                 if ui.button("From canvas").clicked() {
@@ -3554,6 +3692,10 @@ impl eframe::App for ProCraftApp {
                                 .pick_file();
                             self.pending_open = Some(PendingOpen::DualTip);
                             self.status = "Pick a dual tip…".to_string();
+                        }
+                        #[cfg(target_os = "android")]
+                        {
+                            self.android_browse = Some(PendingOpen::DualTip);
                         }
                     }
                     if self.brush.dual_tip.is_some() && ui.button("Clear").clicked() {
@@ -4147,6 +4289,8 @@ impl eframe::App for ProCraftApp {
                                     );
                                     #[cfg(target_os = "ios")]
                                     rfd::ios_share_file(&path);
+                                    #[cfg(target_os = "android")]
+                                    rfd::android_scan_file(&path);
                                 }
                                 Err(e) => self.status = format!("GIF save failed: {e}"),
                             },
@@ -4182,6 +4326,10 @@ impl eframe::App for ProCraftApp {
                         self.pending_open = Some(PendingOpen::Gif);
                         self.status = "Pick GIF…".to_string();
                     }
+                    #[cfg(target_os = "android")]
+                    {
+                        self.android_browse = Some(PendingOpen::Gif);
+                    }
                 }
                 // M41 Time-lapse: staged snapshots while recording
                 // (session-only, capped small thumbs), exported as GIF.
@@ -4211,6 +4359,8 @@ impl eframe::App for ProCraftApp {
                                             );
                                             #[cfg(target_os = "ios")]
                                             rfd::ios_share_file(&path);
+                                            #[cfg(target_os = "android")]
+                                            rfd::android_scan_file(&path);
                                         }
                                         Err(e) => {
                                             self.status = format!("Time-lapse save failed: {e}")

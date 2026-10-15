@@ -44,7 +44,7 @@ android-activity = "0.6"
 # cargo-apk packaging (sideload APK, same model as the iOS IPA workflow).
 [package.metadata.android]
 package = "com.surfrpt1.procraft"
-build_targets = ["aarch64-linux-android"]
+build_targets = ["aarch64-linux-android", "x86_64-linux-android"]
 
 [package.metadata.android.sdk]
 min_sdk_version = 29

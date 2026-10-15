@@ -2989,7 +2989,7 @@ dependencies = [
 
 [[package]]
 name = "procraft"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "android-activity",
  "eframe",
@@ -3002,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "procraft-engine"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "base64",
  "flate2",
@@ -3329,6 +3329,8 @@ dependencies = [
 name = "rfd-shim"
 version = "0.2.0"
 dependencies = [
+ "jni",
+ "ndk-context",
  "objc2 0.6.5",
  "objc2-foundation 0.3.2",
  "objc2-ui-kit 0.3.2",

@@ -12,7 +12,7 @@
 //!   presents the share sheet afterwards for the real destination.
 
 use std::path::PathBuf;
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 use std::path::Path;
 
 /// Builder matching the `rfd::FileDialog` calls in `apps/procraft`.
@@ -50,15 +50,28 @@ impl FileDialog {
     }
 
     /// Save dialog. No native panel: resolves to a uniquified path in the
-    /// sandboxed Documents folder. The app writes the bytes itself and then
-    /// calls [`ios_share_file`] for the real destination.
+    /// sandboxed Documents folder (iOS) or the external files dir with the
+    /// first filter as extension (Android, so the media scan categorizes it).
+    /// The app writes the bytes itself and then calls [`ios_share_file`] /
+    /// [`android_scan_file`] for the real destination.
     pub fn save_file(self) -> Option<PathBuf> {
         #[cfg(target_os = "ios")]
         {
             ios_bridge::documents_path(&unique_stem())
         }
-        #[cfg(not(target_os = "ios"))]
+        #[cfg(target_os = "android")]
         {
+            let dir = android_bridge::external_files_dir().ok()?;
+            let stem = unique_stem();
+            let name = match self.filters.first() {
+                Some(ext) => format!("{stem}.{ext}"),
+                None => stem,
+            };
+            Some(dir.join(name))
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            let _ = &self.filters;
             None
         }
     }
@@ -99,8 +112,23 @@ pub fn ios_share_file(path: &Path) -> bool {
     ios_bridge::share_file(path)
 }
 
+/// External files dir for the in-app browser (call to list importables).
+/// Android only; errors carry the reason for the status line.
+#[cfg(target_os = "android")]
+pub fn android_external_files() -> Result<PathBuf, &'static str> {
+    android_bridge::external_files_dir()
+}
+
+/// Media-scan an already-written file (call right after saving).
+/// Best-effort: false only means "not indexed", the file is still saved.
+/// Android only; the desktop `rfd` has no such function (call sites cfg-gate it).
+#[cfg(target_os = "android")]
+pub fn android_scan_file(path: &Path) -> bool {
+    android_bridge::scan_file(path)
+}
+
 /// Timestamped stem so saves never silently overwrite.
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 fn unique_stem() -> String {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -111,3 +139,5 @@ fn unique_stem() -> String {
 
 #[cfg(target_os = "ios")]
 mod ios_bridge;
+#[cfg(target_os = "android")]
+mod android_bridge;

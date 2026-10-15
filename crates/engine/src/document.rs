@@ -1227,6 +1227,71 @@ impl Document {
         next
     }
 
+    /// Warp mesh (M44): remap the layer through a `cols` x `rows` cell
+    /// lattice, `grid` holding `(cols + 1) * (rows + 1)` source coords in
+    /// row-major order (identity = regular canvas positions, exact
+    /// no-op). Each destination pixel lands in one cell and samples the
+    /// bilinear blend of its four lattice points, so dragging one point
+    /// pulls paint locally — distort's freeform sibling. Same canvas-space
+    /// conventions as `distort_layer`: offsets untouched, masks travel.
+    /// Caller checkpoints for undo first.
+    pub fn warp_layer(&mut self, index: usize, cols: u32, rows: u32, grid: &[(f32, f32)]) {
+        if index >= self.layers.len() || cols < 1 || rows < 1 {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
+        if w < 2 || h < 2 {
+            return;
+        }
+        if grid.len() != ((cols + 1) * (rows + 1)) as usize {
+            return;
+        }
+        let src = self.layers[index].pixels.clone();
+        self.layers[index].pixels = Self::warp_buffer(&src, w, h, cols, rows, grid);
+        if let Some(m) = self.layers[index].mask.clone() {
+            let rgba: Vec<u8> = m.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
+            let out = Self::warp_buffer(&rgba, w, h, cols, rows, grid);
+            self.layers[index].mask = Some(out.as_chunks::<4>().0.iter().map(|p| p[0]).collect());
+        }
+        self.mark_full_dirty();
+    }
+
+    /// Shared warp resampler: destination (x, y) maps into lattice space,
+    /// then bilinearly blends the four surrounding lattice points.
+    fn warp_buffer(
+        src: &[u8],
+        w: u32,
+        h: u32,
+        cols: u32,
+        rows: u32,
+        grid: &[(f32, f32)],
+    ) -> Vec<u8> {
+        let stride = (cols + 1) as usize;
+        let mut next = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let gx = (x as f32 / w as f32 * cols as f32).clamp(0.0, cols as f32 - 1e-6);
+                let gy = (y as f32 / h as f32 * rows as f32).clamp(0.0, rows as f32 - 1e-6);
+                let i = gx.floor() as usize;
+                let j = gy.floor() as usize;
+                let (fu, fv) = (gx - i as f32, gy - j as f32);
+                let p00 = grid[j * stride + i];
+                let p10 = grid[j * stride + i + 1];
+                let p01 = grid[(j + 1) * stride + i];
+                let p11 = grid[(j + 1) * stride + i + 1];
+                let iu = 1.0 - fu;
+                let iv = 1.0 - fv;
+                let sx = p00.0 * iu * iv + p10.0 * fu * iv + p11.0 * fu * fv + p01.0 * iu * fv;
+                let sy = p00.1 * iu * iv + p10.1 * fu * iv + p11.1 * fu * fv + p01.1 * iu * fv;
+                let o = ((y * w + x) * 4) as usize;
+                if sx >= 0.0 && sx < w as f32 && sy >= 0.0 && sy < h as f32 {
+                    next[o..o + 4].copy_from_slice(&Self::sample_bilinear(src, w, h, sx, sy));
+                }
+            }
+        }
+        next
+    }
+
     /// Mirror a layer left-right in place. Masks travel with their layer.
     /// Caller checkpoints for undo first.
     pub fn flip_layer_horizontal(&mut self, index: usize) {
@@ -4274,6 +4339,62 @@ mod tests {
         let mut doc = Document::new(1, 1);
         doc.layers[0].pixels.copy_from_slice(&[255, 0, 0, 255]);
         doc.distort_layer(0, [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
+        assert_eq!(&doc.layers[0].pixels, &[255, 0, 0, 255]);
+    }
+
+    fn identity_lattice(w: f32, h: f32, cols: u32, rows: u32) -> Vec<(f32, f32)> {
+        let mut grid = Vec::new();
+        for j in 0..=rows {
+            for i in 0..=cols {
+                grid.push((i as f32 * w / cols as f32, j as f32 * h / rows as f32));
+            }
+        }
+        grid
+    }
+
+    #[test]
+    fn warp_identity_lattice_is_noop() {
+        let mut doc = Document::new(8, 8);
+        for b in doc.layers[0].pixels.iter_mut() {
+            *b = 100;
+        }
+        let before = doc.layers[0].pixels.clone();
+        let grid = identity_lattice(8.0, 8.0, 2, 2);
+        doc.warp_layer(0, 2, 2, &grid);
+        assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
+    fn warp_pull_moves_paint_and_mask() {
+        // One opaque pixel at the top-left; drag the lattice center to
+        // the origin. Dest (4,4) sits exactly on lattice point (1,1),
+        // so it samples the painted texel; the mask travels with it.
+        let mut doc = Document::new(8, 8);
+        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        let mut m = vec![0u8; 64];
+        m[0] = 255;
+        doc.layers[0].mask = Some(m);
+        let mut grid = identity_lattice(8.0, 8.0, 2, 2);
+        // Row-major (row 1, col 1) of the 3-wide lattice.
+        grid[4] = (0.0, 0.0);
+        doc.warp_layer(0, 2, 2, &grid);
+        let o = ((4 * 8 + 4) * 4) as usize;
+        assert_eq!(&doc.layers[0].pixels[o..o + 4], &[255, 0, 0, 255]);
+        assert_eq!(
+            doc.layers[0].mask.as_ref().unwrap()[(4 * 8 + 4) as usize],
+            255
+        );
+        // Bad grid (wrong point count) is a silent no-op.
+        let before = doc.layers[0].pixels.clone();
+        doc.warp_layer(0, 2, 2, &[(0.0, 0.0)]);
+        assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
+    fn warp_degenerate_canvas_is_noop() {
+        let mut doc = Document::new(1, 1);
+        doc.layers[0].pixels.copy_from_slice(&[255, 0, 0, 255]);
+        doc.warp_layer(0, 1, 1, &[(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
         assert_eq!(&doc.layers[0].pixels, &[255, 0, 0, 255]);
     }
 

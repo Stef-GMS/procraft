@@ -2098,8 +2098,10 @@ impl eframe::App for ProCraftApp {
         }
 
         // Top bar: browsers, File menu, direct edit buttons, zoom, fit,
-        // rotate, then theme + About pinned right. Wraps on narrow
-        // screens; the popups never clip like the old button soup did.
+        // rotate, then theme + About. All groups flow inline inside one
+        // horizontal_wrapped so the bar folds to 2+ lines on narrow
+        // screens instead of overlapping; the popups never clip like
+        // the old button soup did.
         egui::Panel::top("menu").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Gallery").clicked() {
@@ -2312,7 +2314,7 @@ impl eframe::App for ProCraftApp {
                     }
                     self.doc.mark_full_dirty();
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("−").clicked() {
                         self.zoom = (self.zoom / 1.25).clamp(0.1, 8.0);
                     }
@@ -2332,24 +2334,26 @@ impl eframe::App for ProCraftApp {
                 if ui.button("Reset rotation").clicked() {
                     self.view_angle = 0.0;
                 }
-                // Theme picker + About pin right.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let about = if self.has_symbols {
-                        "ⓘ About"
-                    } else {
-                        "About"
-                    };
-                    if ui.button(about).clicked() {
-                        self.show_about = !self.show_about;
-                    }
-                    egui::ComboBox::from_id_salt("theme")
-                        .selected_text(self.theme.name())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.theme, Theme::Dark, "Dark");
-                            ui.selectable_value(&mut self.theme, Theme::Light, "Light");
-                            ui.selectable_value(&mut self.theme, Theme::Paper, "Paper");
-                        });
-                });
+                // Theme + About flow inline so the bar folds to 2+ lines
+                // on narrow displays. A right_to_left pin inside
+                // horizontal_wrapped draws over left items when the line
+                // is full, which is the overlap seen on small screens.
+                ui.separator();
+                egui::ComboBox::from_id_salt("theme")
+                    .selected_text(self.theme.name())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.theme, Theme::Dark, "Dark");
+                        ui.selectable_value(&mut self.theme, Theme::Light, "Light");
+                        ui.selectable_value(&mut self.theme, Theme::Paper, "Paper");
+                    });
+                let about = if self.has_symbols {
+                    "ⓘ About"
+                } else {
+                    "About"
+                };
+                if ui.button(about).clicked() {
+                    self.show_about = !self.show_about;
+                }
             });
         });
 

@@ -22,10 +22,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-apk
         run: cargo install cargo-apk
-      - name: Build release APK (debug-signed for sideload)
-        run: cargo apk build --release -p procraft --lib
+      - name: Build test APK (debug, stripped)
+        run: cargo apk build -p procraft --lib
         env:
           ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/27.0.12077973
+          # Debug .so carries full debuginfo (~300MB APK); strip symbols for
+          # a sideloadable test build. Release signing (real keystore) waits
+          # for the next versioned release.
+          RUSTFLAGS: -C strip=symbols
       - name: Verify + stage APK
         run: |
           set -euxo pipefail

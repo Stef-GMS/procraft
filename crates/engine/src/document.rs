@@ -2561,9 +2561,35 @@ impl Document {
     }
 
     /// Load an image file flattened onto a fresh layer.
+    /// M45 hardening: files over 64MB fail closed on metadata, and
+    /// dimensions are checked from the header before the full decode
+    /// so a phone panorama can't OOM the session (cap matches
+    /// [`MAX_CANVAS_SIDE`], the GIF import cap, and `rehome_canvas`).
     pub fn load_background(&mut self, path: &std::path::Path) -> Result<(), String> {
+        const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_FILE_BYTES {
+                return Err("image file is too large (max 64MB)".to_string());
+            }
+        }
+        let (hw, hh) = image::ImageReader::open(path)
+            .map_err(|e| e.to_string())?
+            .with_guessed_format()
+            .map_err(|e| e.to_string())?
+            .into_dimensions()
+            .map_err(|e| e.to_string())?;
+        if hw == 0 || hh == 0 || hw > MAX_CANVAS_SIDE || hh > MAX_CANVAS_SIDE {
+            return Err(format!(
+                "image too large: {hw}x{hh} (want 1-{MAX_CANVAS_SIDE} each)"
+            ));
+        }
         let img = image::open(path).map_err(|e| e.to_string())?.to_rgba8();
         let (w, h) = (img.width(), img.height());
+        if w == 0 || h == 0 || w > MAX_CANVAS_SIDE || h > MAX_CANVAS_SIDE {
+            return Err(format!(
+                "image too large: {w}x{h} (want 1-{MAX_CANVAS_SIDE} each)"
+            ));
+        }
         self.w = w;
         self.h = h;
         let mut layer = Layer::blank("Imported".to_string(), w, h);
@@ -2722,8 +2748,16 @@ impl Document {
     }
 
     /// Load a `.procraft` file, replacing the current document.
+    /// M45 hardening: files over 200MB fail closed on metadata alone
+    /// (same cap as PSD/brush imports) — never `read_to_end` into memory.
     pub fn open_project(path: &std::path::Path) -> Result<Document, String> {
         use std::io::Read;
+        const MAX_FILE_BYTES: u64 = 200 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_FILE_BYTES {
+                return Err("project file is too large (max 200MB)".to_string());
+            }
+        }
         let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
@@ -4711,6 +4745,81 @@ mod tests {
         }
         std::fs::write(&path, &buf).unwrap();
         assert!(Document::open_project(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn m45_import_rejects_oversize_dimensions() {
+        // M45: a phone panorama wider than the canvas cap must fail
+        // closed instead of adopting a 5000px layer (OOM guard).
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-m45-oversize.png");
+        let wide = 5000u32;
+        let tall = 100u32;
+        let raw = vec![200u8; (wide * tall * 4) as usize];
+        let mut out = Vec::new();
+        {
+            use image::ImageEncoder;
+            let enc = image::codecs::png::PngEncoder::new(&mut out);
+            enc.write_image(&raw, wide, tall, image::ExtendedColorType::Rgba8)
+                .unwrap();
+        }
+        std::fs::write(&path, &out).unwrap();
+        let mut doc = Document::new(8, 8);
+        let err = doc.load_background(&path).unwrap_err();
+        assert!(err.contains("too large"), "unexpected: {err}");
+        // Failed import touches nothing.
+        assert_eq!((doc.w, doc.h), (8, 8));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn m45_open_project_rejects_huge_file() {
+        // M45: a 200MB+ file must fail closed on metadata alone,
+        // never read_to_end into memory.
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-m45-huge.pcraft");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(200 * 1024 * 1024 + 1).unwrap();
+        drop(f);
+        let err = Document::open_project(&path).unwrap_err();
+        assert!(err.contains("too large"), "unexpected: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn m45_project_fuzz_truncations_and_flips_never_panic() {
+        // M45: truncations fail closed (Err); sampled bit-flips never
+        // panic (Ok allowed — flipping a background byte is still a
+        // valid file, just a different color).
+        let doc = Document::new(8, 8);
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-m45-fuzz.pcraft");
+        doc.save_project(&path).unwrap();
+        let full = std::fs::read(&path).unwrap();
+        // Truncations: empty, 1 byte, mid, and len-1 all fail closed.
+        for n in [0usize, 1, 8, full.len() / 2, full.len() - 1] {
+            std::fs::write(&path, &full[..n]).unwrap();
+            assert!(Document::open_project(&path).is_err(), "trunc {n} opened");
+        }
+        // Bit-flips: magic flips must fail closed; every flip must not
+        // panic (the return value is dropped — a panic fails the test).
+        for i in [0usize, 4, 8, 12, 32, 64] {
+            if i >= full.len() {
+                continue;
+            }
+            let mut bad = full.clone();
+            bad[i] ^= 0xFF;
+            std::fs::write(&path, &bad).unwrap();
+            let _ = Document::open_project(&path);
+        }
+        // Magic-byte flips specifically are never valid files.
+        for i in [0usize, 4] {
+            let mut bad = full.clone();
+            bad[i] ^= 0xFF;
+            std::fs::write(&path, &bad).unwrap();
+            assert!(Document::open_project(&path).is_err(), "flip {i} opened");
+        }
         let _ = std::fs::remove_file(&path);
     }
 

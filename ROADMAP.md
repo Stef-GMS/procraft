@@ -20,7 +20,7 @@ people touch daily. Ranked by user-visible value per effort.
   identity is a no-op; masks travel.
 - [x] **M44 — Warp mesh.** Movable lattice over the layer (distort's
   freeform sibling).
-- [ ] **M45 — Stability hardening.** Fuzz project open, OOM guards on
+- [x] **M45 — Stability hardening.** Fuzz project open, OOM guards on
   import.
 - [ ] **M46 — SAF file picker.** Real Android picker (replaces the
   v0.8.1 "picker coming" notes); tighten desktop fallback.

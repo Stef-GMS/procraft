@@ -1175,6 +1175,58 @@ impl Document {
         next
     }
 
+    /// Corner-pin distort (M43): remap the layer through `quad`, the
+    /// source coords sampled at destination corners [TL, TR, BR, BL],
+    /// bilinearly interpolated across the canvas and resampled with the
+    /// shared bilinear sampler (identity quad is an exact no-op). Like
+    /// `affine_layer`, the remap is canvas-space so layer offsets stay
+    /// valid untouched, and masks travel with their layer. Fractional
+    /// pins are lossy by nature — one deliberate gesture per distort
+    /// keeps paint crisp. Caller checkpoints for undo first.
+    pub fn distort_layer(&mut self, index: usize, quad: [(f32, f32); 4]) {
+        if index >= self.layers.len() {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
+        if w < 2 || h < 2 {
+            return;
+        }
+        let src = self.layers[index].pixels.clone();
+        self.layers[index].pixels = Self::quad_buffer(&src, w, h, &quad);
+        if let Some(m) = self.layers[index].mask.clone() {
+            let rgba: Vec<u8> = m.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
+            let out = Self::quad_buffer(&rgba, w, h, &quad);
+            self.layers[index].mask = Some(out.as_chunks::<4>().0.iter().map(|p| p[0]).collect());
+        }
+        self.mark_full_dirty();
+    }
+
+    /// Shared corner-pin resampler: destination (x, y) samples the
+    /// bilinear blend of `quad` at (x/(w-1), y/(h-1)).
+    fn quad_buffer(src: &[u8], w: u32, h: u32, quad: &[(f32, f32); 4]) -> Vec<u8> {
+        let (w1, h1) = (w as f32 - 1.0, h as f32 - 1.0);
+        let mut next = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let u = x as f32 / w1;
+                let v = y as f32 / h1;
+                let (ax, ay) = quad[0];
+                let (bx, by) = quad[1];
+                let (cx, cy) = quad[2];
+                let (dx, dy) = quad[3];
+                let iu = 1.0 - u;
+                let iv = 1.0 - v;
+                let sx = ax * iu * iv + bx * u * iv + cx * u * v + dx * iu * v;
+                let sy = ay * iu * iv + by * u * iv + cy * u * v + dy * iu * v;
+                let o = ((y * w + x) * 4) as usize;
+                if sx >= 0.0 && sx < w as f32 && sy >= 0.0 && sy < h as f32 {
+                    next[o..o + 4].copy_from_slice(&Self::sample_bilinear(src, w, h, sx, sy));
+                }
+            }
+        }
+        next
+    }
+
     /// Mirror a layer left-right in place. Masks travel with their layer.
     /// Caller checkpoints for undo first.
     pub fn flip_layer_horizontal(&mut self, index: usize) {
@@ -4185,6 +4237,44 @@ mod tests {
             doc.affine_layer(0, 1.0, 90.0);
         }
         assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
+    fn distort_identity_quad_is_noop() {
+        let mut doc = Document::new(8, 8);
+        for b in doc.layers[0].pixels.iter_mut() {
+            *b = 100;
+        }
+        let before = doc.layers[0].pixels.clone();
+        doc.distort_layer(0, [(0.0, 0.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)]);
+        assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
+    fn distort_pin_moves_paint_and_mask() {
+        // One opaque pixel at the top-left; pin that corner to the
+        // canvas center. Dest (0,0) now samples the empty center, and
+        // the mask travels with the paint.
+        let mut doc = Document::new(8, 8);
+        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        let mut m = vec![0u8; 64];
+        m[0] = 255;
+        doc.layers[0].mask = Some(m);
+        doc.distort_layer(0, [(4.0, 4.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)]);
+        assert_eq!(&doc.layers[0].pixels[0..4], &[0, 0, 0, 0]);
+        assert_eq!(doc.layers[0].mask.as_ref().unwrap()[0], 0);
+        // Bad index is a silent no-op, never a panic.
+        let before = doc.layers[0].pixels.clone();
+        doc.distort_layer(9, [(0.0, 0.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)]);
+        assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
+    fn distort_degenerate_canvas_is_noop() {
+        let mut doc = Document::new(1, 1);
+        doc.layers[0].pixels.copy_from_slice(&[255, 0, 0, 255]);
+        doc.distort_layer(0, [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
+        assert_eq!(&doc.layers[0].pixels, &[255, 0, 0, 255]);
     }
 
     #[test]

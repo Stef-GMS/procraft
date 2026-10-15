@@ -12,6 +12,22 @@ people touch daily. Ranked by user-visible value per effort.
 - Batch 1 (PC check #1): M23–M27. Batch 2 (PC check #2 + iPad check #1):
   M28–M32 (exact slice decided at M27). Batch 3 (PC check #3): M33–M37
   (Gallery + Adjustments start, decided at v0.7.5).
+- Batch 5 (PC check #5 + iPad check #3): M43–M47 (slice below).
+
+## Batch 5: M43–M47 (transform depth → hardening → picker → Pencil)
+
+- [ ] **M43 — Distort (corner-pin).** Quad remap on layer, bilinear,
+  identity is a no-op; masks travel.
+- [ ] **M44 — Warp mesh.** Movable lattice over the layer (distort's
+  freeform sibling).
+- [ ] **M45 — Stability hardening.** Fuzz project open, OOM guards on
+  import.
+- [ ] **M46 — SAF file picker.** Real Android picker (replaces the
+  v0.8.1 "picker coming" notes); tighten desktop fallback.
+- [ ] **M47 — Palm rejection + Pencil.** Double-tap/hover, touch guards.
+  **→ PC checkpoint #5 + iPad check #3 (IPA).**
+- Deferred to Batch 6: 8K canvas + lazy compositing (standalone perf
+  epic, riskiest — Batch 5 stays shippable without it).
 
 ## Batch 1: M23–M27 (done, awaiting PC check #1)
 

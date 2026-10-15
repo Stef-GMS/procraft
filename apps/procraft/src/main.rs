@@ -61,6 +61,62 @@ enum Tool {
     Text,
 }
 
+/// Tool radio label: icon glyphs on symbol-font platforms, plain words
+/// where the glyphs would be tofu (iPad). Shared render-safe strings
+/// (brush, eraser, smudge, move, shapes) are identical either way.
+fn tool_label(tool: Tool, symbols: bool) -> &'static str {
+    match tool {
+        Tool::Brush => "✏ Brush",
+        Tool::Eraser => "⌫ Eraser",
+        Tool::Smudge => "💧 Smudge",
+        Tool::Select => {
+            if symbols {
+                "⬚ Select"
+            } else {
+                "Select"
+            }
+        }
+        Tool::Lasso => {
+            if symbols {
+                "◌ Lasso"
+            } else {
+                "Lasso"
+            }
+        }
+        Tool::Fill => {
+            if symbols {
+                "◧ Fill"
+            } else {
+                "Fill"
+            }
+        }
+        Tool::Picker => {
+            if symbols {
+                "◉ Pick"
+            } else {
+                "Pick"
+            }
+        }
+        Tool::Move => "↔ Move",
+        Tool::Liquify => {
+            if symbols {
+                "➰ Liquify"
+            } else {
+                "Liquify"
+            }
+        }
+        Tool::Crop => {
+            if symbols {
+                "◫ Crop"
+            } else {
+                "Crop"
+            }
+        }
+        Tool::Shapes => "○ Shapes",
+        Tool::Text => "T Text",
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ShapeKind {
     Line,
@@ -222,6 +278,14 @@ impl Theme {
         }
     }
 
+    fn name(self) -> &'static str {
+        match self {
+            Theme::Dark => "Dark",
+            Theme::Light => "Light",
+            Theme::Paper => "Paper",
+        }
+    }
+
     fn from_str(s: &str) -> Option<Self> {
         match s {
             "dark" => Some(Theme::Dark),
@@ -273,6 +337,10 @@ struct ProCraftApp {
     tool: Tool,
     theme: Theme,
     theme_applied: Option<Theme>,
+    /// True when the system symbol font loaded (desktop Windows): UI
+    /// strings may use icon glyphs. iPad has no such font, so the same
+    /// strings fall back to plain words (see `tool_label`).
+    has_symbols: bool,
     page_custom: [u8; 3],
     picker_size: f32,
     texture: Option<TextureHandle>,
@@ -454,17 +522,19 @@ struct ProCraftApp {
 impl ProCraftApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Extra glyph coverage (tool icons) from a system symbol font; the
-        // app works fine without it.
+        // app works fine without it (UI strings check `has_symbols`).
         let mut fonts = egui::FontDefinitions::default();
-        if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\seguisym.ttf") {
-            fonts.font_data.insert(
-                "segui-symbol".to_owned(),
-                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-            );
-            if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                list.push("segui-symbol".to_owned());
-            }
-        }
+        let has_symbols = std::fs::read("C:\\Windows\\Fonts\\seguisym.ttf")
+            .map(|bytes| {
+                fonts.font_data.insert(
+                    "segui-symbol".to_owned(),
+                    std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                );
+                if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                    list.push("segui-symbol".to_owned());
+                }
+            })
+            .is_ok();
         cc.egui_ctx.set_fonts(fonts);
         // Autosave recovery lives next to the UI state (created eagerly
         // so a crash in the first two minutes still offers recovery only
@@ -484,6 +554,7 @@ impl ProCraftApp {
             tool: Tool::Brush,
             theme: Theme::Paper,
             theme_applied: None,
+            has_symbols,
             page_custom: [255, 255, 255],
             picker_size: 165.0,
             texture: None,
@@ -2026,9 +2097,9 @@ impl eframe::App for ProCraftApp {
             }
         }
 
-        // Top bar: pinned browser + edit buttons plus File/View menus —
-        // one row on every screen. About lives in the Layers header.
-        // Menu actions close their menu; sliders/steppers stay open.
+        // Top bar: browsers, File menu, direct edit buttons, zoom, fit,
+        // rotate, then theme + About pinned right. Wraps on narrow
+        // screens; the popups never clip like the old button soup did.
         egui::Panel::top("menu").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Gallery").clicked() {
@@ -2036,19 +2107,6 @@ impl eframe::App for ProCraftApp {
                 }
                 if ui.button("Reference").clicked() {
                     self.ref_open = !self.ref_open;
-                }
-                if ui.button("Clear layer").clicked() {
-                    self.doc.checkpoint();
-                    if let Some(layer) = self.doc.active_layer_mut() {
-                        layer.clear();
-                    }
-                    self.doc.mark_full_dirty();
-                }
-                if ui.button("Undo").clicked() && self.doc.undo() {
-                    self.status = "Undone.".to_string();
-                }
-                if ui.button("Redo").clicked() && self.doc.redo() {
-                    self.status = "Redone.".to_string();
                 }
                 ui.menu_button("File", |ui| {
                     if ui.button("Save PNG").clicked() {
@@ -2241,36 +2299,56 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                 });
-                ui.menu_button("View", |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Theme:");
-                        ui.radio_value(&mut self.theme, Theme::Dark, "Dark");
-                        ui.radio_value(&mut self.theme, Theme::Light, "Light");
-                        ui.radio_value(&mut self.theme, Theme::Paper, "Paper");
-                    });
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if ui.button("−").clicked() {
-                            self.zoom = (self.zoom / 1.25).clamp(0.1, 8.0);
-                        }
-                        ui.label(format!("{}%", (self.zoom * 100.0).round() as u32));
-                        if ui.button("+").clicked() {
-                            self.zoom = (self.zoom * 1.25).clamp(0.1, 8.0);
-                        }
-                        if ui.button("Fit").clicked() {
-                            self.zoom = 0.0; // recomputed in the canvas view
-                            self.view_offset = egui::Vec2::ZERO;
-                            self.view_angle = 0.0;
-                            ui.close();
-                        }
-                    });
-                    let mut deg = self.view_angle.to_degrees();
-                    stepped_slider(ui, &mut deg, -180.0..=180.0, 1.0, "Rotate°");
-                    self.view_angle = deg.to_radians();
-                    if ui.button("Reset rotation").clicked() {
-                        self.view_angle = 0.0;
-                        ui.close();
+                if ui.button("Undo").clicked() && self.doc.undo() {
+                    self.status = "Undone.".to_string();
+                }
+                if ui.button("Redo").clicked() && self.doc.redo() {
+                    self.status = "Redone.".to_string();
+                }
+                if ui.button("Clear layer").clicked() {
+                    self.doc.checkpoint();
+                    if let Some(layer) = self.doc.active_layer_mut() {
+                        layer.clear();
                     }
+                    self.doc.mark_full_dirty();
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("−").clicked() {
+                        self.zoom = (self.zoom / 1.25).clamp(0.1, 8.0);
+                    }
+                    ui.label(format!("{}%", (self.zoom * 100.0).round() as u32));
+                    if ui.button("+").clicked() {
+                        self.zoom = (self.zoom * 1.25).clamp(0.1, 8.0);
+                    }
+                    if ui.button("Fit").clicked() {
+                        self.zoom = 0.0; // recomputed in the canvas view
+                        self.view_offset = egui::Vec2::ZERO;
+                        self.view_angle = 0.0;
+                    }
+                });
+                let mut deg = self.view_angle.to_degrees();
+                stepped_slider(ui, &mut deg, -180.0..=180.0, 1.0, "Rotate°");
+                self.view_angle = deg.to_radians();
+                if ui.button("Reset rotation").clicked() {
+                    self.view_angle = 0.0;
+                }
+                // Theme picker + About pin right.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let about = if self.has_symbols {
+                        "ⓘ About"
+                    } else {
+                        "About"
+                    };
+                    if ui.button(about).clicked() {
+                        self.show_about = !self.show_about;
+                    }
+                    egui::ComboBox::from_id_salt("theme")
+                        .selected_text(self.theme.name())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.theme, Theme::Dark, "Dark");
+                            ui.selectable_value(&mut self.theme, Theme::Light, "Light");
+                            ui.selectable_value(&mut self.theme, Theme::Paper, "Paper");
+                        });
                 });
             });
         });
@@ -2359,8 +2437,13 @@ impl eframe::App for ProCraftApp {
                                     {
                                         dup_idx = Some(idx);
                                     }
+                                    let (del_w, del_t) = if self.has_symbols {
+                                        (36.0, "✕")
+                                    } else {
+                                        (44.0, "Del")
+                                    };
                                     if ui
-                                        .add_sized([44.0, 28.0], egui::Button::new("Del"))
+                                        .add_sized([del_w, 28.0], egui::Button::new(del_t))
                                         .clicked()
                                     {
                                         remove_idx = Some(idx);
@@ -2751,18 +2834,18 @@ impl eframe::App for ProCraftApp {
                     }
                 });
             });
-            ui.radio_value(&mut self.tool, Tool::Brush, "✏ Brush");
-            ui.radio_value(&mut self.tool, Tool::Eraser, "⌫ Eraser");
-            ui.radio_value(&mut self.tool, Tool::Smudge, "💧 Smudge");
-            ui.radio_value(&mut self.tool, Tool::Select, "Select");
-            ui.radio_value(&mut self.tool, Tool::Lasso, "Lasso");
-            ui.radio_value(&mut self.tool, Tool::Fill, "Fill");
-            ui.radio_value(&mut self.tool, Tool::Picker, "Pick");
-            ui.radio_value(&mut self.tool, Tool::Move, "↔ Move");
-            ui.radio_value(&mut self.tool, Tool::Liquify, "Liquify");
-            ui.radio_value(&mut self.tool, Tool::Crop, "Crop");
-            ui.radio_value(&mut self.tool, Tool::Shapes, "○ Shapes");
-            ui.radio_value(&mut self.tool, Tool::Text, "T Text");
+            ui.radio_value(&mut self.tool, Tool::Brush, tool_label(Tool::Brush, self.has_symbols));
+            ui.radio_value(&mut self.tool, Tool::Eraser, tool_label(Tool::Eraser, self.has_symbols));
+            ui.radio_value(&mut self.tool, Tool::Smudge, tool_label(Tool::Smudge, self.has_symbols));
+            ui.radio_value(&mut self.tool, Tool::Select, tool_label(Tool::Select, self.has_symbols));
+            ui.radio_value(&mut self.tool, Tool::Lasso, tool_label(Tool::Lasso, self.has_symbols));
+            ui.radio_value(&mut self.tool, Tool::Fill, tool_label(Tool::Fill, self.has_symbols));
+            ui.radio_value(&mut self.tool, Tool::Picker, tool_label(Tool::Picker, self.has_symbols));
+            ui.radio_value(&mut self.tool, Tool::Move, tool_label(Tool::Move, self.has_symbols));
+            ui.radio_value(&mut self.tool, Tool::Liquify, tool_label(Tool::Liquify, self.has_symbols));
+            ui.radio_value(&mut self.tool, Tool::Crop, tool_label(Tool::Crop, self.has_symbols));
+            ui.radio_value(&mut self.tool, Tool::Shapes, tool_label(Tool::Shapes, self.has_symbols));
+            ui.radio_value(&mut self.tool, Tool::Text, tool_label(Tool::Text, self.has_symbols));
             if self.tool == Tool::Fill {
                 stepped_slider(ui, &mut self.fill_tolerance, 0..=255, 1.0, "Tolerance");
                 ui.label("Tap fills; hold + drag sideways to sweep tolerance.");
@@ -2993,7 +3076,7 @@ impl eframe::App for ProCraftApp {
                         }
                         self.sel_edges_dirty = true;
                     }
-                    if ui.button("Flip H").clicked() {
+                if ui.button(if self.has_symbols { "⇄ Flip H" } else { "Flip H" }).clicked() {
                         if self.doc.flip_selection_h() {
                             self.status = "Flipped horizontal.".to_string();
                         } else {
@@ -3001,7 +3084,7 @@ impl eframe::App for ProCraftApp {
                         }
                         self.sel_edges_dirty = true;
                     }
-                    if ui.button("Flip V").clicked() {
+                if ui.button(if self.has_symbols { "⇅ Flip V" } else { "Flip V" }).clicked() {
                         if self.doc.flip_selection_v() {
                             self.status = "Flipped vertical.".to_string();
                         } else {
@@ -3168,7 +3251,8 @@ impl eframe::App for ProCraftApp {
                                     }
                                 }
                             });
-                            if ui.small_button("Del").clicked() {
+                            let preset_del = if self.has_symbols { "✕" } else { "Del" };
+                            if ui.small_button(preset_del).clicked() {
                                 remove = Some(idx);
                             }
                         });
@@ -3557,12 +3641,6 @@ impl eframe::App for ProCraftApp {
                     self.show_layers = false;
                 }
                 ui.heading("Layers");
-                // About parks in the Layers corner (top bar has no room).
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("About").clicked() {
-                        self.show_about = !self.show_about;
-                    }
-                });
             });
             ui.horizontal(|ui| {
                 if ui.button("Add layer").clicked() {
@@ -3672,10 +3750,15 @@ impl eframe::App for ProCraftApp {
                                 ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
                             let mut commit = resp.lost_focus() || enter;
                             let mut cancel = false;
-                            if ui.add_sized([44.0, 28.0], egui::Button::new("OK")).clicked() {
+                            let (ok_label, x_label) = if self.has_symbols {
+                                ("✓", "✕")
+                            } else {
+                                ("OK", "X")
+                            };
+                            if ui.add_sized([44.0, 28.0], egui::Button::new(ok_label)).clicked() {
                                 commit = true;
                             }
-                            if ui.add_sized([44.0, 28.0], egui::Button::new("X")).clicked() {
+                            if ui.add_sized([44.0, 28.0], egui::Button::new(x_label)).clicked() {
                                 cancel = true;
                             }
                             if commit && !cancel {
@@ -3752,10 +3835,15 @@ impl eframe::App for ProCraftApp {
                             let enter = ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
                             let mut commit = resp.lost_focus() || enter;
                             let mut cancel = false;
-                            if ui.add_sized([44.0, 28.0], egui::Button::new("OK")).clicked() {
+                            let (ok_label, x_label) = if self.has_symbols {
+                                ("✓", "✕")
+                            } else {
+                                ("OK", "X")
+                            };
+                            if ui.add_sized([44.0, 28.0], egui::Button::new(ok_label)).clicked() {
                                 commit = true;
                             }
-                            if ui.add_sized([44.0, 28.0], egui::Button::new("X")).clicked() {
+                            if ui.add_sized([44.0, 28.0], egui::Button::new(x_label)).clicked() {
                                 cancel = true;
                             }
                         if commit && !cancel {
@@ -4144,11 +4232,11 @@ impl eframe::App for ProCraftApp {
                 }
             });
             ui.horizontal(|ui| {
-                if ui.button("−15°").clicked() {
+                if ui.button(if self.has_symbols { "⟲ −15°" } else { "−15°" }).clicked() {
                     self.doc.checkpoint();
                     self.doc.affine_layer(self.doc.active, 1.0, -15.0);
                 }
-                if ui.button("+15°").clicked() {
+                if ui.button(if self.has_symbols { "⟳ +15°" } else { "+15°" }).clicked() {
                     self.doc.checkpoint();
                     self.doc.affine_layer(self.doc.active, 1.0, 15.0);
                 }

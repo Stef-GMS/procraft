@@ -16,8 +16,9 @@ jobs:
           java-version: "17"
       - name: Install Android NDK + platform (preinstalled SDK)
         run: |
-          yes | sdkmanager --licenses > /dev/null
-          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973"
+          SdkMgr="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SdkMgr" --licenses > /dev/null
+          "$SdkMgr" --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973"
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-apk
         run: cargo install cargo-apk

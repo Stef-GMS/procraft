@@ -45,8 +45,9 @@ android-activity = "0.6"
 [package.metadata.android]
 package = "com.surfrpt1.procraft"
 build_targets = ["aarch64-linux-android", "x86_64-linux-android"]
-# Launcher icon (issue #2: no android:icon meant a missing icon on device).
-icon = "../../assets/icon-1024.png"
+# App resources (mipmap icon densities live under res/; paths are
+# relative to this manifest). Issue #2 shipped with no res/ at all.
+resources = "res"
 
 [package.metadata.android.sdk]
 min_sdk_version = 29
@@ -54,3 +55,6 @@ target_sdk_version = 35
 
 [package.metadata.android.application]
 label = "ProCraft"
+# Virtual resource path (NOT a file path) — resolves into res/mipmap-*/.
+# Issue #2: no android:icon meant a missing icon on device.
+icon = "@mipmap/ic_launcher"

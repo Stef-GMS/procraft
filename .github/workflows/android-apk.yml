@@ -54,8 +54,11 @@ jobs:
           BT="$ANDROID_HOME/build-tools/35.0.0"
           "$BT/aapt" dump badging "$APK" | head -n 8
           "$BT/apksigner" verify --print-certs "$APK" | head -n 4
-          # Issue #2 proof: launcher icon present in the manifest.
-          "$BT/aapt" dump badging "$APK" | grep -q "icon=" || (echo "NO LAUNCHER ICON" && exit 1)
+          # Issue #2 proof: non-empty launcher icon + application label.
+          # (Strict: icon='res/ — a bare icon= also matches icon='', which
+          # is how the first attempt passed vacuously.)
+          "$BT/aapt" dump badging "$APK" | grep -q "icon='res/" || (echo "NO LAUNCHER ICON" && exit 1)
+          "$BT/aapt" dump badging "$APK" | grep -q "application-label:'ProCraft'" || (echo "NO APP LABEL" && exit 1)
           VER=$(grep '^version' Cargo.toml | head -n 1 | cut -d'"' -f2)
           if [ "${{ inputs.profile }}" = "release" ]; then OUT="ProCraft-android-v$VER.apk"; else OUT="ProCraft-android-v1.apk"; fi
           cp "$APK" "$OUT"

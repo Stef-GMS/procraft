@@ -41,7 +41,9 @@ jobs:
           ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/27.0.12077973
           # Debug .so carries full debuginfo (~300MB APK); strip symbols for
           # a sideloadable test build. Release profile strips via Cargo.
-          RUSTFLAGS: ${{ inputs.profile == 'release' && '' || '-C strip=symbols' }}
+          # max-page-size=16384 (issue #2): 4KB-aligned .so is killed at load
+          # on 16KB-page Android 15 devices — instant crash, no stack.
+          RUSTFLAGS: ${{ inputs.profile == 'release' && '-C link-arg=-Wl,-z,max-page-size=16384' || '-C strip=symbols -C link-arg=-Wl,-z,max-page-size=16384' }}
           CARGO_APK_RELEASE_KEYSTORE: /tmp/procraft-release.keystore
           CARGO_APK_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
       - name: Verify + stage APK
@@ -52,10 +54,29 @@ jobs:
           BT="$ANDROID_HOME/build-tools/35.0.0"
           "$BT/aapt" dump badging "$APK" | head -n 8
           "$BT/apksigner" verify --print-certs "$APK" | head -n 4
+          # Issue #2 proof: launcher icon present in the manifest.
+          "$BT/aapt" dump badging "$APK" | grep -q "icon=" || (echo "NO LAUNCHER ICON" && exit 1)
           VER=$(grep '^version' Cargo.toml | head -n 1 | cut -d'"' -f2)
           if [ "${{ inputs.profile }}" = "release" ]; then OUT="ProCraft-android-v$VER.apk"; else OUT="ProCraft-android-v1.apk"; fi
           cp "$APK" "$OUT"
           ls -la "$OUT"
+          # Issue #2 proof: arm64 .so must carry 16KB-aligned LOAD segments,
+          # or 16KB-page Android 15 devices kill the app at startup.
+          OUT="$OUT" python3 - <<'EOF'
+          import os, struct, sys, zipfile
+          z = zipfile.ZipFile(os.environ["OUT"])
+          data = z.read("lib/arm64-v8a/libprocraft_app.so")
+          phoff = struct.unpack("<Q", data[0x20:0x28])[0]
+          phentsize, phnum = struct.unpack("<HH", data[0x36:0x3A])
+          top = 0
+          for i in range(phnum):
+              o = phoff + i * phentsize
+              f = struct.unpack("<IIQQQQQQ", data[o:o + 56])
+              if f[0] == 1:
+                  top = max(top, f[7])
+          print("max PT_LOAD align:", top)
+          sys.exit(0 if top >= 16384 else 1)
+          EOF
       - uses: actions/upload-artifact@v4
         with:
           name: android-apk

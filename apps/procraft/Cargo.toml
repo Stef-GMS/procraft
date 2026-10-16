@@ -45,6 +45,8 @@ android-activity = "0.6"
 [package.metadata.android]
 package = "com.surfrpt1.procraft"
 build_targets = ["aarch64-linux-android", "x86_64-linux-android"]
+# Launcher icon (issue #2: no android:icon meant a missing icon on device).
+icon = "../../assets/icon-1024.png"
 
 [package.metadata.android.sdk]
 min_sdk_version = 29

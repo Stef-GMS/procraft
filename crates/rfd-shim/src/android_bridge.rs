@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use jni::objects::{JObject, JString, JValue};
+use jni::signature::RuntimeFieldSignature;
 use jni::{jni_sig, jni_str};
 
 /// Run `f` with the current thread attached to the JVM.
@@ -81,4 +82,44 @@ pub fn scan_file(path: &Path) -> bool {
         Ok(())
     })
     .is_ok()
+}
+
+/// Status-bar height in px: top edge of the window-visible display frame.
+/// Errors carry the reason for the status line; callers fall back to 0.
+pub fn status_bar_height() -> Result<u32, &'static str> {
+    with_attached(|env| {
+        let ctx = ndk_context::android_context();
+        let activity = unsafe { JObject::from_raw(env, ctx.context() as jni::sys::jobject) };
+        let window: JObject = env
+            .call_method(
+                &activity,
+                jni_str!("getWindow"),
+                jni_sig!("()Landroid/view/Window;"),
+                &[],
+            )?
+            .l()?;
+        let decor: JObject = env
+            .call_method(
+                &window,
+                jni_str!("getDecorView"),
+                jni_sig!("()Landroid/view/View;"),
+                &[],
+            )?
+            .l()?;
+        let frame: JObject =
+            env.new_object(jni_str!("android/graphics/Rect"), jni_sig!("()V"), &[])?;
+        env.call_method(
+            &decor,
+            jni_str!("getWindowVisibleDisplayFrame"),
+            jni_sig!("(Landroid/graphics/Rect;)V"),
+            &[JValue::Object(&frame)],
+        )?
+        .v()?;
+        let sig = RuntimeFieldSignature::from_str("I")?;
+        let top = env
+            .get_field(&frame, jni_str!("top"), sig.field_signature())?
+            .i()?;
+        Ok(top.max(0) as u32)
+    })
+    .map_err(|_| "status inset unavailable")
 }

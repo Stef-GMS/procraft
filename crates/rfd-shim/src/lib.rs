@@ -127,6 +127,13 @@ pub fn android_scan_file(path: &Path) -> bool {
     android_bridge::scan_file(path)
 }
 
+/// Status-bar height in px for edge-to-edge padding (call once, cache).
+/// Android only; errors carry the reason, callers fall back to 0.
+#[cfg(target_os = "android")]
+pub fn android_status_bar_height() -> Result<u32, &'static str> {
+    android_bridge::status_bar_height()
+}
+
 /// Timestamped stem so saves never silently overwrite.
 #[cfg(any(target_os = "ios", target_os = "android"))]
 fn unique_stem() -> String {

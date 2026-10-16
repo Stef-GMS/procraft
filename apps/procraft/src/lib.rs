@@ -488,6 +488,9 @@ struct ProCraftApp {
     /// Android in-app browser request (external files; no system picker).
     #[cfg(target_os = "android")]
     android_browse: Option<PendingOpen>,
+    /// Cached status-bar height in px (-1 = unread; JNI runs once).
+    #[cfg(target_os = "android")]
+    android_inset_top: f32,
     preview_theme: Option<Theme>,
     custom_brushes: Vec<BrushPreset>,
     new_brush_name: String,
@@ -684,6 +687,8 @@ impl ProCraftApp {
             pending_open: None,
             #[cfg(target_os = "android")]
             android_browse: None,
+            #[cfg(target_os = "android")]
+            android_inset_top: -1.0,
             preview_theme: None,
             custom_brushes: Vec::new(),
             new_brush_name: String::new(),
@@ -1137,6 +1142,58 @@ fn load_brush_file(path: &std::path::Path) -> Result<Vec<BrushPreset>, String> {
 }
 
 impl ProCraftApp {
+    /// Zoom/rotate/theme/About cluster shared by the wide bar (inline) and
+    /// the narrow bar (inside a View menu). `in_menu` dismisses the popup
+    /// after momentary actions, matching the File menu convention; inline
+    /// clicks must not close anything.
+    fn view_controls(&mut self, ui: &mut egui::Ui, in_menu: bool) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("−").clicked() {
+                self.zoom = (self.zoom / 1.25).clamp(0.1, 8.0);
+            }
+            ui.label(format!("{}%", (self.zoom * 100.0).round() as u32));
+            if ui.button("+").clicked() {
+                self.zoom = (self.zoom * 1.25).clamp(0.1, 8.0);
+            }
+            if ui.button("Fit").clicked() {
+                if in_menu {
+                    ui.close();
+                }
+                self.zoom = 0.0; // recomputed in the canvas view
+                self.view_offset = egui::Vec2::ZERO;
+                self.view_angle = 0.0;
+            }
+        });
+        let mut deg = self.view_angle.to_degrees();
+        stepped_slider(ui, &mut deg, -180.0..=180.0, 1.0, "Rotate°");
+        self.view_angle = deg.to_radians();
+        if ui.button("Reset rotation").clicked() {
+            if in_menu {
+                ui.close();
+            }
+            self.view_angle = 0.0;
+        }
+        ui.separator();
+        egui::ComboBox::from_id_salt("theme")
+            .selected_text(self.theme.name())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.theme, Theme::Dark, "Dark");
+                ui.selectable_value(&mut self.theme, Theme::Light, "Light");
+                ui.selectable_value(&mut self.theme, Theme::Paper, "Paper");
+            });
+        let about = if self.has_symbols {
+            "ⓘ About"
+        } else {
+            "About"
+        };
+        if ui.button(about).clicked() {
+            if in_menu {
+                ui.close();
+            }
+            self.show_about = !self.show_about;
+        }
+    }
+
     /// Unique display name for a new custom brush: "Foo", "Foo (2)", ...
     fn unique_brush_name(&self, want: &str) -> String {
         let want = want.trim();
@@ -1783,6 +1840,33 @@ fn brush_ring_radius(size: f32, zoom: f32) -> f32 {
     (size * zoom * 0.5).max(2.0)
 }
 
+/// Top-bar width era. Below [`PHONE_BAR_W`] the zoom/rotate/theme/About
+/// group folds into a View menu (phone portrait starves the inline
+/// stepper to a character-wide column); at/above it the bar is unchanged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BarLayout {
+    Wide,
+    Narrow,
+}
+
+const PHONE_BAR_W: f32 = 600.0;
+
+fn bar_layout(width: f32) -> BarLayout {
+    if width < PHONE_BAR_W {
+        BarLayout::Narrow
+    } else {
+        BarLayout::Wide
+    }
+}
+
+/// Android status-bar padding: JNI px clamped so a wild value can never
+/// eat the screen. Only the Android call site uses it (host builds cover
+/// it through tests).
+#[cfg(any(target_os = "android", test))]
+fn clamp_status_inset(px: u32) -> f32 {
+    (px as f32).clamp(0.0, 200.0)
+}
+
 /// Textured quad for a rotated canvas view: `corners` are TL, TR, BR, BL
 /// with matching unit UVs, tinted (egui has no canvas transform, so the
 /// texture stays axis-aligned and the quad does the rotating).
@@ -2233,6 +2317,19 @@ impl eframe::App for ProCraftApp {
         // screens instead of overlapping; the popups never clip like
         // the old button soup did.
         egui::Panel::top("menu").show(ui, |ui| {
+            // Edge-to-edge Android draws under the status bar (winit never
+            // surfaces insets); pad once from the JNI readout, cached.
+            #[cfg(target_os = "android")]
+            {
+                if self.android_inset_top < 0.0 {
+                    self.android_inset_top = rfd::android_status_bar_height()
+                        .map(|px| clamp_status_inset(px))
+                        .unwrap_or(0.0);
+                }
+                if self.android_inset_top > 0.0 {
+                    ui.add_space(self.android_inset_top);
+                }
+            }
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Gallery").clicked() {
                     self.gallery_open = !self.gallery_open;
@@ -2466,45 +2563,15 @@ impl eframe::App for ProCraftApp {
                     }
                     self.doc.mark_full_dirty();
                 }
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("−").clicked() {
-                        self.zoom = (self.zoom / 1.25).clamp(0.1, 8.0);
-                    }
-                    ui.label(format!("{}%", (self.zoom * 100.0).round() as u32));
-                    if ui.button("+").clicked() {
-                        self.zoom = (self.zoom * 1.25).clamp(0.1, 8.0);
-                    }
-                    if ui.button("Fit").clicked() {
-                        self.zoom = 0.0; // recomputed in the canvas view
-                        self.view_offset = egui::Vec2::ZERO;
-                        self.view_angle = 0.0;
-                    }
-                });
-                let mut deg = self.view_angle.to_degrees();
-                stepped_slider(ui, &mut deg, -180.0..=180.0, 1.0, "Rotate°");
-                self.view_angle = deg.to_radians();
-                if ui.button("Reset rotation").clicked() {
-                    self.view_angle = 0.0;
-                }
-                // Theme + About flow inline so the bar folds to 2+ lines
-                // on narrow displays. A right_to_left pin inside
-                // horizontal_wrapped draws over left items when the line
-                // is full, which is the overlap seen on small screens.
-                ui.separator();
-                egui::ComboBox::from_id_salt("theme")
-                    .selected_text(self.theme.name())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.theme, Theme::Dark, "Dark");
-                        ui.selectable_value(&mut self.theme, Theme::Light, "Light");
-                        ui.selectable_value(&mut self.theme, Theme::Paper, "Paper");
+                // Phone portrait folds the view cluster into a menu (the
+                // inline stepper starves to a character-wide column below
+                // ~600px); wider screens keep the exact inline layout.
+                if bar_layout(ui.ctx().viewport_rect().width()) == BarLayout::Narrow {
+                    ui.menu_button("View", |ui| {
+                        self.view_controls(ui, true);
                     });
-                let about = if self.has_symbols {
-                    "ⓘ About"
                 } else {
-                    "About"
-                };
-                if ui.button(about).clicked() {
-                    self.show_about = !self.show_about;
+                    self.view_controls(ui, false);
                 }
             });
         });
@@ -2991,8 +3058,15 @@ impl eframe::App for ProCraftApp {
         // under the old id. No max clamp:
         // the panel stays freely resizable, it just starts compact (swatch
         // grids wrap to ~3 rows, page gets the room).
-        if self.show_tools {
-            egui::Panel::left("tools-compact").default_size(240.0).show(ui, |ui| {
+        // Drag-to-collapse (phone fix): shrinking past the minimum closes
+        // the panel instead of clamping; the ▶ strip reopens (drag_to_open
+        // stays off so a stray edge touch never pops panels open).
+        let tools_was = self.show_tools;
+        let mut tools_open = tools_was;
+        egui::Panel::left("tools-compact")
+            .default_size(240.0)
+            .drag_to_open(false)
+            .show_collapsible(ui, &mut tools_open, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Tool");
@@ -3819,927 +3893,1151 @@ impl eframe::App for ProCraftApp {
             }
             });
         });
-        } // end show_tools
+        // Either the ◀ button (inside) or a drag past the minimum (panel)
+        // can close; reopening is only via ▶/persistence, never a drag.
+        self.show_tools = tools_open && self.show_tools;
 
         // Fresh id (not "layers"): panel widths persist to disk by id (see
         // `persistence_path` in `main`), and the old narrow width would
         // otherwise override `default_size` forever.
-        if self.show_layers {
-            egui::Panel::right("layers-wide").default_size(280.0).show(ui, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.add_sized([40.0, 24.0], egui::Button::new("▶")).clicked() {
-                    self.show_layers = false;
-                }
-                ui.heading("Layers");
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Add layer").clicked() {
-                    self.ghost_dirty = true;
-                    self.doc.add_layer(format!("Layer {}", self.doc.layers.len() + 1));
-                }
-                if ui.button("Duplicate").clicked() {
-                    let active = self.doc.active;
-                    self.ghost_dirty = true;
-                    self.doc.duplicate_layer(active);
-                    self.status = "Layer duplicated.".to_string();
-                }
-                let can_merge = self.doc.active > 0 && self.doc.layers.len() > 1;
-                if ui.add_enabled(can_merge, egui::Button::new("Merge down")).clicked() {
-                    let active = self.doc.active;
-                    if self.doc.merge_down(active) {
-                        self.ghost_dirty = true;
-                        self.status = "Merged down.".to_string();
-                    }
-                }
-            });
-            if ui.button("New group").clicked() {
-                let name = format!("Group {}", self.doc.groups.len() + 1);
-                self.doc.new_group(name.clone());
-                self.ghost_dirty = true;
-                self.status = format!("{name} created.");
-            }
-            let mut remove = None;
-            let mut select = None;
-            let mut touched = false;
-            let mut grp_collapse = None;
-            let mut grp_eye = None;
-            let mut grp_add = None;
-            let mut grp_ungroup = None;
-            let mut grp_opacity: Option<(u32, f32)> = None;
-            let mut grp_rename_commit: Option<(u32, String)> = None;
-            // Ancestor chains (top-down group ids) per layer, computed up
-            // front so the row loop can read them without borrowing.
-            let chains: Vec<Vec<u32>> = (0..self.doc.layers.len())
-                .map(|i| {
-                    let mut up = Vec::new();
-                    let mut seen = Vec::new();
-                    let mut g = self.doc.layers[i].group;
-                    while let Some(id) = g {
-                        if seen.contains(&id) {
-                            break;
-                        }
-                        seen.push(id);
-                        let Some(gr) = self.doc.groups.iter().find(|x| x.id == id) else {
-                            break;
-                        };
-                        up.push(id);
-                        g = gr.parent;
-                    }
-                    up.reverse();
-                    up
-                })
-                .collect();
-            let is_collapsed = |doc: &Document, id: u32| {
-                doc.groups
-                    .iter()
-                    .find(|g| g.id == id)
-                    .is_some_and(|g| g.collapsed)
-            };
-            let mut printed: Vec<u32> = Vec::new();
-            for i in (0..self.doc.layers.len()).rev() {
-                let chain = chains[i].clone();
-                for (d, gid) in chain.iter().enumerate() {
-                    if printed.contains(gid) {
-                        continue;
-                    }
-                    // Headers parked under a collapsed ancestor stay hidden
-                    // with their subtree.
-                    if chain[..d].iter().any(|a| is_collapsed(&self.doc, *a)) {
-                        continue;
-                    }
-                    printed.push(*gid);
-                    let (gname, gvis, gcollapsed, gopacity) =
-                        match self.doc.groups.iter().find(|g| g.id == *gid) {
-                            Some(g) => (g.name.clone(), g.visible, g.collapsed, g.opacity),
-                            None => continue,
-                        };
+        // Same drag-to-collapse contract as the tools panel.
+        let mut layers_open = self.show_layers;
+        egui::Panel::right("layers-wide")
+            .default_size(280.0)
+            .drag_to_open(false)
+            .show_collapsible(ui, &mut layers_open, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.add_space(d as f32 * 12.0);
-                        if ui
-                            .small_button(if gcollapsed { "+" } else { "−" })
-                            .on_hover_text(if gcollapsed { "Expand group" } else { "Collapse group" })
-                            .clicked()
-                        {
-                            grp_collapse = Some(*gid);
+                        if ui.add_sized([40.0, 24.0], egui::Button::new("▶")).clicked() {
+                            self.show_layers = false;
                         }
-                        let mut vis = gvis;
-                        if ui
-                            .toggle_value(&mut vis, "👁")
-                            .on_hover_text("Toggle group visibility")
-                            .changed()
-                        {
-                            grp_eye = Some(*gid);
-                        }
-                        if Some(*gid) == self.group_renaming {
-                            let resp =
-                                ui.text_edit_singleline(&mut self.group_name_edit);
-                            if !resp.has_focus() {
-                                resp.request_focus();
-                            }
-                            let enter =
-                                ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
-                            let mut commit = resp.lost_focus() || enter;
-                            let mut cancel = false;
-                            let (ok_label, x_label) = if self.has_symbols {
-                                ("✓", "✕")
-                            } else {
-                                ("OK", "X")
-                            };
-                            if ui.add_sized([44.0, 28.0], egui::Button::new(ok_label)).clicked() {
-                                commit = true;
-                            }
-                            if ui.add_sized([44.0, 28.0], egui::Button::new(x_label)).clicked() {
-                                cancel = true;
-                            }
-                            if commit && !cancel {
-                                let name = std::mem::take(&mut self.group_name_edit);
-                                grp_rename_commit = Some((
-                                    *gid,
-                                    if name.trim().is_empty() {
-                                        gname.clone()
-                                    } else {
-                                        name
-                                    },
-                                ));
-                            }
-                            if commit || cancel {
-                                self.group_renaming = None;
-                                self.group_name_edit.clear();
-                            }
-                        } else {
-                            if ui.selectable_label(false, &gname).clicked() {
-                                self.group_renaming = Some(*gid);
-                                self.group_name_edit = gname.clone();
-                            }
-                        }
-                        if ui
-                            .small_button("+Add")
-                            .on_hover_text("Move active layer into this group")
-                            .clicked()
-                        {
-                            grp_add = Some(*gid);
-                        }
-                        if ui
-                            .small_button("Ungroup")
-                            .on_hover_text("Disband group (keeps layers)")
-                            .clicked()
-                        {
-                            grp_ungroup = Some(*gid);
-                        }
+                        ui.heading("Layers");
                     });
                     ui.horizontal(|ui| {
-                        ui.add_space(d as f32 * 12.0);
-                        let mut gop = gopacity;
-                        stepped_slider(ui, &mut gop, 0.0..=1.0, 0.05, "Opacity");
-                        if (gop - gopacity).abs() > f32::EPSILON {
-                            grp_opacity = Some((*gid, gop));
+                        if ui.button("Add layer").clicked() {
+                            self.ghost_dirty = true;
+                            self.doc
+                                .add_layer(format!("Layer {}", self.doc.layers.len() + 1));
+                        }
+                        if ui.button("Duplicate").clicked() {
+                            let active = self.doc.active;
+                            self.ghost_dirty = true;
+                            self.doc.duplicate_layer(active);
+                            self.status = "Layer duplicated.".to_string();
+                        }
+                        let can_merge = self.doc.active > 0 && self.doc.layers.len() > 1;
+                        if ui
+                            .add_enabled(can_merge, egui::Button::new("Merge down"))
+                            .clicked()
+                        {
+                            let active = self.doc.active;
+                            if self.doc.merge_down(active) {
+                                self.ghost_dirty = true;
+                                self.status = "Merged down.".to_string();
+                            }
                         }
                     });
-                }
-                if chain.iter().any(|id| is_collapsed(&self.doc, *id)) {
-                    continue;
-                }
-                let depth = chain.len();
-                let layer = &mut self.doc.layers[i];
-                ui.horizontal(|ui| {
-                    ui.add_space(depth as f32 * 12.0);
-                    let mut vis = layer.visible;
-                    if ui
-                        .toggle_value(&mut vis, "👁")
-                        .on_hover_text("Toggle layer visibility")
-                        .changed()
-                    {
-                        layer.visible = vis;
-                        touched = true;
-                    }
-                    let selected = self.doc.active == i;
-                    if Some(i) == self.renaming {
-                        // Double-clicked: edit the name in a staged buffer so
-                        // Cancel can discard it. Commits via Save, Enter, or
-                        // focus loss (touch keyboards often send neither, so
-                        // the buttons are the reliable path on iPad).
-                        let resp = ui.text_edit_singleline(&mut self.renaming_text);
-                        if !resp.has_focus() {
-                            resp.request_focus();
-                        }
-                            let enter = ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
-                            let mut commit = resp.lost_focus() || enter;
-                            let mut cancel = false;
-                            let (ok_label, x_label) = if self.has_symbols {
-                                ("✓", "✕")
-                            } else {
-                                ("OK", "X")
-                            };
-                            if ui.add_sized([44.0, 28.0], egui::Button::new(ok_label)).clicked() {
-                                commit = true;
-                            }
-                            if ui.add_sized([44.0, 28.0], egui::Button::new(x_label)).clicked() {
-                                cancel = true;
-                            }
-                        if commit && !cancel {
-                            if self.renaming_text.trim().is_empty() {
-                                self.renaming_text = format!("Layer {}", i + 1);
-                            }
-                            layer.name = std::mem::take(&mut self.renaming_text);
-                        }
-                        if commit || cancel {
-                            self.renaming = None;
-                            self.renaming_text.clear();
-                        }
-                    } else {
-                        let resp = ui.selectable_label(selected, &layer.name);
-                        if resp.clicked() {
-                            select = Some(i);
-                        }
-                        if resp.double_clicked() {
-                            select = Some(i);
-                            self.renaming = Some(i);
-                            self.renaming_text = layer.name.clone();
-                        }
-                    }
-                    if ui
-                        .add_sized([44.0, 24.0], egui::Button::new("del"))
-                        .clicked()
-                    {
-                        remove = Some(i);
-                    }
-                    if layer.mask.is_some() {
-                        ui.label("M");
-                    }
-                    if layer.clip {
-                        ui.label("C");
-                    }
-                });
-            }
-            if let Some(i) = select {
-                self.doc.active = i;
-                // A fresh full upload (matters for the mask viewer).
-                self.doc.mark_full_dirty();
-                if !self.doc.is_layer_shown(i) {
-                    self.status = "Active layer is in a hidden group.".to_string();
-                }
-            }
-            if let Some(gid) = grp_collapse {
-                let cur = self
-                    .doc
-                    .groups
-                    .iter()
-                    .find(|g| g.id == gid)
-                    .is_some_and(|g| g.collapsed);
-                self.doc.set_group_collapsed(gid, !cur);
-            }
-            if let Some(gid) = grp_eye {
-                let cur = self
-                    .doc
-                    .groups
-                    .iter()
-                    .find(|g| g.id == gid)
-                    .is_none_or(|g| g.visible);
-                self.doc.set_group_visible(gid, !cur);
-                self.ghost_dirty = true;
-                self.doc.mark_full_dirty();
-            }
-            if let Some(gid) = grp_add {
-                let active = self.doc.active;
-                self.doc.move_layer_into_group(active, Some(gid));
-                self.ghost_dirty = true;
-                self.status = "Active layer moved into the group.".to_string();
-            }
-            if let Some(gid) = grp_ungroup {
-                self.doc.ungroup(gid);
-                self.ghost_dirty = true;
-                self.doc.mark_full_dirty();
-                self.status = "Group disbanded (layers kept).".to_string();
-            }
-            if let Some((gid, op)) = grp_opacity {
-                self.doc.set_group_opacity(gid, op);
-                self.ghost_dirty = true;
-                self.doc.mark_full_dirty();
-            }
-            if let Some((gid, name)) = grp_rename_commit {
-                self.doc.rename_group(gid, name);
-            }
-            if touched {
-                self.ghost_dirty = true;
-                self.doc.mark_full_dirty();
-            }
-            if let Some(i) = remove {
-                self.ghost_dirty = true;
-                self.doc.remove_layer(i);
-            }
-            ui.separator();
-            if let Some(layer) = self.doc.layers.get_mut(self.doc.active) {
-                ui.label(format!("Opacity: {}", layer.name));
-                let before = layer.opacity;
-                stepped_slider(ui, &mut layer.opacity, 0.0..=1.0, 0.05, "");
-                let mut blend = layer.blend;
-                let mut moved = 0;
-                egui::ComboBox::from_label("Blend")
-                    .selected_text(blend.name())
-                    .show_ui(ui, |ui| {
-                        for m in BlendMode::ALL {
-                            ui.selectable_value(&mut blend, m, m.name());
-                        }
-                    });
-                ui.horizontal(|ui| {
-                    if ui.button("▲ Up").clicked() {
-                        moved = 1;
-                    }
-                    if ui.button("▼ Down").clicked() {
-                        moved = -1;
-                    }
-                });
-                let active = self.doc.active;
-                let mut dirty = (self.doc.layers[active].opacity - before).abs() > f32::EPSILON;
-                if self.doc.layers[active].blend != blend {
-                    self.doc.layers[active].blend = blend;
-                    dirty = true;
-                }
-                if moved > 0 && active + 1 < self.doc.layers.len() {
-                    self.doc.move_layer(active, active + 1);
-                } else if moved < 0 && active > 0 {
-                    self.doc.move_layer(active, active - 1);
-                }
-                if dirty {
-                    self.ghost_dirty = true;
-                    self.doc.mark_full_dirty();
-                }
-                // Masks, clipping and paint target for the active layer.
-                let has_mask = self.doc.layers[active].mask.is_some();
-                ui.horizontal(|ui| {
-                    if ui.button(if has_mask { "Clear mask" } else { "Add mask" }).clicked() {
+                    if ui.button("New group").clicked() {
+                        let name = format!("Group {}", self.doc.groups.len() + 1);
+                        self.doc.new_group(name.clone());
                         self.ghost_dirty = true;
-                        if has_mask {
-                            self.doc.clear_mask(active);
-                            self.view_mask = false;
-                            self.status = "Mask cleared.".to_string();
-                        } else {
-                            self.doc.add_mask(active);
-                            self.status = "Mask added (white reveals). Paint on Mask to edit.".to_string();
-                        }
+                        self.status = format!("{name} created.");
                     }
-                    if ui.checkbox(&mut self.view_mask, "View").changed() {
-                        self.doc.mark_full_dirty();
-                        self.status = if self.view_mask {
-                            "Mask view: white reveals, black conceals.".to_string()
-                        } else {
-                            "Canvas view.".to_string()
-                        };
-                    }
-                });
-                ui.horizontal(|ui| {
-                    let mut clip = self.doc.layers[active].clip;
-                    if ui.checkbox(&mut clip, "Clip to below").changed() {
-                        self.ghost_dirty = true;
-                        self.doc.layers[active].clip = clip;
-                        self.doc.mark_full_dirty();
-                        self.status = if clip { "Layer clips to below.".to_string() } else { "Clip off.".to_string() };
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Paint:");
-                    ui.radio_value(&mut self.doc.paint_target, PaintTarget::Color, "Color");
-                    ui.radio_value(&mut self.doc.paint_target, PaintTarget::Mask, "Mask");
-                });
-            }
-            ui.separator();
-            ui.label(format!(
-                "{} layer(s), active: {}",
-                self.doc.layers.len(),
-                self.doc.layers.get(self.doc.active).map(|l| l.name.as_str()).unwrap_or("-")
-            ));
-            ui.separator();
-            ui.heading("Animation");
-            ui.label("Layers are frames, bottom first.");
-            ui.horizontal(|ui| {
-                if ui.checkbox(&mut self.anim_assist, "Assist").changed() {
-                    self.anim_playing = false;
-                    self.texture = None; // rebuild the view (frame vs composite)
-                    self.ghost_dirty = true;
-                    self.status = if self.anim_assist {
-                        "Animation Assist on: one frame at a time.".to_string()
-                    } else {
-                        "Animation Assist off.".to_string()
-                    };
-                }
-                let playing = self.anim_playing;
-                if ui.button(if playing { "Stop" } else { "Play" }).clicked() {
-                    if playing {
-                        self.anim_playing = false;
-                        self.status = "Playback stopped.".to_string();
-                    } else if self.doc.layers.len() < 2 {
-                        self.status = "Need at least 2 layers to play.".to_string();
-                    } else {
-                        self.anim_assist = true;
-                        self.anim_playing = true;
-                        self.anim_fwd = true;
-                        self.anim_last_t = ui.ctx().input(|i| i.time);
-                        self.texture = None;
-                        self.ghost_dirty = true;
-                        self.status = "Playing.".to_string();
-                    }
-                }
-            });
-            if self.anim_assist && !self.doc.layers.is_empty() {
-                ui.horizontal(|ui| {
-                    if ui.button("|<").clicked() {
-                        let n = self.doc.layers.len();
-                        self.doc.active = (self.doc.active + n - 1) % n;
-                        self.doc.mark_full_dirty();
-                    }
-                    ui.label(format!("Frame {}/{}", self.doc.active + 1, self.doc.layers.len()));
-                    if ui.button(">|").clicked() {
-                        let n = self.doc.layers.len();
-                        self.doc.active = (self.doc.active + 1) % n;
-                        self.doc.mark_full_dirty();
-                    }
-                    if ui.button("Duplicate frame").clicked() {
-                        let active = self.doc.active;
-                        self.doc.duplicate_layer(active);
-                        self.ghost_dirty = true;
-                        self.status = format!("Frame {} duplicated.", self.doc.active + 1);
-                    }
-                });
-                stepped_slider(ui, &mut self.anim_fps, MIN_ANIM_FPS..=MAX_ANIM_FPS, 1.0, "FPS");
-                ui.horizontal(|ui| {
-                    ui.label("Loop:");
-                    for m in LoopMode::ALL {
-                        ui.radio_value(&mut self.anim_loop, m, m.name());
-                    }
-                });
-                // Per-frame hold: the stepper edits the current frame only.
-                let mut hold = self
-                    .doc
-                    .layers
-                    .get(self.doc.active)
-                    .map(|l| l.hold)
-                    .unwrap_or(MIN_ANIM_HOLD)
-                    .clamp(MIN_ANIM_HOLD, MAX_ANIM_HOLD);
-                stepped_slider(ui, &mut hold, MIN_ANIM_HOLD..=MAX_ANIM_HOLD, 1.0, "Frame hold");
-                if let Some(layer) = self.doc.layers.get_mut(self.doc.active) {
-                    if layer.hold != hold {
-                        layer.hold = hold;
-                    }
-                }
-                if ui.checkbox(&mut self.onion, "Onion skin").changed() {
-                    self.ghost_dirty = true;
-                }
-                if self.onion {
-                    let before = (self.onion_prev, self.onion_next);
-                    stepped_slider(ui, &mut self.onion_prev, 0.05..=0.8, 0.05, "Prev ghost");
-                    stepped_slider(ui, &mut self.onion_next, 0.05..=0.8, 0.05, "Next ghost");
-                    if (self.onion_prev, self.onion_next) != before {
-                        self.ghost_dirty = true;
-                    }
-                }
-                if ui.button("Export GIF").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().add_filter("GIF image", &["gif"]).save_file()
-                    {
-                        let path = ensure_extension(path, "gif");
-                        match export_gif_ext(&self.doc, self.anim_fps, self.anim_loop) {
-                            Ok(bytes) => match std::fs::write(&path, &bytes) {
-                                Ok(()) => {
-                                    let shown =
-                                        self.doc.layers.iter().filter(|l| l.visible).count();
-                                    let exported = if self.anim_loop == LoopMode::PingPong && shown > 2
-                                    {
-                                        2 * shown - 2
-                                    } else {
-                                        shown
-                                    };
-                                    let held =
-                                        self.doc.layers.iter().filter(|l| l.hold > 1).count();
-                                    let extra = match (self.anim_loop, held) {
-                                        (LoopMode::PingPong, 0) => ", ping-pong".to_string(),
-                                        (LoopMode::PingPong, _) => {
-                                            format!(", ping-pong, {held} held")
-                                        }
-                                        (LoopMode::Forward, 0) => String::new(),
-                                        (LoopMode::Forward, _) => format!(", {held} held"),
-                                    };
-                                    self.status = format!(
-                                        "GIF saved {} ({} frames, hidden skipped{extra}).",
-                                        path.display(),
-                                        exported
-                                    );
-                                    #[cfg(target_os = "ios")]
-                                    rfd::ios_share_file(&path);
-                                    #[cfg(target_os = "android")]
-                                    rfd::android_scan_file(&path);
+                    let mut remove = None;
+                    let mut select = None;
+                    let mut touched = false;
+                    let mut grp_collapse = None;
+                    let mut grp_eye = None;
+                    let mut grp_add = None;
+                    let mut grp_ungroup = None;
+                    let mut grp_opacity: Option<(u32, f32)> = None;
+                    let mut grp_rename_commit: Option<(u32, String)> = None;
+                    // Ancestor chains (top-down group ids) per layer, computed up
+                    // front so the row loop can read them without borrowing.
+                    let chains: Vec<Vec<u32>> = (0..self.doc.layers.len())
+                        .map(|i| {
+                            let mut up = Vec::new();
+                            let mut seen = Vec::new();
+                            let mut g = self.doc.layers[i].group;
+                            while let Some(id) = g {
+                                if seen.contains(&id) {
+                                    break;
                                 }
-                                Err(e) => self.status = format!("GIF save failed: {e}"),
-                            },
-                            Err(e) => self.status = format!("GIF export failed: {e}"),
-                        }
-                    }
-                }
-                if ui.button("Import GIF").clicked() {
-                    #[cfg(not(target_os = "ios"))]
-                    if let Some(path) = rfd::FileDialog::new().add_filter("GIF image", &["gif"]).pick_file()
-                    {
-                        match std::fs::read(&path)
-                            .map_err(|e| e.to_string())
-                            .and_then(|b| import_gif_document(&b))
-                        {
-                            Ok((doc, fps)) => {
-                                self.status = format!(
-                                    "GIF imported {} ({} frames, {} fps).",
-                                    path.display(),
-                                    doc.layers.len(),
-                                    fps
-                                );
-                                self.adopt_gif(doc, fps);
+                                seen.push(id);
+                                let Some(gr) = self.doc.groups.iter().find(|x| x.id == id) else {
+                                    break;
+                                };
+                                up.push(id);
+                                g = gr.parent;
                             }
-                            Err(e) => self.status = format!("GIF import failed: {e}"),
+                            up.reverse();
+                            up
+                        })
+                        .collect();
+                    let is_collapsed = |doc: &Document, id: u32| {
+                        doc.groups
+                            .iter()
+                            .find(|g| g.id == id)
+                            .is_some_and(|g| g.collapsed)
+                    };
+                    let mut printed: Vec<u32> = Vec::new();
+                    for i in (0..self.doc.layers.len()).rev() {
+                        let chain = chains[i].clone();
+                        for (d, gid) in chain.iter().enumerate() {
+                            if printed.contains(gid) {
+                                continue;
+                            }
+                            // Headers parked under a collapsed ancestor stay hidden
+                            // with their subtree.
+                            if chain[..d].iter().any(|a| is_collapsed(&self.doc, *a)) {
+                                continue;
+                            }
+                            printed.push(*gid);
+                            let (gname, gvis, gcollapsed, gopacity) =
+                                match self.doc.groups.iter().find(|g| g.id == *gid) {
+                                    Some(g) => (g.name.clone(), g.visible, g.collapsed, g.opacity),
+                                    None => continue,
+                                };
+                            ui.horizontal(|ui| {
+                                ui.add_space(d as f32 * 12.0);
+                                if ui
+                                    .small_button(if gcollapsed { "+" } else { "−" })
+                                    .on_hover_text(if gcollapsed {
+                                        "Expand group"
+                                    } else {
+                                        "Collapse group"
+                                    })
+                                    .clicked()
+                                {
+                                    grp_collapse = Some(*gid);
+                                }
+                                let mut vis = gvis;
+                                if ui
+                                    .toggle_value(&mut vis, "👁")
+                                    .on_hover_text("Toggle group visibility")
+                                    .changed()
+                                {
+                                    grp_eye = Some(*gid);
+                                }
+                                if Some(*gid) == self.group_renaming {
+                                    let resp = ui.text_edit_singleline(&mut self.group_name_edit);
+                                    if !resp.has_focus() {
+                                        resp.request_focus();
+                                    }
+                                    let enter =
+                                        ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
+                                    let mut commit = resp.lost_focus() || enter;
+                                    let mut cancel = false;
+                                    let (ok_label, x_label) = if self.has_symbols {
+                                        ("✓", "✕")
+                                    } else {
+                                        ("OK", "X")
+                                    };
+                                    if ui
+                                        .add_sized([44.0, 28.0], egui::Button::new(ok_label))
+                                        .clicked()
+                                    {
+                                        commit = true;
+                                    }
+                                    if ui
+                                        .add_sized([44.0, 28.0], egui::Button::new(x_label))
+                                        .clicked()
+                                    {
+                                        cancel = true;
+                                    }
+                                    if commit && !cancel {
+                                        let name = std::mem::take(&mut self.group_name_edit);
+                                        grp_rename_commit = Some((
+                                            *gid,
+                                            if name.trim().is_empty() {
+                                                gname.clone()
+                                            } else {
+                                                name
+                                            },
+                                        ));
+                                    }
+                                    if commit || cancel {
+                                        self.group_renaming = None;
+                                        self.group_name_edit.clear();
+                                    }
+                                } else {
+                                    if ui.selectable_label(false, &gname).clicked() {
+                                        self.group_renaming = Some(*gid);
+                                        self.group_name_edit = gname.clone();
+                                    }
+                                }
+                                if ui
+                                    .small_button("+Add")
+                                    .on_hover_text("Move active layer into this group")
+                                    .clicked()
+                                {
+                                    grp_add = Some(*gid);
+                                }
+                                if ui
+                                    .small_button("Ungroup")
+                                    .on_hover_text("Disband group (keeps layers)")
+                                    .clicked()
+                                {
+                                    grp_ungroup = Some(*gid);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_space(d as f32 * 12.0);
+                                let mut gop = gopacity;
+                                stepped_slider(ui, &mut gop, 0.0..=1.0, 0.05, "Opacity");
+                                if (gop - gopacity).abs() > f32::EPSILON {
+                                    grp_opacity = Some((*gid, gop));
+                                }
+                            });
+                        }
+                        if chain.iter().any(|id| is_collapsed(&self.doc, *id)) {
+                            continue;
+                        }
+                        let depth = chain.len();
+                        let layer = &mut self.doc.layers[i];
+                        ui.horizontal(|ui| {
+                            ui.add_space(depth as f32 * 12.0);
+                            let mut vis = layer.visible;
+                            if ui
+                                .toggle_value(&mut vis, "👁")
+                                .on_hover_text("Toggle layer visibility")
+                                .changed()
+                            {
+                                layer.visible = vis;
+                                touched = true;
+                            }
+                            let selected = self.doc.active == i;
+                            if Some(i) == self.renaming {
+                                // Double-clicked: edit the name in a staged buffer so
+                                // Cancel can discard it. Commits via Save, Enter, or
+                                // focus loss (touch keyboards often send neither, so
+                                // the buttons are the reliable path on iPad).
+                                let resp = ui.text_edit_singleline(&mut self.renaming_text);
+                                if !resp.has_focus() {
+                                    resp.request_focus();
+                                }
+                                let enter = ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
+                                let mut commit = resp.lost_focus() || enter;
+                                let mut cancel = false;
+                                let (ok_label, x_label) = if self.has_symbols {
+                                    ("✓", "✕")
+                                } else {
+                                    ("OK", "X")
+                                };
+                                if ui
+                                    .add_sized([44.0, 28.0], egui::Button::new(ok_label))
+                                    .clicked()
+                                {
+                                    commit = true;
+                                }
+                                if ui
+                                    .add_sized([44.0, 28.0], egui::Button::new(x_label))
+                                    .clicked()
+                                {
+                                    cancel = true;
+                                }
+                                if commit && !cancel {
+                                    if self.renaming_text.trim().is_empty() {
+                                        self.renaming_text = format!("Layer {}", i + 1);
+                                    }
+                                    layer.name = std::mem::take(&mut self.renaming_text);
+                                }
+                                if commit || cancel {
+                                    self.renaming = None;
+                                    self.renaming_text.clear();
+                                }
+                            } else {
+                                let resp = ui.selectable_label(selected, &layer.name);
+                                if resp.clicked() {
+                                    select = Some(i);
+                                }
+                                if resp.double_clicked() {
+                                    select = Some(i);
+                                    self.renaming = Some(i);
+                                    self.renaming_text = layer.name.clone();
+                                }
+                            }
+                            if ui
+                                .add_sized([44.0, 24.0], egui::Button::new("del"))
+                                .clicked()
+                            {
+                                remove = Some(i);
+                            }
+                            if layer.mask.is_some() {
+                                ui.label("M");
+                            }
+                            if layer.clip {
+                                ui.label("C");
+                            }
+                        });
+                    }
+                    if let Some(i) = select {
+                        self.doc.active = i;
+                        // A fresh full upload (matters for the mask viewer).
+                        self.doc.mark_full_dirty();
+                        if !self.doc.is_layer_shown(i) {
+                            self.status = "Active layer is in a hidden group.".to_string();
                         }
                     }
-                    #[cfg(target_os = "ios")]
-                    {
-                        let _ = rfd::FileDialog::new()
-                            .add_filter("GIF image", &["gif"])
-                            .pick_file();
-                        self.pending_open = Some(PendingOpen::Gif);
-                        self.status = "Pick GIF…".to_string();
+                    if let Some(gid) = grp_collapse {
+                        let cur = self
+                            .doc
+                            .groups
+                            .iter()
+                            .find(|g| g.id == gid)
+                            .is_some_and(|g| g.collapsed);
+                        self.doc.set_group_collapsed(gid, !cur);
                     }
-                    #[cfg(target_os = "android")]
-                    {
-                        self.android_browse = Some(PendingOpen::Gif);
+                    if let Some(gid) = grp_eye {
+                        let cur = self
+                            .doc
+                            .groups
+                            .iter()
+                            .find(|g| g.id == gid)
+                            .is_none_or(|g| g.visible);
+                        self.doc.set_group_visible(gid, !cur);
+                        self.ghost_dirty = true;
+                        self.doc.mark_full_dirty();
                     }
-                }
-                // M41 Time-lapse: staged snapshots while recording
-                // (session-only, capped small thumbs), exported as GIF.
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.lapse_on, "Time-lapse");
-                    ui.label(format!("{} frames", self.lapse_frames.len()));
-                });
-                if !self.lapse_frames.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add_sized([110.0, 28.0], egui::Button::new("Export lapse"))
-                            .clicked()
-                        {
+                    if let Some(gid) = grp_add {
+                        let active = self.doc.active;
+                        self.doc.move_layer_into_group(active, Some(gid));
+                        self.ghost_dirty = true;
+                        self.status = "Active layer moved into the group.".to_string();
+                    }
+                    if let Some(gid) = grp_ungroup {
+                        self.doc.ungroup(gid);
+                        self.ghost_dirty = true;
+                        self.doc.mark_full_dirty();
+                        self.status = "Group disbanded (layers kept).".to_string();
+                    }
+                    if let Some((gid, op)) = grp_opacity {
+                        self.doc.set_group_opacity(gid, op);
+                        self.ghost_dirty = true;
+                        self.doc.mark_full_dirty();
+                    }
+                    if let Some((gid, name)) = grp_rename_commit {
+                        self.doc.rename_group(gid, name);
+                    }
+                    if touched {
+                        self.ghost_dirty = true;
+                        self.doc.mark_full_dirty();
+                    }
+                    if let Some(i) = remove {
+                        self.ghost_dirty = true;
+                        self.doc.remove_layer(i);
+                    }
+                    ui.separator();
+                    if let Some(layer) = self.doc.layers.get_mut(self.doc.active) {
+                        ui.label(format!("Opacity: {}", layer.name));
+                        let before = layer.opacity;
+                        stepped_slider(ui, &mut layer.opacity, 0.0..=1.0, 0.05, "");
+                        let mut blend = layer.blend;
+                        let mut moved = 0;
+                        egui::ComboBox::from_label("Blend")
+                            .selected_text(blend.name())
+                            .show_ui(ui, |ui| {
+                                for m in BlendMode::ALL {
+                                    ui.selectable_value(&mut blend, m, m.name());
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            if ui.button("▲ Up").clicked() {
+                                moved = 1;
+                            }
+                            if ui.button("▼ Down").clicked() {
+                                moved = -1;
+                            }
+                        });
+                        let active = self.doc.active;
+                        let mut dirty =
+                            (self.doc.layers[active].opacity - before).abs() > f32::EPSILON;
+                        if self.doc.layers[active].blend != blend {
+                            self.doc.layers[active].blend = blend;
+                            dirty = true;
+                        }
+                        if moved > 0 && active + 1 < self.doc.layers.len() {
+                            self.doc.move_layer(active, active + 1);
+                        } else if moved < 0 && active > 0 {
+                            self.doc.move_layer(active, active - 1);
+                        }
+                        if dirty {
+                            self.ghost_dirty = true;
+                            self.doc.mark_full_dirty();
+                        }
+                        // Masks, clipping and paint target for the active layer.
+                        let has_mask = self.doc.layers[active].mask.is_some();
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(if has_mask { "Clear mask" } else { "Add mask" })
+                                .clicked()
+                            {
+                                self.ghost_dirty = true;
+                                if has_mask {
+                                    self.doc.clear_mask(active);
+                                    self.view_mask = false;
+                                    self.status = "Mask cleared.".to_string();
+                                } else {
+                                    self.doc.add_mask(active);
+                                    self.status =
+                                        "Mask added (white reveals). Paint on Mask to edit."
+                                            .to_string();
+                                }
+                            }
+                            if ui.checkbox(&mut self.view_mask, "View").changed() {
+                                self.doc.mark_full_dirty();
+                                self.status = if self.view_mask {
+                                    "Mask view: white reveals, black conceals.".to_string()
+                                } else {
+                                    "Canvas view.".to_string()
+                                };
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let mut clip = self.doc.layers[active].clip;
+                            if ui.checkbox(&mut clip, "Clip to below").changed() {
+                                self.ghost_dirty = true;
+                                self.doc.layers[active].clip = clip;
+                                self.doc.mark_full_dirty();
+                                self.status = if clip {
+                                    "Layer clips to below.".to_string()
+                                } else {
+                                    "Clip off.".to_string()
+                                };
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Paint:");
+                            ui.radio_value(&mut self.doc.paint_target, PaintTarget::Color, "Color");
+                            ui.radio_value(&mut self.doc.paint_target, PaintTarget::Mask, "Mask");
+                        });
+                    }
+                    ui.separator();
+                    ui.label(format!(
+                        "{} layer(s), active: {}",
+                        self.doc.layers.len(),
+                        self.doc
+                            .layers
+                            .get(self.doc.active)
+                            .map(|l| l.name.as_str())
+                            .unwrap_or("-")
+                    ));
+                    ui.separator();
+                    ui.heading("Animation");
+                    ui.label("Layers are frames, bottom first.");
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut self.anim_assist, "Assist").changed() {
+                            self.anim_playing = false;
+                            self.texture = None; // rebuild the view (frame vs composite)
+                            self.ghost_dirty = true;
+                            self.status = if self.anim_assist {
+                                "Animation Assist on: one frame at a time.".to_string()
+                            } else {
+                                "Animation Assist off.".to_string()
+                            };
+                        }
+                        let playing = self.anim_playing;
+                        if ui.button(if playing { "Stop" } else { "Play" }).clicked() {
+                            if playing {
+                                self.anim_playing = false;
+                                self.status = "Playback stopped.".to_string();
+                            } else if self.doc.layers.len() < 2 {
+                                self.status = "Need at least 2 layers to play.".to_string();
+                            } else {
+                                self.anim_assist = true;
+                                self.anim_playing = true;
+                                self.anim_fwd = true;
+                                self.anim_last_t = ui.ctx().input(|i| i.time);
+                                self.texture = None;
+                                self.ghost_dirty = true;
+                                self.status = "Playing.".to_string();
+                            }
+                        }
+                    });
+                    if self.anim_assist && !self.doc.layers.is_empty() {
+                        ui.horizontal(|ui| {
+                            if ui.button("|<").clicked() {
+                                let n = self.doc.layers.len();
+                                self.doc.active = (self.doc.active + n - 1) % n;
+                                self.doc.mark_full_dirty();
+                            }
+                            ui.label(format!(
+                                "Frame {}/{}",
+                                self.doc.active + 1,
+                                self.doc.layers.len()
+                            ));
+                            if ui.button(">|").clicked() {
+                                let n = self.doc.layers.len();
+                                self.doc.active = (self.doc.active + 1) % n;
+                                self.doc.mark_full_dirty();
+                            }
+                            if ui.button("Duplicate frame").clicked() {
+                                let active = self.doc.active;
+                                self.doc.duplicate_layer(active);
+                                self.ghost_dirty = true;
+                                self.status = format!("Frame {} duplicated.", self.doc.active + 1);
+                            }
+                        });
+                        stepped_slider(
+                            ui,
+                            &mut self.anim_fps,
+                            MIN_ANIM_FPS..=MAX_ANIM_FPS,
+                            1.0,
+                            "FPS",
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Loop:");
+                            for m in LoopMode::ALL {
+                                ui.radio_value(&mut self.anim_loop, m, m.name());
+                            }
+                        });
+                        // Per-frame hold: the stepper edits the current frame only.
+                        let mut hold = self
+                            .doc
+                            .layers
+                            .get(self.doc.active)
+                            .map(|l| l.hold)
+                            .unwrap_or(MIN_ANIM_HOLD)
+                            .clamp(MIN_ANIM_HOLD, MAX_ANIM_HOLD);
+                        stepped_slider(
+                            ui,
+                            &mut hold,
+                            MIN_ANIM_HOLD..=MAX_ANIM_HOLD,
+                            1.0,
+                            "Frame hold",
+                        );
+                        if let Some(layer) = self.doc.layers.get_mut(self.doc.active) {
+                            if layer.hold != hold {
+                                layer.hold = hold;
+                            }
+                        }
+                        if ui.checkbox(&mut self.onion, "Onion skin").changed() {
+                            self.ghost_dirty = true;
+                        }
+                        if self.onion {
+                            let before = (self.onion_prev, self.onion_next);
+                            stepped_slider(
+                                ui,
+                                &mut self.onion_prev,
+                                0.05..=0.8,
+                                0.05,
+                                "Prev ghost",
+                            );
+                            stepped_slider(
+                                ui,
+                                &mut self.onion_next,
+                                0.05..=0.8,
+                                0.05,
+                                "Next ghost",
+                            );
+                            if (self.onion_prev, self.onion_next) != before {
+                                self.ghost_dirty = true;
+                            }
+                        }
+                        if ui.button("Export GIF").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
                                 .add_filter("GIF image", &["gif"])
                                 .save_file()
                             {
                                 let path = ensure_extension(path, "gif");
-                                match export_timelapse(&self.lapse_frames, 10) {
+                                match export_gif_ext(&self.doc, self.anim_fps, self.anim_loop) {
                                     Ok(bytes) => match std::fs::write(&path, &bytes) {
                                         Ok(()) => {
+                                            let shown = self
+                                                .doc
+                                                .layers
+                                                .iter()
+                                                .filter(|l| l.visible)
+                                                .count();
+                                            let exported = if self.anim_loop == LoopMode::PingPong
+                                                && shown > 2
+                                            {
+                                                2 * shown - 2
+                                            } else {
+                                                shown
+                                            };
+                                            let held = self
+                                                .doc
+                                                .layers
+                                                .iter()
+                                                .filter(|l| l.hold > 1)
+                                                .count();
+                                            let extra = match (self.anim_loop, held) {
+                                                (LoopMode::PingPong, 0) => {
+                                                    ", ping-pong".to_string()
+                                                }
+                                                (LoopMode::PingPong, _) => {
+                                                    format!(", ping-pong, {held} held")
+                                                }
+                                                (LoopMode::Forward, 0) => String::new(),
+                                                (LoopMode::Forward, _) => format!(", {held} held"),
+                                            };
                                             self.status = format!(
-                                                "Time-lapse saved {} ({} frames).",
+                                                "GIF saved {} ({} frames, hidden skipped{extra}).",
                                                 path.display(),
-                                                self.lapse_frames.len()
+                                                exported
                                             );
                                             #[cfg(target_os = "ios")]
                                             rfd::ios_share_file(&path);
                                             #[cfg(target_os = "android")]
                                             rfd::android_scan_file(&path);
                                         }
-                                        Err(e) => {
-                                            self.status = format!("Time-lapse save failed: {e}")
-                                        }
+                                        Err(e) => self.status = format!("GIF save failed: {e}"),
                                     },
-                                    Err(e) => {
-                                        self.status = format!("Time-lapse export failed: {e}")
-                                    }
+                                    Err(e) => self.status = format!("GIF export failed: {e}"),
                                 }
                             }
                         }
-                        if ui
-                            .add_sized([110.0, 28.0], egui::Button::new("Clear lapse"))
-                            .clicked()
-                        {
-                            self.lapse_frames.clear();
-                            self.status = "Time-lapse cleared.".to_string();
+                        if ui.button("Import GIF").clicked() {
+                            #[cfg(not(target_os = "ios"))]
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("GIF image", &["gif"])
+                                .pick_file()
+                            {
+                                match std::fs::read(&path)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|b| import_gif_document(&b))
+                                {
+                                    Ok((doc, fps)) => {
+                                        self.status = format!(
+                                            "GIF imported {} ({} frames, {} fps).",
+                                            path.display(),
+                                            doc.layers.len(),
+                                            fps
+                                        );
+                                        self.adopt_gif(doc, fps);
+                                    }
+                                    Err(e) => self.status = format!("GIF import failed: {e}"),
+                                }
+                            }
+                            #[cfg(target_os = "ios")]
+                            {
+                                let _ = rfd::FileDialog::new()
+                                    .add_filter("GIF image", &["gif"])
+                                    .pick_file();
+                                self.pending_open = Some(PendingOpen::Gif);
+                                self.status = "Pick GIF…".to_string();
+                            }
+                            #[cfg(target_os = "android")]
+                            {
+                                self.android_browse = Some(PendingOpen::Gif);
+                            }
+                        }
+                        // M41 Time-lapse: staged snapshots while recording
+                        // (session-only, capped small thumbs), exported as GIF.
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.lapse_on, "Time-lapse");
+                            ui.label(format!("{} frames", self.lapse_frames.len()));
+                        });
+                        if !self.lapse_frames.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .add_sized([110.0, 28.0], egui::Button::new("Export lapse"))
+                                    .clicked()
+                                {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("GIF image", &["gif"])
+                                        .save_file()
+                                    {
+                                        let path = ensure_extension(path, "gif");
+                                        match export_timelapse(&self.lapse_frames, 10) {
+                                            Ok(bytes) => match std::fs::write(&path, &bytes) {
+                                                Ok(()) => {
+                                                    self.status = format!(
+                                                        "Time-lapse saved {} ({} frames).",
+                                                        path.display(),
+                                                        self.lapse_frames.len()
+                                                    );
+                                                    #[cfg(target_os = "ios")]
+                                                    rfd::ios_share_file(&path);
+                                                    #[cfg(target_os = "android")]
+                                                    rfd::android_scan_file(&path);
+                                                }
+                                                Err(e) => {
+                                                    self.status =
+                                                        format!("Time-lapse save failed: {e}")
+                                                }
+                                            },
+                                            Err(e) => {
+                                                self.status =
+                                                    format!("Time-lapse export failed: {e}")
+                                            }
+                                        }
+                                    }
+                                }
+                                if ui
+                                    .add_sized([110.0, 28.0], egui::Button::new("Clear lapse"))
+                                    .clicked()
+                                {
+                                    self.lapse_frames.clear();
+                                    self.status = "Time-lapse cleared.".to_string();
+                                }
+                            });
+                        }
+                    }
+                    ui.separator();
+                    ui.heading("Transform layer");
+                    ui.horizontal(|ui| {
+                        if ui.button("Scale +").clicked() {
+                            self.doc.checkpoint();
+                            self.doc.affine_layer(self.doc.active, 1.25, 0.0);
+                        }
+                        if ui.button("Scale −").clicked() {
+                            self.doc.checkpoint();
+                            self.doc.affine_layer(self.doc.active, 1.0 / 1.25, 0.0);
                         }
                     });
-                }
-            }
-            ui.separator();
-            ui.heading("Transform layer");
-            ui.horizontal(|ui| {
-                if ui.button("Scale +").clicked() {
-                    self.doc.checkpoint();
-                    self.doc.affine_layer(self.doc.active, 1.25, 0.0);
-                }
-                if ui.button("Scale −").clicked() {
-                    self.doc.checkpoint();
-                    self.doc.affine_layer(self.doc.active, 1.0 / 1.25, 0.0);
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button(if self.has_symbols { "⟲ −15°" } else { "−15°" }).clicked() {
-                    self.doc.checkpoint();
-                    self.doc.affine_layer(self.doc.active, 1.0, -15.0);
-                }
-                if ui.button(if self.has_symbols { "⟳ +15°" } else { "+15°" }).clicked() {
-                    self.doc.checkpoint();
-                    self.doc.affine_layer(self.doc.active, 1.0, 15.0);
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Flip H").clicked() {
-                    self.doc.checkpoint();
-                    self.doc.flip_layer_horizontal(self.doc.active);
-                    self.status = "Layer flipped horizontally.".to_string();
-                }
-                if ui.button("Flip V").clicked() {
-                    self.doc.checkpoint();
-                    self.doc.flip_layer_vertical(self.doc.active);
-                    self.status = "Layer flipped vertically.".to_string();
-                }
-            });
-            ui.separator();
-            ui.heading("Symmetry");
-            for m in SymmetryMode::ALL {
-                if ui.radio_value(&mut self.doc.symmetry, m, m.name()).changed() {
-                    self.sym_move = false;
-                    self.sym_grab = false;
-                    self.status = format!("Symmetry: {}.", m.name());
-                }
-            }
-            if self.doc.symmetry != SymmetryMode::Off {
-                if ui.checkbox(&mut self.sym_move, "Move center (drag it on canvas)").changed() {
-                    self.sym_grab = false;
-                    self.status = if self.sym_move {
-                        "Drag the mirror center; painting pauses while armed.".to_string()
-                    } else {
-                        "Mirror-center move off.".to_string()
-                    };
-                }
-                if ui.button("Reset center").clicked() {
-                    self.doc.reset_symmetry_center();
-                    self.status = "Mirror center reset to canvas middle.".to_string();
-                }
-            }
-            if self.doc.symmetry == SymmetryMode::Kaleidoscope {
-                stepped_slider(ui, &mut self.doc.symmetry_segments, 2..=16, 1.0, "Segments");
-            }
-            ui.separator();
-            ui.heading("Filters");
-            ui.label("Active layer. Sliders preview live; Apply keeps. Selections mask filters.");
-            // Tone previews live from a snapshot (one undo step); Apply
-            // keeps the preview, or applies once when nothing is pending.
-            let tone_before = (self.filt_brightness, self.filt_contrast);
-            stepped_slider_label_end(ui, &mut self.filt_brightness, -100..=100, 1.0, "Brightness");
-            stepped_slider_label_end(ui, &mut self.filt_contrast, 0.0..=200.0, 1.0, "Contrast %");
-            if (self.filt_brightness, self.filt_contrast) != tone_before {
-                let (b, c) = (self.filt_brightness, self.filt_contrast);
-                self.filter_scrub(0, move |doc, layer| {
-                    doc.adjust_tone(layer, (b as f32 * 2.55).round() as i32, c / 100.0);
-                });
-                self.status = "Previewing tone — Apply to keep.".to_string();
-            }
-            if ui.button("Apply tone").clicked() {
-                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 0) {
-                    let (b, c) = (self.filt_brightness, self.filt_contrast);
-                    self.doc.checkpoint();
-                    self.doc.adjust_tone(
-                        self.doc.active,
-                        (b as f32 * 2.55).round() as i32,
-                        c / 100.0,
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(if self.has_symbols {
+                                "⟲ −15°"
+                            } else {
+                                "−15°"
+                            })
+                            .clicked()
+                        {
+                            self.doc.checkpoint();
+                            self.doc.affine_layer(self.doc.active, 1.0, -15.0);
+                        }
+                        if ui
+                            .button(if self.has_symbols {
+                                "⟳ +15°"
+                            } else {
+                                "+15°"
+                            })
+                            .clicked()
+                        {
+                            self.doc.checkpoint();
+                            self.doc.affine_layer(self.doc.active, 1.0, 15.0);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Flip H").clicked() {
+                            self.doc.checkpoint();
+                            self.doc.flip_layer_horizontal(self.doc.active);
+                            self.status = "Layer flipped horizontally.".to_string();
+                        }
+                        if ui.button("Flip V").clicked() {
+                            self.doc.checkpoint();
+                            self.doc.flip_layer_vertical(self.doc.active);
+                            self.status = "Layer flipped vertically.".to_string();
+                        }
+                    });
+                    ui.separator();
+                    ui.heading("Symmetry");
+                    for m in SymmetryMode::ALL {
+                        if ui
+                            .radio_value(&mut self.doc.symmetry, m, m.name())
+                            .changed()
+                        {
+                            self.sym_move = false;
+                            self.sym_grab = false;
+                            self.status = format!("Symmetry: {}.", m.name());
+                        }
+                    }
+                    if self.doc.symmetry != SymmetryMode::Off {
+                        if ui
+                            .checkbox(&mut self.sym_move, "Move center (drag it on canvas)")
+                            .changed()
+                        {
+                            self.sym_grab = false;
+                            self.status = if self.sym_move {
+                                "Drag the mirror center; painting pauses while armed.".to_string()
+                            } else {
+                                "Mirror-center move off.".to_string()
+                            };
+                        }
+                        if ui.button("Reset center").clicked() {
+                            self.doc.reset_symmetry_center();
+                            self.status = "Mirror center reset to canvas middle.".to_string();
+                        }
+                    }
+                    if self.doc.symmetry == SymmetryMode::Kaleidoscope {
+                        stepped_slider(
+                            ui,
+                            &mut self.doc.symmetry_segments,
+                            2..=16,
+                            1.0,
+                            "Segments",
+                        );
+                    }
+                    ui.separator();
+                    ui.heading("Filters");
+                    ui.label(
+                        "Active layer. Sliders preview live; Apply keeps. Selections mask filters.",
                     );
-                } else {
-                    // Throttled-stale preview (or a fresh one): stamp the
-                    // latest values over the scrub snapshot — same undo step.
-                    let (b, c) = (self.filt_brightness, self.filt_contrast);
-                    self.restamp_preview(move |doc, layer| {
-                        doc.adjust_tone(layer, (b as f32 * 2.55).round() as i32, c / 100.0);
-                    });
-                }
-                self.filter_preview = None;
-                self.status = "Tone applied.".to_string();
-                self.capture_timelapse();
-            }
-            let blur_before = self.filt_blur;
-            stepped_slider_label_end(ui, &mut self.filt_blur, 0..=25, 1.0, "Blur");
-            if self.filt_blur != blur_before {
-                let r = self.filt_blur.max(0) as u32;
-                self.filter_scrub(1, move |doc, layer| {
-                    doc.blur_layer(layer, r);
-                });
-                self.status = "Previewing blur — Apply to keep.".to_string();
-            }
-            if ui.button("Apply blur").clicked() {
-                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 1) {
-                    self.doc.checkpoint();
-                    self.doc.blur_layer(self.doc.active, self.filt_blur.max(0) as u32);
-                } else {
-                    let r = self.filt_blur.max(0) as u32;
-                    self.restamp_preview(move |doc, layer| {
-                        doc.blur_layer(layer, r);
-                    });
-                }
-                self.filter_preview = None;
-                self.status = "Blur applied.".to_string();
-                self.capture_timelapse();
-            }
-            let sharp_before = self.filt_sharpen;
-            stepped_slider_label_end(ui, &mut self.filt_sharpen, 0.0..=200.0, 1.0, "Sharpen %");
-            if self.filt_sharpen != sharp_before {
-                let s = self.filt_sharpen / 100.0;
-                self.filter_scrub(2, move |doc, layer| {
-                    doc.sharpen_layer(layer, s);
-                });
-                self.status = "Previewing sharpen — Apply to keep.".to_string();
-            }
-            if ui.button("Apply sharpen").clicked() {
-                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 2) {
-                    self.doc.checkpoint();
-                    self.doc.sharpen_layer(self.doc.active, self.filt_sharpen / 100.0);
-                } else {
-                    let s = self.filt_sharpen / 100.0;
-                    self.restamp_preview(move |doc, layer| {
-                        doc.sharpen_layer(layer, s);
-                    });
-                }
-                self.filter_preview = None;
-                self.status = "Sharpen applied.".to_string();
-                self.capture_timelapse();
-            }
-            // M36 Levels: black/white points + mid gamma, same live
-            // preview + Apply rhythm as tone (preview kind 3).
-            let levels_before =
-                (self.filt_levels_shadow, self.filt_levels_gamma, self.filt_levels_high);
-            stepped_slider_label_end(ui, &mut self.filt_levels_shadow, 0..=255, 1.0, "Shadow");
-            stepped_slider_label_end(ui, &mut self.filt_levels_gamma, 10.0..=400.0, 1.0, "Gamma %");
-            stepped_slider_label_end(ui, &mut self.filt_levels_high, 0..=255, 1.0, "Highlight");
-            if (self.filt_levels_shadow, self.filt_levels_gamma, self.filt_levels_high)
-                != levels_before
-            {
-                let (s, g, h) =
-                    (self.filt_levels_shadow, self.filt_levels_gamma / 100.0, self.filt_levels_high);
-                let lut = levels_lut(s, g, h);
-                self.filter_scrub(3, move |doc, layer| {
-                    doc.apply_lut(layer, &lut);
-                });
-                self.status = "Previewing levels — Apply to keep.".to_string();
-            }
-            if ui.button("Apply levels").clicked() {
-                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 3) {
-                    let lut = levels_lut(
+                    // Tone previews live from a snapshot (one undo step); Apply
+                    // keeps the preview, or applies once when nothing is pending.
+                    let tone_before = (self.filt_brightness, self.filt_contrast);
+                    stepped_slider_label_end(
+                        ui,
+                        &mut self.filt_brightness,
+                        -100..=100,
+                        1.0,
+                        "Brightness",
+                    );
+                    stepped_slider_label_end(
+                        ui,
+                        &mut self.filt_contrast,
+                        0.0..=200.0,
+                        1.0,
+                        "Contrast %",
+                    );
+                    if (self.filt_brightness, self.filt_contrast) != tone_before {
+                        let (b, c) = (self.filt_brightness, self.filt_contrast);
+                        self.filter_scrub(0, move |doc, layer| {
+                            doc.adjust_tone(layer, (b as f32 * 2.55).round() as i32, c / 100.0);
+                        });
+                        self.status = "Previewing tone — Apply to keep.".to_string();
+                    }
+                    if ui.button("Apply tone").clicked() {
+                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 0) {
+                            let (b, c) = (self.filt_brightness, self.filt_contrast);
+                            self.doc.checkpoint();
+                            self.doc.adjust_tone(
+                                self.doc.active,
+                                (b as f32 * 2.55).round() as i32,
+                                c / 100.0,
+                            );
+                        } else {
+                            // Throttled-stale preview (or a fresh one): stamp the
+                            // latest values over the scrub snapshot — same undo step.
+                            let (b, c) = (self.filt_brightness, self.filt_contrast);
+                            self.restamp_preview(move |doc, layer| {
+                                doc.adjust_tone(layer, (b as f32 * 2.55).round() as i32, c / 100.0);
+                            });
+                        }
+                        self.filter_preview = None;
+                        self.status = "Tone applied.".to_string();
+                        self.capture_timelapse();
+                    }
+                    let blur_before = self.filt_blur;
+                    stepped_slider_label_end(ui, &mut self.filt_blur, 0..=25, 1.0, "Blur");
+                    if self.filt_blur != blur_before {
+                        let r = self.filt_blur.max(0) as u32;
+                        self.filter_scrub(1, move |doc, layer| {
+                            doc.blur_layer(layer, r);
+                        });
+                        self.status = "Previewing blur — Apply to keep.".to_string();
+                    }
+                    if ui.button("Apply blur").clicked() {
+                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 1) {
+                            self.doc.checkpoint();
+                            self.doc
+                                .blur_layer(self.doc.active, self.filt_blur.max(0) as u32);
+                        } else {
+                            let r = self.filt_blur.max(0) as u32;
+                            self.restamp_preview(move |doc, layer| {
+                                doc.blur_layer(layer, r);
+                            });
+                        }
+                        self.filter_preview = None;
+                        self.status = "Blur applied.".to_string();
+                        self.capture_timelapse();
+                    }
+                    let sharp_before = self.filt_sharpen;
+                    stepped_slider_label_end(
+                        ui,
+                        &mut self.filt_sharpen,
+                        0.0..=200.0,
+                        1.0,
+                        "Sharpen %",
+                    );
+                    if self.filt_sharpen != sharp_before {
+                        let s = self.filt_sharpen / 100.0;
+                        self.filter_scrub(2, move |doc, layer| {
+                            doc.sharpen_layer(layer, s);
+                        });
+                        self.status = "Previewing sharpen — Apply to keep.".to_string();
+                    }
+                    if ui.button("Apply sharpen").clicked() {
+                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 2) {
+                            self.doc.checkpoint();
+                            self.doc
+                                .sharpen_layer(self.doc.active, self.filt_sharpen / 100.0);
+                        } else {
+                            let s = self.filt_sharpen / 100.0;
+                            self.restamp_preview(move |doc, layer| {
+                                doc.sharpen_layer(layer, s);
+                            });
+                        }
+                        self.filter_preview = None;
+                        self.status = "Sharpen applied.".to_string();
+                        self.capture_timelapse();
+                    }
+                    // M36 Levels: black/white points + mid gamma, same live
+                    // preview + Apply rhythm as tone (preview kind 3).
+                    let levels_before = (
                         self.filt_levels_shadow,
-                        self.filt_levels_gamma / 100.0,
+                        self.filt_levels_gamma,
                         self.filt_levels_high,
                     );
-                    self.doc.checkpoint();
-                    self.doc.apply_lut(self.doc.active, &lut);
-                } else {
-                    let lut = levels_lut(
+                    stepped_slider_label_end(
+                        ui,
+                        &mut self.filt_levels_shadow,
+                        0..=255,
+                        1.0,
+                        "Shadow",
+                    );
+                    stepped_slider_label_end(
+                        ui,
+                        &mut self.filt_levels_gamma,
+                        10.0..=400.0,
+                        1.0,
+                        "Gamma %",
+                    );
+                    stepped_slider_label_end(
+                        ui,
+                        &mut self.filt_levels_high,
+                        0..=255,
+                        1.0,
+                        "Highlight",
+                    );
+                    if (
                         self.filt_levels_shadow,
-                        self.filt_levels_gamma / 100.0,
+                        self.filt_levels_gamma,
                         self.filt_levels_high,
+                    ) != levels_before
+                    {
+                        let (s, g, h) = (
+                            self.filt_levels_shadow,
+                            self.filt_levels_gamma / 100.0,
+                            self.filt_levels_high,
+                        );
+                        let lut = levels_lut(s, g, h);
+                        self.filter_scrub(3, move |doc, layer| {
+                            doc.apply_lut(layer, &lut);
+                        });
+                        self.status = "Previewing levels — Apply to keep.".to_string();
+                    }
+                    if ui.button("Apply levels").clicked() {
+                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 3) {
+                            let lut = levels_lut(
+                                self.filt_levels_shadow,
+                                self.filt_levels_gamma / 100.0,
+                                self.filt_levels_high,
+                            );
+                            self.doc.checkpoint();
+                            self.doc.apply_lut(self.doc.active, &lut);
+                        } else {
+                            let lut = levels_lut(
+                                self.filt_levels_shadow,
+                                self.filt_levels_gamma / 100.0,
+                                self.filt_levels_high,
+                            );
+                            self.restamp_preview(move |doc, layer| {
+                                doc.apply_lut(layer, &lut);
+                            });
+                        }
+                        self.filter_preview = None;
+                        self.status = "Levels applied.".to_string();
+                        self.capture_timelapse();
+                    }
+                    // M36 Curves (parametric shadows/mids/highlights through a
+                    // pinned-endpoint LUT; preview kind 4).
+                    let curves_before = (
+                        self.filt_curve_shadow,
+                        self.filt_curve_mid,
+                        self.filt_curve_high,
                     );
-                    self.restamp_preview(move |doc, layer| {
-                        doc.apply_lut(layer, &lut);
-                    });
-                }
-                self.filter_preview = None;
-                self.status = "Levels applied.".to_string();
-                self.capture_timelapse();
-            }
-            // M36 Curves (parametric shadows/mids/highlights through a
-            // pinned-endpoint LUT; preview kind 4).
-            let curves_before = (self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high);
-            stepped_slider_label_end(ui, &mut self.filt_curve_shadow, -100..=100, 1.0, "Shadows");
-            stepped_slider_label_end(ui, &mut self.filt_curve_mid, -100..=100, 1.0, "Midtones");
-            stepped_slider_label_end(ui, &mut self.filt_curve_high, -100..=100, 1.0, "Highlights");
-            if (self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high) != curves_before
-            {
-                let (s, m, h) = (self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high);
-                let lut = curves_lut(s, m, h);
-                self.filter_scrub(4, move |doc, layer| {
-                    doc.apply_lut(layer, &lut);
-                });
-                self.status = "Previewing curves — Apply to keep.".to_string();
-            }
-            if ui.button("Apply curves").clicked() {
-                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 4) {
-                    let lut =
-                        curves_lut(self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high);
-                    self.doc.checkpoint();
-                    self.doc.apply_lut(self.doc.active, &lut);
-                } else {
-                    let lut =
-                        curves_lut(self.filt_curve_shadow, self.filt_curve_mid, self.filt_curve_high);
-                    self.restamp_preview(move |doc, layer| {
-                        doc.apply_lut(layer, &lut);
-                    });
-                }
-                self.filter_preview = None;
-                self.status = "Curves applied.".to_string();
-                self.capture_timelapse();
-            }
-            // M37 HSL: hue spin + saturation scale + lightness shift
-            // (preview kind 5). Grays only answer to lightness.
-            let hsl_before = (self.filt_hue, self.filt_sat, self.filt_light);
-            stepped_slider_label_end(ui, &mut self.filt_hue, -180.0..=180.0, 1.0, "Hue°");
-            stepped_slider_label_end(ui, &mut self.filt_sat, 0.0..=400.0, 1.0, "Sat %");
-            stepped_slider_label_end(ui, &mut self.filt_light, -100..=100, 1.0, "Light");
-            if (self.filt_hue, self.filt_sat, self.filt_light) != hsl_before {
-                let (h, s, l) = (self.filt_hue, self.filt_sat / 100.0, self.filt_light as f32 / 100.0);
-                self.filter_scrub(5, move |doc, layer| {
-                    doc.adjust_hsl(layer, h, s, l);
-                });
-                self.status = "Previewing HSL — Apply to keep.".to_string();
-            }
-            if ui.button("Apply HSL").clicked() {
-                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 5) {
-                    self.doc.checkpoint();
-                    let active = self.doc.active;
-                    self.doc.adjust_hsl(
-                        active,
-                        self.filt_hue,
-                        self.filt_sat / 100.0,
-                        self.filt_light as f32 / 100.0,
+                    stepped_slider_label_end(
+                        ui,
+                        &mut self.filt_curve_shadow,
+                        -100..=100,
+                        1.0,
+                        "Shadows",
                     );
-                } else {
-                    let (h, s, l) =
-                        (self.filt_hue, self.filt_sat / 100.0, self.filt_light as f32 / 100.0);
-                    self.restamp_preview(move |doc, layer| {
-                        doc.adjust_hsl(layer, h, s, l);
-                    });
-                }
-                self.filter_preview = None;
-                self.status = "HSL applied.".to_string();
-                self.capture_timelapse();
-            }
-            // M37 Color balance: − toward cyan/magenta/yellow, + toward
-            // red/green/blue (preview kind 6).
-            let bal_before = (self.filt_bal_r, self.filt_bal_g, self.filt_bal_b);
-            stepped_slider_label_end(ui, &mut self.filt_bal_r, -100..=100, 1.0, "Red−Cyan");
-            stepped_slider_label_end(ui, &mut self.filt_bal_g, -100..=100, 1.0, "Green−Magenta");
-            stepped_slider_label_end(ui, &mut self.filt_bal_b, -100..=100, 1.0, "Blue−Yellow");
-            if (self.filt_bal_r, self.filt_bal_g, self.filt_bal_b) != bal_before {
-                let (r, g, b) = (
-                    (self.filt_bal_r as f32 * 2.55).round() as i32,
-                    (self.filt_bal_g as f32 * 2.55).round() as i32,
-                    (self.filt_bal_b as f32 * 2.55).round() as i32,
-                );
-                self.filter_scrub(6, move |doc, layer| {
-                    doc.color_balance(layer, r, g, b);
-                });
-                self.status = "Previewing balance — Apply to keep.".to_string();
-            }
-            if ui.button("Apply balance").clicked() {
-                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 6) {
-                    let (r, g, b) = (
-                        (self.filt_bal_r as f32 * 2.55).round() as i32,
-                        (self.filt_bal_g as f32 * 2.55).round() as i32,
-                        (self.filt_bal_b as f32 * 2.55).round() as i32,
+                    stepped_slider_label_end(
+                        ui,
+                        &mut self.filt_curve_mid,
+                        -100..=100,
+                        1.0,
+                        "Midtones",
                     );
-                    self.doc.checkpoint();
-                    self.doc.color_balance(self.doc.active, r, g, b);
-                } else {
-                    let (r, g, b) = (
-                        (self.filt_bal_r as f32 * 2.55).round() as i32,
-                        (self.filt_bal_g as f32 * 2.55).round() as i32,
-                        (self.filt_bal_b as f32 * 2.55).round() as i32,
+                    stepped_slider_label_end(
+                        ui,
+                        &mut self.filt_curve_high,
+                        -100..=100,
+                        1.0,
+                        "Highlights",
                     );
-                    self.restamp_preview(move |doc, layer| {
-                        doc.color_balance(layer, r, g, b);
-                    });
-                }
-                self.filter_preview = None;
-                self.status = "Balance applied.".to_string();
-                self.capture_timelapse();
-            }
-            // M37 Recolor (colorize) toward the current paint color at
-            // strength (preview kind 7). White stays white by definition.
-            ui.label(format!(
-                "Recolor target: #{:02X}{:02X}{:02X} (paint color).",
-                self.color[0], self.color[1], self.color[2]
-            ));
-            let recolor_before = self.filt_recolor_strength;
-            stepped_slider_label_end(ui, &mut self.filt_recolor_strength, 0.0..=100.0, 1.0, "Strength %");
-            if self.filt_recolor_strength != recolor_before {
-                let (target, s) = (self.color, self.filt_recolor_strength / 100.0);
-                self.filter_scrub(7, move |doc, layer| {
-                    doc.colorize(layer, target, s);
+                    if (
+                        self.filt_curve_shadow,
+                        self.filt_curve_mid,
+                        self.filt_curve_high,
+                    ) != curves_before
+                    {
+                        let (s, m, h) = (
+                            self.filt_curve_shadow,
+                            self.filt_curve_mid,
+                            self.filt_curve_high,
+                        );
+                        let lut = curves_lut(s, m, h);
+                        self.filter_scrub(4, move |doc, layer| {
+                            doc.apply_lut(layer, &lut);
+                        });
+                        self.status = "Previewing curves — Apply to keep.".to_string();
+                    }
+                    if ui.button("Apply curves").clicked() {
+                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 4) {
+                            let lut = curves_lut(
+                                self.filt_curve_shadow,
+                                self.filt_curve_mid,
+                                self.filt_curve_high,
+                            );
+                            self.doc.checkpoint();
+                            self.doc.apply_lut(self.doc.active, &lut);
+                        } else {
+                            let lut = curves_lut(
+                                self.filt_curve_shadow,
+                                self.filt_curve_mid,
+                                self.filt_curve_high,
+                            );
+                            self.restamp_preview(move |doc, layer| {
+                                doc.apply_lut(layer, &lut);
+                            });
+                        }
+                        self.filter_preview = None;
+                        self.status = "Curves applied.".to_string();
+                        self.capture_timelapse();
+                    }
+                    // M37 HSL: hue spin + saturation scale + lightness shift
+                    // (preview kind 5). Grays only answer to lightness.
+                    let hsl_before = (self.filt_hue, self.filt_sat, self.filt_light);
+                    stepped_slider_label_end(ui, &mut self.filt_hue, -180.0..=180.0, 1.0, "Hue°");
+                    stepped_slider_label_end(ui, &mut self.filt_sat, 0.0..=400.0, 1.0, "Sat %");
+                    stepped_slider_label_end(ui, &mut self.filt_light, -100..=100, 1.0, "Light");
+                    if (self.filt_hue, self.filt_sat, self.filt_light) != hsl_before {
+                        let (h, s, l) = (
+                            self.filt_hue,
+                            self.filt_sat / 100.0,
+                            self.filt_light as f32 / 100.0,
+                        );
+                        self.filter_scrub(5, move |doc, layer| {
+                            doc.adjust_hsl(layer, h, s, l);
+                        });
+                        self.status = "Previewing HSL — Apply to keep.".to_string();
+                    }
+                    if ui.button("Apply HSL").clicked() {
+                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 5) {
+                            self.doc.checkpoint();
+                            let active = self.doc.active;
+                            self.doc.adjust_hsl(
+                                active,
+                                self.filt_hue,
+                                self.filt_sat / 100.0,
+                                self.filt_light as f32 / 100.0,
+                            );
+                        } else {
+                            let (h, s, l) = (
+                                self.filt_hue,
+                                self.filt_sat / 100.0,
+                                self.filt_light as f32 / 100.0,
+                            );
+                            self.restamp_preview(move |doc, layer| {
+                                doc.adjust_hsl(layer, h, s, l);
+                            });
+                        }
+                        self.filter_preview = None;
+                        self.status = "HSL applied.".to_string();
+                        self.capture_timelapse();
+                    }
+                    // M37 Color balance: − toward cyan/magenta/yellow, + toward
+                    // red/green/blue (preview kind 6).
+                    let bal_before = (self.filt_bal_r, self.filt_bal_g, self.filt_bal_b);
+                    stepped_slider_label_end(ui, &mut self.filt_bal_r, -100..=100, 1.0, "Red−Cyan");
+                    stepped_slider_label_end(
+                        ui,
+                        &mut self.filt_bal_g,
+                        -100..=100,
+                        1.0,
+                        "Green−Magenta",
+                    );
+                    stepped_slider_label_end(
+                        ui,
+                        &mut self.filt_bal_b,
+                        -100..=100,
+                        1.0,
+                        "Blue−Yellow",
+                    );
+                    if (self.filt_bal_r, self.filt_bal_g, self.filt_bal_b) != bal_before {
+                        let (r, g, b) = (
+                            (self.filt_bal_r as f32 * 2.55).round() as i32,
+                            (self.filt_bal_g as f32 * 2.55).round() as i32,
+                            (self.filt_bal_b as f32 * 2.55).round() as i32,
+                        );
+                        self.filter_scrub(6, move |doc, layer| {
+                            doc.color_balance(layer, r, g, b);
+                        });
+                        self.status = "Previewing balance — Apply to keep.".to_string();
+                    }
+                    if ui.button("Apply balance").clicked() {
+                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 6) {
+                            let (r, g, b) = (
+                                (self.filt_bal_r as f32 * 2.55).round() as i32,
+                                (self.filt_bal_g as f32 * 2.55).round() as i32,
+                                (self.filt_bal_b as f32 * 2.55).round() as i32,
+                            );
+                            self.doc.checkpoint();
+                            self.doc.color_balance(self.doc.active, r, g, b);
+                        } else {
+                            let (r, g, b) = (
+                                (self.filt_bal_r as f32 * 2.55).round() as i32,
+                                (self.filt_bal_g as f32 * 2.55).round() as i32,
+                                (self.filt_bal_b as f32 * 2.55).round() as i32,
+                            );
+                            self.restamp_preview(move |doc, layer| {
+                                doc.color_balance(layer, r, g, b);
+                            });
+                        }
+                        self.filter_preview = None;
+                        self.status = "Balance applied.".to_string();
+                        self.capture_timelapse();
+                    }
+                    // M37 Recolor (colorize) toward the current paint color at
+                    // strength (preview kind 7). White stays white by definition.
+                    ui.label(format!(
+                        "Recolor target: #{:02X}{:02X}{:02X} (paint color).",
+                        self.color[0], self.color[1], self.color[2]
+                    ));
+                    let recolor_before = self.filt_recolor_strength;
+                    stepped_slider_label_end(
+                        ui,
+                        &mut self.filt_recolor_strength,
+                        0.0..=100.0,
+                        1.0,
+                        "Strength %",
+                    );
+                    if self.filt_recolor_strength != recolor_before {
+                        let (target, s) = (self.color, self.filt_recolor_strength / 100.0);
+                        self.filter_scrub(7, move |doc, layer| {
+                            doc.colorize(layer, target, s);
+                        });
+                        self.status = "Previewing recolor — Apply to keep.".to_string();
+                    }
+                    if ui.button("Apply recolor").clicked() {
+                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 7) {
+                            self.doc.checkpoint();
+                            let active = self.doc.active;
+                            self.doc.colorize(
+                                active,
+                                self.color,
+                                self.filt_recolor_strength / 100.0,
+                            );
+                        } else {
+                            let (target, s) = (self.color, self.filt_recolor_strength / 100.0);
+                            self.restamp_preview(move |doc, layer| {
+                                doc.colorize(layer, target, s);
+                            });
+                        }
+                        self.filter_preview = None;
+                        self.status = "Recolor applied.".to_string();
+                        self.capture_timelapse();
+                    }
                 });
-                self.status = "Previewing recolor — Apply to keep.".to_string();
-            }
-            if ui.button("Apply recolor").clicked() {
-                if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 7) {
-                    self.doc.checkpoint();
-                    let active = self.doc.active;
-                    self.doc.colorize(active, self.color, self.filt_recolor_strength / 100.0);
-                } else {
-                    let (target, s) = (self.color, self.filt_recolor_strength / 100.0);
-                    self.restamp_preview(move |doc, layer| {
-                        doc.colorize(layer, target, s);
-                    });
-                }
-                self.filter_preview = None;
-                self.status = "Recolor applied.".to_string();
-                self.capture_timelapse();
-            }
-        });
-        });
-        } // end show_layers
+            });
+        self.show_layers = layers_open && self.show_layers;
 
         // Floating edge buttons reopen hidden sidebars (touch-sized).
         if !self.show_tools {
@@ -6118,5 +6416,20 @@ mod tests {
         assert_eq!(brush_ring_radius(20.0, 2.0), 20.0);
         // Tiny brushes stay visible (2px floor).
         assert_eq!(brush_ring_radius(1.0, 0.5), 2.0);
+    }
+
+    #[test]
+    fn bar_layout_splits_at_phone_width() {
+        assert_eq!(bar_layout(360.0), BarLayout::Narrow);
+        assert_eq!(bar_layout(599.0), BarLayout::Narrow);
+        assert_eq!(bar_layout(600.0), BarLayout::Wide);
+        assert_eq!(bar_layout(1280.0), BarLayout::Wide);
+    }
+
+    #[test]
+    fn status_inset_clamps_wild_values() {
+        assert_eq!(clamp_status_inset(0), 0.0);
+        assert_eq!(clamp_status_inset(72), 72.0);
+        assert_eq!(clamp_status_inset(9999), 200.0);
     }
 }

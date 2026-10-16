@@ -7,14 +7,14 @@
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
 // iOS has no rfd backend: same call shape, every dialog declined.
 use procraft_engine::{
-    analogous, check_font, clamp_frame, complementary, curves_lut, export_gif_ext,
-    export_timelapse, export_tip_png, gallery_thumb, import_brush_file, import_gif_document,
-    import_gpl_file, levels_lut, next_frame, onion_ghost, open_brush_library, open_palette,
-    open_psd, palette_from_rgba, prev_frame, rasterize_frame, rasterize_frame_region,
+    analogous, check_font, clamp_frame, classify_touch_tap, complementary, curves_lut,
+    export_gif_ext, export_timelapse, export_tip_png, gallery_thumb, import_brush_file,
+    import_gif_document, import_gpl_file, levels_lut, next_frame, onion_ghost, open_brush_library,
+    open_palette, open_psd, palette_from_rgba, prev_frame, rasterize_frame, rasterize_frame_region,
     save_brush_library, save_palette, save_psd, starter_palette, step_playback_visible, triadic,
     AssistLine, BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides,
-    LoopMode, PaintTarget, Palette, PaletteSet, ShapePoly, SymmetryMode, TextStyle, LAPSE_SIDE,
-    MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES,
+    LoopMode, PaintTarget, Palette, PaletteSet, ShapePoly, SymmetryMode, TapAction, TextStyle,
+    LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES,
     MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING,
     MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
 };
@@ -2046,13 +2046,15 @@ impl eframe::App for ProCraftApp {
                 }
             } else if let Some(t) = self.tap_track.take() {
                 let any_down = ui.ctx().input(|i| i.pointer.any_down());
-                if !t.moved && !any_down && now - t.t0 < 0.35 {
-                    match t.n {
-                        2 if self.doc.undo() => {
+                // M47: classification lives in the tested engine helper —
+                // a palm landing mid-stroke (`painting`) never fires.
+                if !any_down {
+                    match classify_touch_tap(t.n, now - t.t0, t.moved, self.painting) {
+                        TapAction::Undo if self.doc.undo() => {
                             self.ghost_dirty = true;
                             self.status = "Undone.".to_string();
                         }
-                        3 if self.doc.redo() => {
+                        TapAction::Redo if self.doc.redo() => {
                             self.ghost_dirty = true;
                             self.status = "Redone.".to_string();
                         }

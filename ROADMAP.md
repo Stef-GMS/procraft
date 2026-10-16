@@ -24,7 +24,7 @@ people touch daily. Ranked by user-visible value per effort.
   import.
 - [x] **M46 — SAF file picker.** Real Android picker (replaces the
   v0.8.1 "picker coming" notes); tighten desktop fallback.
-- [ ] **M47 — Palm rejection + Pencil.** Double-tap/hover, touch guards.
+- [x] **M47 — Palm rejection + Pencil.** Double-tap/hover, touch guards.
   **→ PC checkpoint #5 + iPad check #3 (IPA).**
 - Deferred to Batch 6: 8K canvas + lazy compositing (standalone perf
   epic, riskiest — Batch 5 stays shippable without it).

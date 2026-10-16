@@ -10,6 +10,7 @@ mod import_filter;
 mod palette;
 mod probrush;
 mod psd;
+mod tap;
 mod text;
 
 pub use animation::{
@@ -35,6 +36,7 @@ pub use palette::{
 };
 pub use probrush::{export_tip_png, import_brush_file, ImportedBrush};
 pub use psd::{open_psd, save_psd};
+pub use tap::{classify_touch_tap, TapAction};
 pub use text::{
     check_font, layout_text, layout_text_styled, TextLayout, TextStyle, FONT_BYTES,
     MAX_LAYOUT_SIDE, MAX_OUTLINE_PX, MAX_TEXT_CHARS, MAX_TEXT_LINES, MAX_TEXT_PX, MAX_TEXT_SPACING,

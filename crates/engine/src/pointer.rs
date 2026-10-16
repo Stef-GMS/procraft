@@ -13,6 +13,14 @@ pub fn shift_wheel_remap(dx: f32, dy: f32, shift: bool) -> (f32, f32) {
     }
 }
 
+/// Ctrl+middle-drag zoom (pen-button workflow): vertical drag distance
+/// maps onto the same x1.25 wheel step the bar buttons use, so every zoom
+/// path feels identical. `dy` is screen px dragged (negative = up = in).
+/// Pure so the app canvas shares exactly what host tests pin down.
+pub fn zoom_drag_factor(dy: f32) -> f32 {
+    1.25f32.powf(-dy / 120.0)
+}
+
 /// Pan the view by `delta`, clamped so a 60px margin of canvas always
 /// stays on screen (the canvas can never get lost off-view). `cw`/`ch`
 /// are canvas size in screen px, `aw`/`ah` the viewport size.
@@ -43,6 +51,16 @@ mod tests {
         // A real horizontal tick (trackpad) is left alone, shift or not.
         assert_eq!(shift_wheel_remap(12.0, 0.0, true), (12.0, 0.0));
         assert_eq!(shift_wheel_remap(0.0, 0.0, true), (0.0, 0.0));
+    }
+
+    #[test]
+    fn zoom_drag_factor_matches_wheel_steps() {
+        // No movement: identity.
+        assert_eq!(zoom_drag_factor(0.0), 1.0);
+        // 120px up: one wheel-step in (x1.25, same step as the bar buttons).
+        assert_eq!(zoom_drag_factor(-120.0), 1.25);
+        // 120px down: one wheel-step out.
+        assert!((zoom_drag_factor(120.0) - 0.8).abs() < 1e-6);
     }
 
     #[test]

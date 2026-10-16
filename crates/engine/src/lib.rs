@@ -35,7 +35,7 @@ pub use palette::{
     palette_from_rgba, rgb_to_hsl, save_palette, starter_palette, triadic, Palette, PaletteSet,
     MAX_IMAGE_COLORS, MAX_PALETTES, MAX_PALETTE_COLORS,
 };
-pub use pointer::{pan_offset, shift_wheel_remap};
+pub use pointer::{pan_offset, shift_wheel_remap, zoom_drag_factor};
 pub use probrush::{export_tip_png, import_brush_file, ImportedBrush};
 pub use psd::{open_psd, save_psd};
 pub use tap::{classify_touch_tap, TapAction};

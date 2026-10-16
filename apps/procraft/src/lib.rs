@@ -12,11 +12,12 @@ use procraft_engine::{
     import_gif_document, import_gpl_file, levels_lut, next_frame, onion_ghost, open_brush_library,
     open_palette, open_psd, palette_from_rgba, pan_offset, prev_frame, rasterize_frame,
     rasterize_frame_region, save_brush_library, save_palette, save_psd, shift_wheel_remap,
-    starter_palette, step_playback_visible, triadic, AssistLine, BlendMode, Brush, BrushPreset,
-    Color, DabDynamics, Document, GuideKind, Guides, LoopMode, PaintTarget, Palette, PaletteSet,
-    ShapePoly, SymmetryMode, TapAction, TextStyle, LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD,
-    MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX,
-    MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
+    starter_palette, step_playback_visible, triadic, zoom_drag_factor, AssistLine, BlendMode,
+    Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides, LoopMode, PaintTarget,
+    Palette, PaletteSet, ShapePoly, SymmetryMode, TapAction, TextStyle, LAPSE_SIDE, MAX_ANIM_FPS,
+    MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES,
+    MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING, MIN_ANIM_FPS,
+    MIN_ANIM_HOLD, MIN_TEXT_PX,
 };
 #[cfg(target_os = "android")]
 use procraft_engine::{ext_matches, file_size_label};
@@ -530,6 +531,8 @@ struct ProCraftApp {
     ghost_dirty: bool,
     move_from: Option<(f32, f32)>,
     move_acc: (f32, f32),
+    /// Ctrl+middle-drag zoom anchor (screen pos of the last tick).
+    mmb_last: Option<egui::Pos2>,
     /// M40 Liquify: drag anchor plus brush size/strength.
     liquify_from: Option<(f32, f32)>,
     liquify_size: f32,
@@ -715,6 +718,7 @@ impl ProCraftApp {
             ghost_dirty: true,
             move_from: None,
             move_acc: (0.0, 0.0),
+            mmb_last: None,
             liquify_from: None,
             liquify_size: 128.0,
             liquify_strength: 0.5,
@@ -1770,6 +1774,13 @@ fn rot_pt(p: egui::Pos2, c: egui::Pos2, ang: f32) -> egui::Pos2 {
 /// Inverse of [`rot_pt`] (screen back to the unrotated view).
 fn unrot_pt(p: egui::Pos2, c: egui::Pos2, ang: f32) -> egui::Pos2 {
     rot_pt(p, c, -ang)
+}
+
+/// Brush cursor ring radius in screen px: nominal dab diameter scaled by
+/// zoom, floored so 1px brushes stay visible. Hover has no pressure, so
+/// this is the base size; dynamics spread real dabs around it.
+fn brush_ring_radius(size: f32, zoom: f32) -> f32 {
+    (size * zoom * 0.5).max(2.0)
 }
 
 /// Textured quad for a rotated canvas view: `corners` are TL, TR, BR, BL
@@ -4943,6 +4954,18 @@ impl eframe::App for ProCraftApp {
                         ui.painter().circle_stroke(p, r, (2.0, Color32::WHITE));
                     }
                 }
+                // Brush cursor ring: nominal dab diameter at the hover point
+                // (brush tools only). Dark + white strokes stay visible on
+                // any paper color; hover has no pressure so this is the
+                // base size, dynamics spread real dabs around it.
+                if matches!(self.tool, Tool::Brush | Tool::Eraser | Tool::Smudge) {
+                    if let Some(pos) = resp.hover_pos() {
+                        let r = brush_ring_radius(self.brush.size, z);
+                        ui.painter()
+                            .circle_stroke(pos, r, (2.0, Color32::from_gray(30)));
+                        ui.painter().circle_stroke(pos, r, (1.0, Color32::WHITE));
+                    }
+                }
                 // Drawing guides overlay: view-assist only, never baked in.
                 if self.guides.kind != GuideKind::Off {
                     let alpha = (self.guides.opacity.clamp(0.05, 1.0) * 255.0).round() as u8;
@@ -5167,6 +5190,28 @@ impl eframe::App for ProCraftApp {
                     self.painting = false;
                     self.last = None;
                     return;
+                }
+
+                // Ctrl+middle-drag zoom (pen-button workflow): vertical drag
+                // distance maps onto wheel steps via `zoom_drag_factor`.
+                // Skipped mid-stroke (and while primary drags) so it never
+                // wrecks a line; needs no checkpoint (view-only like pan).
+                if !self.painting && !resp.dragged() && ui.ctx().input(|i| i.modifiers.ctrl) {
+                    use egui::PointerButton::Middle;
+                    if resp.drag_started_by(Middle) {
+                        self.mmb_last = resp.hover_pos();
+                    } else if resp.dragged_by(Middle) {
+                        if let (Some(last), Some(pos)) = (self.mmb_last, resp.hover_pos()) {
+                            let dy = pos.y - last.y;
+                            self.zoom = (self.zoom * zoom_drag_factor(dy)).clamp(0.1, 8.0);
+                            self.mmb_last = Some(pos);
+                        }
+                    }
+                    if resp.drag_stopped_by(Middle) {
+                        self.mmb_last = None;
+                    }
+                } else {
+                    self.mmb_last = None;
                 }
 
                 if self.tool == Tool::Select {
@@ -6063,5 +6108,15 @@ mod tests {
         }
         // Length alone distinguishes.
         assert_ne!(pixels_hash(&a), pixels_hash(&a[..2048]));
+    }
+
+    #[test]
+    fn brush_ring_radius_tracks_size_and_zoom() {
+        // 20px brush at zoom 1: 10px ring.
+        assert_eq!(brush_ring_radius(20.0, 1.0), 10.0);
+        // Zoom scales the ring with the canvas.
+        assert_eq!(brush_ring_radius(20.0, 2.0), 20.0);
+        // Tiny brushes stay visible (2px floor).
+        assert_eq!(brush_ring_radius(1.0, 0.5), 2.0);
     }
 }

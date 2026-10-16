@@ -10,13 +10,13 @@ use procraft_engine::{
     analogous, check_font, clamp_frame, classify_touch_tap, complementary, curves_lut,
     export_gif_ext, export_timelapse, export_tip_png, gallery_thumb, import_brush_file,
     import_gif_document, import_gpl_file, levels_lut, next_frame, onion_ghost, open_brush_library,
-    open_palette, open_psd, palette_from_rgba, prev_frame, rasterize_frame, rasterize_frame_region,
-    save_brush_library, save_palette, save_psd, starter_palette, step_playback_visible, triadic,
-    AssistLine, BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides,
-    LoopMode, PaintTarget, Palette, PaletteSet, ShapePoly, SymmetryMode, TapAction, TextStyle,
-    LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES,
-    MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING,
-    MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
+    open_palette, open_psd, palette_from_rgba, pan_offset, prev_frame, rasterize_frame,
+    rasterize_frame_region, save_brush_library, save_palette, save_psd, shift_wheel_remap,
+    starter_palette, step_playback_visible, triadic, AssistLine, BlendMode, Brush, BrushPreset,
+    Color, DabDynamics, Document, GuideKind, Guides, LoopMode, PaintTarget, Palette, PaletteSet,
+    ShapePoly, SymmetryMode, TapAction, TextStyle, LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD,
+    MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX,
+    MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
 };
 #[cfg(target_os = "android")]
 use procraft_engine::{ext_matches, file_size_label};
@@ -100,6 +100,7 @@ enum Tool {
     Fill,
     Picker,
     Move,
+    Hand,
     Liquify,
     Crop,
     Shapes,
@@ -143,6 +144,13 @@ fn tool_label(tool: Tool, symbols: bool) -> &'static str {
             }
         }
         Tool::Move => "↔ Move",
+        Tool::Hand => {
+            if symbols {
+                "✋ Hand"
+            } else {
+                "Hand"
+            }
+        }
         Tool::Liquify => {
             if symbols {
                 "➰ Liquify"
@@ -1430,7 +1438,7 @@ impl ProCraftApp {
         self.doc = Document::new(w, h);
         self.clear_recovery();
         self.after_canvas_change();
-        self.status = format!("New canvas {w} x {h}.");
+        self.status = format!("New canvas {w} x {h}. Time-lapse records under Animation.");
     }
 
     /// M33 Gallery: rebuild cached thumbnails when the recent list
@@ -2991,6 +2999,7 @@ impl eframe::App for ProCraftApp {
             ui.radio_value(&mut self.tool, Tool::Fill, tool_label(Tool::Fill, self.has_symbols));
             ui.radio_value(&mut self.tool, Tool::Picker, tool_label(Tool::Picker, self.has_symbols));
             ui.radio_value(&mut self.tool, Tool::Move, tool_label(Tool::Move, self.has_symbols));
+            ui.radio_value(&mut self.tool, Tool::Hand, tool_label(Tool::Hand, self.has_symbols));
             ui.radio_value(&mut self.tool, Tool::Liquify, tool_label(Tool::Liquify, self.has_symbols));
             ui.radio_value(&mut self.tool, Tool::Crop, tool_label(Tool::Crop, self.has_symbols));
             ui.radio_value(&mut self.tool, Tool::Shapes, tool_label(Tool::Shapes, self.has_symbols));
@@ -4769,10 +4778,16 @@ impl eframe::App for ProCraftApp {
             if let Some(m) = &fingers {
                 let d = m.translation_delta;
                 if d != egui::Vec2::ZERO {
-                    self.view_offset += d;
                     let (cw, ch) = (w * self.zoom, h * self.zoom);
-                    self.view_offset.x = self.view_offset.x.clamp(-cw + 60.0, avail.x - 60.0);
-                    self.view_offset.y = self.view_offset.y.clamp(-ch + 60.0, avail.y - 60.0);
+                    let (ox, oy) = pan_offset(
+                        (self.view_offset.x, self.view_offset.y),
+                        (d.x, d.y),
+                        cw,
+                        ch,
+                        avail.x,
+                        avail.y,
+                    );
+                    self.view_offset = egui::Vec2::new(ox, oy);
                 }
                 // Two-finger twist rotates the view about the canvas
                 // center (paint math stays axis-aligned).
@@ -4820,6 +4835,17 @@ impl eframe::App for ProCraftApp {
             // an inline chain reindents the whole ~950-line body.)
             let canvas_scroll = egui::ScrollArea::both()
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+            // PC wheel conventions: plain wheel pans vertically, shift+wheel
+            // pans horizontally, ctrl+wheel zooms (via zoom_delta below).
+            // The backend passes wheel ticks through untouched, so shift
+            // would otherwise scroll vertically like a plain wheel.
+            if ui.ctx().input(|i| i.modifiers.shift) {
+                ui.ctx().input_mut(|i| {
+                    let d = i.smooth_scroll_delta;
+                    let (x, y) = shift_wheel_remap(d.x, d.y, true);
+                    i.smooth_scroll_delta = egui::Vec2::new(x, y);
+                });
+            }
             canvas_scroll.show(ui, |ui| {
                 let (rect, resp) =
                     ui.allocate_exact_size(Vec2::new(w * z, h * z), Sense::click_and_drag());
@@ -5397,6 +5423,31 @@ impl eframe::App for ProCraftApp {
                         let (x, y) = to_canvas(pos);
                         let (cx, cy) = clamp_pt(x, y);
                         self.paint_picker_loupe(ui.painter(), &ctx, pos, cx, cy);
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                }
+
+                if self.tool == Tool::Hand {
+                    // Pan the VIEW with any pointer (pen, mouse, finger) —
+                    // never paints, checkpoints, or touches undo. Same clamp
+                    // as two-finger pan; multi-touch stays on its own path
+                    // (gesture) so the two never double-pan.
+                    if resp.dragged() && !gesture {
+                        let d = resp.drag_delta();
+                        if d != egui::Vec2::ZERO {
+                            let (cw, ch) = (w * self.zoom, h * self.zoom);
+                            let (ox, oy) = pan_offset(
+                                (self.view_offset.x, self.view_offset.y),
+                                (d.x, d.y),
+                                cw,
+                                ch,
+                                avail.x,
+                                avail.y,
+                            );
+                            self.view_offset = egui::Vec2::new(ox, oy);
+                        }
                     }
                     self.painting = false;
                     self.last = None;

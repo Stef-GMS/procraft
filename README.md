@@ -26,7 +26,7 @@ Android files live in the app's external folder
 in-app Import browser reads it, and saves land there, then appear in
 Photos after a media scan.
 
-## Status: milestone 32
+## Status: milestone 47
 
 - [x] Layered document model (add / hide / reorder / opacity / blend)
 - [x] Soft-round brush + eraser with spacing, dynamics and undo
@@ -62,6 +62,10 @@ Photos after a media scan.
 - [x] Animation frame UI: duplicate frame, per-frame hold (playback + GIF round-trip timing), onion strength per side
 - [x] Adaptive top bar: all groups flow inline and fold to 2+ lines on narrow displays (phone portrait, small windows) instead of overlapping
 - [x] Native Android build (NativeActivity + wgpu, cargo-apk sideload APK, ARM64 + x86_64 universal, release-signed): touch paint, adaptive bar, in-app Import browser over USB (`Android/data/...`), external saves with media scan
+- [x] Gallery/file browser (M33): new/open/recent with thumbnails; Reference companion (M34); Selection upgrades (M35): save/load, nudge/flip; Adjustments (M36/M37): Curves/Levels + HSL/Balance/Recolor
+- [x] Typography (M38): TTF/OTF import, leading/tracking/outline; Brush depth (M39); Liquify-lite (M40); Time-lapse snapshots (M41); iPad layout polish (M42)
+- [x] Transform depth (M43/M44): corner-pin distort + warp mesh (masks travel); Stability hardening (M45): fuzz open, OOM guards; SAF picker (M46); Palm rejection + Pencil (M47)
+- [x] Touch workflow: Hand pan tool (margin-grab fix), Pencil + two-finger pan, shift+wheel horizontal pan, hidden scrollbars, tap undo/redo
 
 ## Icon
 

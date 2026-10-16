@@ -18,6 +18,8 @@ use procraft_engine::{
     MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING,
     MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
 };
+#[cfg(target_os = "android")]
+use procraft_engine::{ext_matches, file_size_label};
 #[cfg(any(target_os = "ios", target_os = "android"))]
 use rfd_shim as rfd;
 
@@ -55,11 +57,7 @@ fn android_import_list(kind: PendingOpen) -> (Vec<std::path::PathBuf>, Option<St
             rd.filter_map(|e| e.ok())
                 .map(|e| e.path())
                 .filter(|p| {
-                    p.is_file()
-                        && p.extension()
-                            .and_then(|e| e.to_str())
-                            .map(|e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
-                            .unwrap_or(false)
+                    p.is_file() && ext_matches(p.extension().and_then(|e| e.to_str()), exts)
                 })
                 .collect()
         })
@@ -2153,6 +2151,8 @@ impl eframe::App for ProCraftApp {
         // Android file browser: external files dir (USB/`adb push` drop
         // point), filtered by the requested kind. Synchronous UI — there is
         // no system picker on NativeActivity. Picks reuse `open_picked`.
+        // M46: scrollable rows with sizes + a count label (long USB drops
+        // no longer overflow the window).
         #[cfg(target_os = "android")]
         if let Some(kind) = self.android_browse {
             let mut picked: Option<std::path::PathBuf> = None;
@@ -2168,16 +2168,30 @@ impl eframe::App for ProCraftApp {
                         ui.label(note);
                     } else if files.is_empty() {
                         ui.label("No matching files yet — copy some over USB first.");
+                    } else {
+                        ui.label(format!("{} file(s)", files.len()));
                     }
-                    for path in &files {
-                        let name = path
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        if ui.button(&name).clicked() {
-                            picked = Some(path.clone());
-                        }
-                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for path in &files {
+                                let name = path
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                let size = std::fs::metadata(path)
+                                    .map(|m| file_size_label(m.len()))
+                                    .unwrap_or_default();
+                                let row = if size.is_empty() {
+                                    name
+                                } else {
+                                    format!("{name} ({size})")
+                                };
+                                if ui.button(&row).clicked() {
+                                    picked = Some(path.clone());
+                                }
+                            }
+                        });
                     if ui.button("Cancel").clicked() {
                         cancelled = true;
                     }

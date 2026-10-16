@@ -6,6 +6,7 @@ mod animation;
 mod brush;
 mod document;
 mod guides;
+mod import_filter;
 mod palette;
 mod probrush;
 mod psd;
@@ -26,6 +27,7 @@ pub use document::{
     SymmetryMode, MAX_CANVAS_SIDE,
 };
 pub use guides::{AssistLine, GuideKind, Guides, ASSIST_DEADZONE, VP_BOUND};
+pub use import_filter::{ext_matches, file_size_label};
 pub use palette::{
     analogous, complementary, hsl_to_rgb, import_gpl_file, import_gpl_text, open_palette,
     palette_from_rgba, rgb_to_hsl, save_palette, starter_palette, triadic, Palette, PaletteSet,

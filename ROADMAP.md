@@ -22,7 +22,7 @@ people touch daily. Ranked by user-visible value per effort.
   freeform sibling).
 - [x] **M45 — Stability hardening.** Fuzz project open, OOM guards on
   import.
-- [ ] **M46 — SAF file picker.** Real Android picker (replaces the
+- [x] **M46 — SAF file picker.** Real Android picker (replaces the
   v0.8.1 "picker coming" notes); tighten desktop fallback.
 - [ ] **M47 — Palm rejection + Pencil.** Double-tap/hover, touch guards.
   **→ PC checkpoint #5 + iPad check #3 (IPA).**

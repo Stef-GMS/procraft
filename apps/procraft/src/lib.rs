@@ -4813,7 +4813,14 @@ impl eframe::App for ProCraftApp {
                 self.sym_grab = false;
             }
             let z = self.zoom;
-            egui::ScrollArea::both().show(ui, |ui| {
+            // No scrollbar visuals over the artwork (v13 iPad: a full-width
+            // bar flashed across the painting on every tap at overflow).
+            // Touch pans via view_offset; desktop wheel keeps scrolling
+            // while hidden - visibility was serving neither. (Bound first:
+            // an inline chain reindents the whole ~950-line body.)
+            let canvas_scroll = egui::ScrollArea::both()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+            canvas_scroll.show(ui, |ui| {
                 let (rect, resp) =
                     ui.allocate_exact_size(Vec2::new(w * z, h * z), Sense::click_and_drag());
                 // Pan applies to the drawn canvas and every overlay/mapping

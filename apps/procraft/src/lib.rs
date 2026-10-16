@@ -4760,6 +4760,9 @@ impl eframe::App for ProCraftApp {
             let tex = self.texture.as_ref().unwrap().id();
             let (w, h) = (self.doc.w as f32, self.doc.h as f32);
             let avail = ui.available_size();
+            // Viewport rect for press-origin tests (Hand grabs anywhere
+            // in it, including paper margins outside the canvas rect).
+            let view_rect = ui.available_rect_before_wrap();
             if self.zoom <= 0.0 {
                 self.zoom = (avail.x / w).min(avail.y / h).clamp(0.1, 8.0);
             }
@@ -5431,23 +5434,31 @@ impl eframe::App for ProCraftApp {
 
                 if self.tool == Tool::Hand {
                     // Pan the VIEW with any pointer (pen, mouse, finger) —
-                    // never paints, checkpoints, or touches undo. Same clamp
-                    // as two-finger pan; multi-touch stays on its own path
-                    // (gesture) so the two never double-pan.
-                    if resp.dragged() && !gesture {
-                        let d = resp.drag_delta();
-                        if d != egui::Vec2::ZERO {
-                            let (cw, ch) = (w * self.zoom, h * self.zoom);
-                            let (ox, oy) = pan_offset(
-                                (self.view_offset.x, self.view_offset.y),
-                                (d.x, d.y),
-                                cw,
-                                ch,
-                                avail.x,
-                                avail.y,
-                            );
-                            self.view_offset = egui::Vec2::new(ox, oy);
-                        }
+                    // never paints, checkpoints, or touches undo. The grab
+                    // starts anywhere in the viewport (press origin), not
+                    // just on the canvas: paper margins pan too. The origin
+                    // persists for the whole press, so no latch is needed;
+                    // multi-touch stays on its own path (gesture) so the
+                    // two never double-pan. Same clamp as two-finger pan.
+                    let (held, origin_in_view, d) = ui.ctx().input(|i| {
+                        let p = &i.pointer;
+                        (
+                            p.any_down(),
+                            p.press_origin().is_some_and(|o| view_rect.contains(o)),
+                            p.delta(),
+                        )
+                    });
+                    if held && origin_in_view && !gesture && d != egui::Vec2::ZERO {
+                        let (cw, ch) = (w * self.zoom, h * self.zoom);
+                        let (ox, oy) = pan_offset(
+                            (self.view_offset.x, self.view_offset.y),
+                            (d.x, d.y),
+                            cw,
+                            ch,
+                            avail.x,
+                            avail.y,
+                        );
+                        self.view_offset = egui::Vec2::new(ox, oy);
                     }
                     self.painting = false;
                     self.last = None;

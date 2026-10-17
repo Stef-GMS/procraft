@@ -12,12 +12,12 @@ use procraft_engine::{
     import_gif_document, import_gpl_file, levels_lut, next_frame, onion_ghost, open_brush_library,
     open_palette, open_psd, palette_from_rgba, pan_offset, prev_frame, rasterize_frame,
     rasterize_frame_region, save_brush_library, save_palette, save_psd, shift_wheel_remap,
-    starter_palette, step_playback_visible, triadic, zoom_drag_factor, AssistLine, BlendMode,
-    Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides, LoopMode, PaintTarget,
-    Palette, PaletteSet, Settings, ShapePoly, SymmetryMode, TapAction, TextStyle, LAPSE_SIDE,
-    MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES,
-    MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING,
-    MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
+    starter_palette, step_playback_visible, triadic, zoom_drag_factor, ActionId, AssistLine,
+    BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides, LoopMode,
+    PaintTarget, Palette, PaletteSet, Settings, ShapePoly, Shortcuts, SymmetryMode, TapAction,
+    TextStyle, LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS,
+    MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS,
+    MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX, SETTINGS_VERSION,
 };
 #[cfg(target_os = "android")]
 use procraft_engine::{ext_matches, file_size_label};
@@ -377,6 +377,18 @@ fn push_recent(recent: &mut Vec<String>, path: &str) {
     recent.truncate(MAX_RECENT);
 }
 
+/// M49: what makes two settings snapshots differ in the discrete sense.
+/// Zoom is excluded — it coalesces through `should_flush_zoom` and gets
+/// written by its own quiet-period path.
+fn settings_differ(a: &Settings, b: &Settings) -> bool {
+    a.version != b.version
+        || a.theme != b.theme
+        || a.show_tools != b.show_tools
+        || a.show_layers != b.show_layers
+        || a.recent != b.recent
+        || a.shortcuts != b.shortcuts
+}
+
 fn page_presets() -> Vec<(&'static str, [u8; 3])> {
     vec![
         ("White", [255, 255, 255]),
@@ -385,6 +397,13 @@ fn page_presets() -> Vec<(&'static str, [u8; 3])> {
         ("Warm", [240, 230, 210]),
         ("Blue", [52, 120, 200]),
     ]
+}
+
+/// M49: Shift+drag brush-size gesture state — the size at press plus the
+/// pointer's last x; total travel drives the size, not per-frame deltas.
+struct SizeDrag {
+    base: f32,
+    last_x: f32,
 }
 
 struct ProCraftApp {
@@ -590,6 +609,24 @@ struct ProCraftApp {
     saved_sel: Option<SavedSelection>,
     sel_nudge_x: i32,
     sel_nudge_y: i32,
+    /// M49 settings: resolved settings dir (None = session-only), the
+    /// last-saved snapshot (change detection), the shortcuts table, and
+    /// the zoom write coalescer (dirty flag + last-change time).
+    settings_dir: Option<std::path::PathBuf>,
+    settings_snapshot: Settings,
+    shortcuts: Shortcuts,
+    zoom_dirty: bool,
+    zoom_changed_at: f64,
+    /// M49 UI: shortcuts window flag, live chord-capture target, a
+    /// load/corrupt note for the settings window, and the Shift+drag
+    /// brush-size gesture in flight.
+    show_shortcuts: bool,
+    capture: Option<ActionId>,
+    settings_note: Option<String>,
+    size_drag: Option<SizeDrag>,
+    /// M49: set when this run seeded settings.json; the marker is written
+    /// on the first frame (eframe's CreationContext storage is read-only).
+    seed_marker_pending: bool,
 }
 
 impl ProCraftApp {
@@ -620,6 +657,10 @@ impl ProCraftApp {
         let _ = std::fs::create_dir_all(&dir);
         dir.push("recovery.pcraft");
         let recovery_path = dir;
+        // M49: settings.json lives in the same app dir (independent
+        // lookup; no dir on a platform without APPDATA/HOME means
+        // settings stay session-only).
+        let settings_dir = crate::settings::settings_dir();
         let mut app = Self {
             doc: Document::new(1280, 800),
             brush: Brush::default(),
@@ -773,41 +814,166 @@ impl ProCraftApp {
             saved_sel: None,
             sel_nudge_x: 0,
             sel_nudge_y: 0,
+            settings_dir,
+            settings_snapshot: Settings::default(),
+            shortcuts: Shortcuts::default(),
+            zoom_dirty: false,
+            zoom_changed_at: 0.0,
+            show_shortcuts: false,
+            capture: None,
+            settings_note: None,
+            size_drag: None,
+            seed_marker_pending: false,
         };
-        // Restore disk-persisted UI state (theme, panels, zoom); defaults
-        // stand when nothing was saved yet.
+        // M49: settings.json is the source of truth. The legacy eframe
+        // keys (theme/panels/zoom/recent) are read exactly once — the
+        // first run after M49 — to seed the file; the marker then makes
+        // a later missing file mean "fresh defaults", never a legacy
+        // resurrection. Platforms with no settings dir stay session-only.
         if let Some(storage) = cc.storage {
-            if let Some(name) = storage.get_string("theme") {
-                if let Some(theme) = Theme::from_str(&name) {
-                    app.theme = theme;
-                }
-            }
-            if let Some(v) = storage.get_string("show_tools") {
-                app.show_tools = v == "1";
-            }
-            if let Some(v) = storage.get_string("show_layers") {
-                app.show_layers = v == "1";
-            }
-            if let Some(v) = storage.get_string("zoom") {
-                if let Ok(z) = v.parse::<f32>() {
-                    if z.is_finite() && z > 0.0 {
-                        app.zoom = z;
+            if let Some(dir) = app.settings_dir.clone() {
+                let marker_set = storage.get_string(crate::settings::MARKER_KEY).is_some();
+                let file_exists = crate::settings::settings_path(&dir).is_file();
+                match crate::settings::init_action(file_exists, marker_set) {
+                    crate::settings::Inits::LoadFile => match crate::settings::read(&dir) {
+                        Ok(s) => app.apply_settings(&s),
+                        Err(err) => {
+                            let backup = crate::settings::quarantine(&dir);
+                            let note = match backup {
+                                Some(p) => format!(
+                                    "Settings were unreadable ({err}); backup kept as {}.",
+                                    p.display()
+                                ),
+                                None => {
+                                    format!("Settings were unreadable ({err}); defaults used.")
+                                }
+                            };
+                            app.status = note.clone();
+                            app.settings_note = Some(note);
+                        }
+                    },
+                    crate::settings::Inits::SeedLegacy => {
+                        if let Some(name) = storage.get_string("theme") {
+                            if let Some(theme) = Theme::from_str(&name) {
+                                app.theme = theme;
+                            }
+                        }
+                        if let Some(v) = storage.get_string("show_tools") {
+                            app.show_tools = v == "1";
+                        }
+                        if let Some(v) = storage.get_string("show_layers") {
+                            app.show_layers = v == "1";
+                        }
+                        if let Some(v) = storage.get_string("zoom") {
+                            if let Ok(z) = v.parse::<f32>() {
+                                if z.is_finite() && z > 0.0 {
+                                    app.zoom = z;
+                                }
+                            }
+                        }
+                        // Legacy recents: newline-joined paths.
+                        if let Some(v) = storage.get_string("recent") {
+                            app.recent = v
+                                .lines()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .take(MAX_RECENT)
+                                .map(str::to_string)
+                                .collect();
+                        }
+                        // Seed the file from the migrated values; only a
+                        // landed write earns the marker (a failed write
+                        // retries the seed next launch). eframe 0.36 hands
+                        // `new` a read-only storage, so the marker itself
+                        // is written on the first frame via `storage_mut`.
+                        let snap = app.settings_snapshot_from_fields();
+                        if crate::settings::save_now(&dir, &snap).is_ok() {
+                            app.seed_marker_pending = true;
+                        }
                     }
+                    crate::settings::Inits::UseDefaults => {}
                 }
-            }
-            // M33 Gallery recents: newline-joined paths (iOS has no
-            // disk persistence, so the list is session-only there).
-            if let Some(v) = storage.get_string("recent") {
-                app.recent = v
-                    .lines()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .take(MAX_RECENT)
-                    .map(str::to_string)
-                    .collect();
             }
         }
+        // The snapshot always mirrors what the app actually holds, so
+        // the first frame's sync sees no spurious changes.
+        app.settings_snapshot = app.settings_snapshot_from_fields();
         app
+    }
+
+    /// M49: current fields as a Settings value (the shape written to
+    /// settings.json).
+    fn settings_snapshot_from_fields(&self) -> Settings {
+        Settings {
+            version: SETTINGS_VERSION,
+            theme: self.theme.as_str().to_string(),
+            show_tools: self.show_tools,
+            show_layers: self.show_layers,
+            zoom: self.zoom,
+            recent: self.recent.clone(),
+            shortcuts: self.shortcuts.to_stored(),
+        }
+    }
+
+    /// M49: adopt a loaded file. Unknown theme ids keep the current
+    /// theme; a non-finite/positive zoom keeps the current zoom (legacy
+    /// keys' semantics); shortcut-file warnings become the settings note.
+    fn apply_settings(&mut self, s: &Settings) {
+        if let Some(theme) = Theme::from_str(&s.theme) {
+            self.theme = theme;
+        }
+        self.show_tools = s.show_tools;
+        self.show_layers = s.show_layers;
+        if s.zoom.is_finite() && s.zoom > 0.0 {
+            self.zoom = s.zoom;
+        }
+        self.recent = s.recent.iter().take(MAX_RECENT).cloned().collect();
+        let (shortcuts, warns) = Shortcuts::from_stored(&s.shortcuts);
+        self.shortcuts = shortcuts;
+        if !warns.is_empty() {
+            self.settings_note = Some(warns.join(" "));
+        }
+    }
+
+    /// M49: write settings now (no-op when the platform gave us no dir).
+    fn save_settings_file(&self, s: &Settings) -> Result<(), String> {
+        match &self.settings_dir {
+            Some(dir) => crate::settings::save_now(dir, s),
+            None => Ok(()),
+        }
+    }
+
+    /// M49: once-per-frame settings sync. Discrete edits (theme, panels,
+    /// recents, shortcuts) save immediately; zoom writes coalesce and
+    /// only land once `should_flush_zoom` says the pointer went quiet.
+    fn settings_sync(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let cur = self.settings_snapshot_from_fields();
+        if cur.zoom != self.settings_snapshot.zoom {
+            self.zoom_dirty = true;
+            self.zoom_changed_at = now;
+            self.settings_snapshot.zoom = cur.zoom;
+        }
+        if settings_differ(&cur, &self.settings_snapshot) {
+            self.settings_snapshot = cur.clone();
+            let _ = self.save_settings_file(&cur);
+            self.zoom_dirty = false; // snapshot refreshed wholesale
+        } else if crate::settings::should_flush_zoom(self.zoom_dirty, self.zoom_changed_at, now) {
+            let _ = self.save_settings_file(&cur);
+            self.settings_snapshot = cur;
+            self.zoom_dirty = false;
+        }
+    }
+
+    /// M49: flush immediately when anything is pending (clean exit and
+    /// iOS backgrounding — no timing gate here).
+    fn flush_settings_now(&mut self) {
+        let cur = self.settings_snapshot_from_fields();
+        if settings_differ(&cur, &self.settings_snapshot) || self.zoom_dirty {
+            self.zoom_dirty = false;
+            self.settings_snapshot = cur.clone();
+            let _ = self.save_settings_file(&cur);
+        }
     }
 
     fn base_brush(&self) -> Brush {
@@ -2723,33 +2889,35 @@ fn paint_mask_edges(
 }
 
 impl eframe::App for ProCraftApp {
-    /// Persist UI state to disk (theme, panel visibility, zoom). Window
-    /// rect and panel widths persist via eframe once `persistence_path`
-    /// is set in `main`. Runs on clean exit (and iOS backgrounding), so
-    /// the recovery file is dropped here: anything still on disk next
-    /// launch means the session actually crashed. (iOS caveat: background
-    /// suspension also clears it, so a later kill loses the tail — the
-    /// 120 s cadence bounds that window.)
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        storage.set_string("theme", self.theme.as_str().to_string());
-        storage.set_string(
-            "show_tools",
-            if self.show_tools { "1" } else { "0" }.to_string(),
-        );
-        storage.set_string(
-            "show_layers",
-            if self.show_layers { "1" } else { "0" }.to_string(),
-        );
-        storage.set_string("zoom", self.zoom.to_string());
-        storage.set_string("recent", self.recent.join("\n"));
+    /// Runs on clean exit and iOS backgrounding: flush any pending
+    /// settings write (settings.json is the source of truth since M49;
+    /// window rect and panel widths still persist via eframe), then drop
+    /// the recovery file — anything still on disk next launch means the
+    /// session actually crashed. (iOS caveat: background suspension also
+    /// clears it, so a later kill loses the tail — the 120 s cadence
+    /// bounds that window.)
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.flush_settings_now();
         self.clear_recovery();
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         if self.theme_applied != Some(self.theme) {
             ui.ctx().set_visuals(self.theme.visuals());
             self.theme_applied = Some(self.theme);
         }
+        // M49: the seed marker lands here — eframe 0.36's
+        // `CreationContext::storage` is read-only, `Frame::storage_mut`
+        // is the writable handle (None on mobile: markers are desktop-only
+        // and mobile re-reads the settings file every launch anyway).
+        if self.seed_marker_pending {
+            if let Some(storage) = frame.storage_mut() {
+                storage.set_string(crate::settings::MARKER_KEY, "1".to_string());
+                self.seed_marker_pending = false;
+            }
+        }
+        // M49: first thing each frame — sync the previous frame's edits.
+        self.settings_sync(ui.ctx());
         // Ctrl+Z undo, Ctrl+Y / Ctrl+Shift+Z redo, Esc clears selection.
         if ui
             .ctx()
@@ -7341,6 +7509,22 @@ fn android_main(app: android_activity::AndroidApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_differ_ignores_zoom_but_catches_discrete_changes() {
+        let a = procraft_engine::Settings::default();
+        let mut b = a.clone();
+        b.zoom = 2.0;
+        assert!(!settings_differ(&a, &b), "zoom is coalesced elsewhere");
+        b.recent = vec!["x.procraft".into()];
+        assert!(settings_differ(&a, &b));
+        let mut c = a.clone();
+        c.show_tools = !c.show_tools;
+        assert!(settings_differ(&a, &c));
+        let mut d = a.clone();
+        d.shortcuts.bindings.insert("undo".into(), None);
+        assert!(settings_differ(&a, &d));
+    }
 
     #[test]
     fn stabilizer_substeps_compose_to_one_frame_step() {

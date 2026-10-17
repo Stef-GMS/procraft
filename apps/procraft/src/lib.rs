@@ -1871,13 +1871,19 @@ fn clamp_status_inset(px: u32) -> f32 {
 }
 
 /// M48 transform-handle mode: Off = normal painting; Corners = four
-/// corner pins drive `distort_layer`. Mesh (3x3 warp lattice) arrives
-/// with its drag chain in the next slice.
+/// corner pins drive `distort_layer`; Mesh = 3x3 lattice drives
+/// `warp_layer`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum XformMode {
     Off,
     Corners,
+    Mesh,
 }
+
+/// Mesh lattice is a fixed 2x2 cells (3x3 points) — the engine-tested
+/// path (`Document::warp_layer`).
+const XFORM_MESH_COLS: u32 = 2;
+const XFORM_MESH_ROWS: u32 = 2;
 
 /// Source coords sampled at destination corners [TL, TR, BR, BL] for a
 /// no-op distort: each corner samples itself (engine
@@ -1902,12 +1908,30 @@ fn quad_differs_from_identity(quad: [(f32, f32); 4], w: f32, h: f32) -> bool {
     quad != identity_quad(w, h)
 }
 
+/// Source coords for a no-op warp lattice: regular canvas positions,
+/// row-major, `(cols+1) * (rows+1)` points (engine
+/// `warp_identity_lattice_is_noop`).
+fn identity_grid(w: f32, h: f32, cols: u32, rows: u32) -> Vec<(f32, f32)> {
+    let mut grid = Vec::with_capacity(((cols + 1) * (rows + 1)) as usize);
+    for j in 0..=rows {
+        for i in 0..=cols {
+            grid.push((i as f32 * w / cols as f32, j as f32 * h / rows as f32));
+        }
+    }
+    grid
+}
+
+fn grid_differs_from_identity(grid: &[(f32, f32)], w: f32, h: f32, cols: u32, rows: u32) -> bool {
+    grid != identity_grid(w, h, cols, rows).as_slice()
+}
+
 /// Armed transform state. Handles drag on the canvas; the engine op
 /// applies once on release (checkpoint + resample), so mid-drag ticks
 /// never resample and a release with no movement never checkpoints.
 struct XformState {
     mode: XformMode,
     quad: [(f32, f32); 4],
+    grid: Vec<(f32, f32)>,
     grab: Option<usize>,
     /// Points as they were when the current grab started; a release
     /// applies only when they differ (drag-away-and-back included).
@@ -1919,6 +1943,7 @@ impl XformState {
         Self {
             mode: XformMode::Off,
             quad: identity_quad(1.0, 1.0),
+            grid: Vec::new(),
             grab: None,
             grab_from: Vec::new(),
         }
@@ -1927,6 +1952,7 @@ impl XformState {
     fn points(&self) -> &[(f32, f32)] {
         match self.mode {
             XformMode::Corners => &self.quad,
+            XformMode::Mesh => &self.grid,
             XformMode::Off => &[],
         }
     }
@@ -5390,33 +5416,65 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                 }
-                // Transform handles (M48): corner pins while the Transform
-                // panel has Distort armed. Off-canvas pins park on the
-                // canvas edge as diamonds, exactly like VP handles.
-                if self.xform.mode == XformMode::Corners {
+                // Transform handles (M48): corner pins or warp lattice
+                // while armed in the Transform panel. Off-canvas points
+                // park on the canvas edge as diamonds, like VP handles.
+                if self.xform.mode != XformMode::Off {
                     let red = Color32::from_rgb(220, 60, 60);
-                    for (i, &(x, y)) in self.xform.quad.iter().enumerate() {
-                        let (p0, parked) = vp_handle_pos(rect, z, x, y);
-                        let p = rot_pt(p0, cc, ang);
-                        if parked {
+                    let sp: Vec<(egui::Pos2, bool)> = self
+                        .xform
+                        .points()
+                        .iter()
+                        .map(|&(x, y)| {
+                            let (p0, parked) = vp_handle_pos(rect, z, x, y);
+                            (rot_pt(p0, cc, ang), parked)
+                        })
+                        .collect();
+                    // Mesh: lattice lines under the dots.
+                    if self.xform.mode == XformMode::Mesh
+                        && sp.len()
+                            == (XFORM_MESH_COLS as usize + 1) * (XFORM_MESH_ROWS as usize + 1)
+                    {
+                        let stride = XFORM_MESH_COLS as usize + 1;
+                        let cols = XFORM_MESH_COLS as usize;
+                        let rows = XFORM_MESH_ROWS as usize;
+                        for j in 0..=rows {
+                            for i in 0..=cols {
+                                if i < cols {
+                                    ui.painter().line_segment(
+                                        [sp[j * stride + i].0, sp[j * stride + i + 1].0],
+                                        (1.0, red),
+                                    );
+                                }
+                                if j < rows {
+                                    ui.painter().line_segment(
+                                        [sp[j * stride + i].0, sp[(j + 1) * stride + i].0],
+                                        (1.0, red),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    for (i, (p, parked)) in sp.iter().enumerate() {
+                        if *parked {
                             let r = 10.0;
                             let diamond = vec![
-                                p + egui::Vec2::new(0.0, -r),
-                                p + egui::Vec2::new(r, 0.0),
-                                p + egui::Vec2::new(0.0, r),
-                                p + egui::Vec2::new(-r, 0.0),
+                                *p + egui::Vec2::new(0.0, -r),
+                                *p + egui::Vec2::new(r, 0.0),
+                                *p + egui::Vec2::new(0.0, r),
+                                *p + egui::Vec2::new(-r, 0.0),
                             ];
                             ui.painter()
                                 .add(egui::Shape::closed_line(diamond, (3.0, red)));
-                            ui.painter().circle_filled(p, 2.0, Color32::WHITE);
+                            ui.painter().circle_filled(*p, 2.0, Color32::WHITE);
                         } else {
                             let r = if self.xform.grab == Some(i) {
                                 11.0
                             } else {
                                 9.0
                             };
-                            ui.painter().circle_filled(p, r, red);
-                            ui.painter().circle_stroke(p, r, (2.0, Color32::WHITE));
+                            ui.painter().circle_filled(*p, r, red);
+                            ui.painter().circle_stroke(*p, r, (2.0, Color32::WHITE));
                         }
                     }
                 }
@@ -5595,7 +5653,7 @@ impl eframe::App for ProCraftApp {
                 // grabs pause painting and move the nearest pin; the
                 // engine op applies once on release (a resample per tick
                 // would hang like the pre-throttle filter previews).
-                if self.xform.mode == XformMode::Corners {
+                if self.xform.mode == XformMode::Corners || self.xform.mode == XformMode::Mesh {
                     if resp.drag_started() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let mut best: Option<(usize, f32)> = None;
@@ -5618,20 +5676,57 @@ impl eframe::App for ProCraftApp {
                     } else if resp.dragged() {
                         if let (Some(i), Some(pos)) = (self.xform.grab, resp.hover_pos()) {
                             let (x, y) = to_canvas(pos);
-                            self.xform.quad = quad_with_drag(self.xform.quad, i, (x, y));
+                            match self.xform.mode {
+                                XformMode::Corners => {
+                                    self.xform.quad = quad_with_drag(self.xform.quad, i, (x, y));
+                                }
+                                XformMode::Mesh => {
+                                    if let Some(p) = self.xform.grid.get_mut(i) {
+                                        *p = (x, y);
+                                    }
+                                }
+                                XformMode::Off => {}
+                            }
                         }
                     }
                     if resp.drag_stopped() {
                         let was_grabbed = self.xform.grab.take().is_some();
                         let from = std::mem::take(&mut self.xform.grab_from);
-                        let quad = self.xform.quad;
-                        if was_grabbed
-                            && from.as_slice() != quad.as_slice()
-                            && quad_differs_from_identity(quad, w, h)
-                        {
-                            self.doc.checkpoint();
-                            self.doc.distort_layer(self.doc.active, quad);
-                            self.status = "Distort applied.".to_string();
+                        if was_grabbed {
+                            match self.xform.mode {
+                                XformMode::Corners => {
+                                    let quad = self.xform.quad;
+                                    if from.as_slice() != quad.as_slice()
+                                        && quad_differs_from_identity(quad, w, h)
+                                    {
+                                        self.doc.checkpoint();
+                                        self.doc.distort_layer(self.doc.active, quad);
+                                        self.status = "Distort applied.".to_string();
+                                    }
+                                }
+                                XformMode::Mesh => {
+                                    let grid = self.xform.grid.clone();
+                                    if from.as_slice() != grid.as_slice()
+                                        && grid_differs_from_identity(
+                                            &grid,
+                                            w,
+                                            h,
+                                            XFORM_MESH_COLS,
+                                            XFORM_MESH_ROWS,
+                                        )
+                                    {
+                                        self.doc.checkpoint();
+                                        self.doc.warp_layer(
+                                            self.doc.active,
+                                            XFORM_MESH_COLS,
+                                            XFORM_MESH_ROWS,
+                                            &grid,
+                                        );
+                                        self.status = "Mesh warp applied.".to_string();
+                                    }
+                                }
+                                XformMode::Off => {}
+                            }
                         }
                     }
                     self.painting = false;
@@ -6598,5 +6693,13 @@ mod tests {
         ));
         let moved = quad_with_drag(identity_quad(8.0, 8.0), 1, (6.0, 1.0));
         assert!(quad_differs_from_identity(moved, 8.0, 8.0));
+    }
+
+    #[test]
+    fn xform_grid_identity_has_nine_points() {
+        let g = identity_grid(8.0, 8.0, 2, 2);
+        assert_eq!(g.len(), 9);
+        assert_eq!(g[4], (4.0, 4.0));
+        assert!(!grid_differs_from_identity(&g, 8.0, 8.0, 2, 2));
     }
 }

@@ -2472,18 +2472,22 @@ fn brush_ring_radius(size: f32, zoom: f32) -> f32 {
 
 /// Top-bar width era. Below [`PHONE_BAR_W`] the zoom/rotate/theme/About
 /// group folds into a View menu (phone portrait starves the inline
-/// stepper to a character-wide column); at/above it the bar is unchanged.
+/// stepper to a character-wide column); mobile at/above it is Tablet
+/// (same fold, finger-sized controls); desktop stays unchanged.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BarLayout {
     Wide,
     Narrow,
+    Tablet,
 }
 
 const PHONE_BAR_W: f32 = 600.0;
 
-fn bar_layout(width: f32) -> BarLayout {
+fn bar_layout(width: f32, mobile: bool) -> BarLayout {
     if width < PHONE_BAR_W {
         BarLayout::Narrow
+    } else if mobile {
+        BarLayout::Tablet
     } else {
         BarLayout::Wide
     }
@@ -3605,6 +3609,14 @@ impl eframe::App for ProCraftApp {
                     ui.add_space(self.android_inset_top);
                 }
             }
+            let layout = bar_layout(
+                ui.ctx().viewport_rect().width(),
+                cfg!(any(target_os = "ios", target_os = "android")),
+            );
+            if layout == BarLayout::Tablet {
+                ui.spacing_mut().interact_size.y = 40.0;
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            }
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Gallery").clicked() {
                     self.gallery_open = !self.gallery_open;
@@ -3838,10 +3850,10 @@ impl eframe::App for ProCraftApp {
                     }
                     self.doc.mark_full_dirty();
                 }
-                // Phone portrait folds the view cluster into a menu (the
+                // Phone and tablet fold the view cluster into a menu (the
                 // inline stepper starves to a character-wide column below
-                // ~600px); wider screens keep the exact inline layout.
-                if bar_layout(ui.ctx().viewport_rect().width()) == BarLayout::Narrow {
+                // ~600px); desktop keeps the exact inline layout.
+                if matches!(layout, BarLayout::Narrow | BarLayout::Tablet) {
                     ui.menu_button("View", |ui| {
                         self.view_controls(ui, true);
                     });
@@ -8146,10 +8158,14 @@ mod tests {
 
     #[test]
     fn bar_layout_splits_at_phone_width() {
-        assert_eq!(bar_layout(360.0), BarLayout::Narrow);
-        assert_eq!(bar_layout(599.0), BarLayout::Narrow);
-        assert_eq!(bar_layout(600.0), BarLayout::Wide);
-        assert_eq!(bar_layout(1280.0), BarLayout::Wide);
+        assert_eq!(bar_layout(320.0, true), BarLayout::Narrow);
+        assert_eq!(bar_layout(599.0, true), BarLayout::Narrow);
+        assert_eq!(bar_layout(360.0, false), BarLayout::Narrow);
+        assert_eq!(bar_layout(600.0, true), BarLayout::Tablet);
+        assert_eq!(bar_layout(820.0, true), BarLayout::Tablet);
+        assert_eq!(bar_layout(844.0, true), BarLayout::Tablet);
+        assert_eq!(bar_layout(600.0, false), BarLayout::Wide);
+        assert_eq!(bar_layout(1280.0, false), BarLayout::Wide);
     }
 
     #[test]

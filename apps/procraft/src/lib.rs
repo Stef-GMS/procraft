@@ -2037,9 +2037,133 @@ fn pull_grid(
     )
 }
 
-/// Armed transform state. Handles drag on the canvas; the engine op
-/// applies once on release (checkpoint + resample), so mid-drag ticks
-/// never resample and a release with no movement never checkpoints.
+/// Result of a live transform preview tick (see [`xform_preview`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum XformApply {
+    /// Handles off (or nothing to map): nothing was written.
+    NoOp,
+    /// The layer now shows the transform previewed from the session base.
+    Applied,
+    /// Pins sit back on the base positions: pristine pixels were restored.
+    Restored,
+    /// The pins collapsed (solve failed): the last good preview stays.
+    Skipped,
+}
+
+/// Live-preview session base: the active layer's pixels and mask as they
+/// were when the transform session started, plus the pin positions they
+/// correspond to and the document revision at capture. Every preview
+/// recomputes from this base, so dragging shows live feedback and
+/// repeated back-and-forth gestures never compound resampling blur or
+/// permanently lose content pushed off-canvas. Dropped by re-arming,
+/// re-captured whenever the document or layer changes behind it.
+struct XformBase {
+    pixels: Vec<u8>,
+    mask: Option<Vec<u8>>,
+    layer: usize,
+    pins: Vec<(f32, f32)>,
+    rev: u64,
+}
+
+/// Recompute the active layer from the session base with the pins where
+/// they are now: the one path that writes transform pixels. Captures the
+/// base lazily on the first write (while the pixels still correspond to
+/// the gesture-start pins), restores pristine pixels when the pins land
+/// back on the base, and re-captures instead of warping a stale base
+/// after external edits (painting, undo, filters) or a layer switch.
+fn xform_preview(doc: &mut Document, x: &mut XformState) -> XformApply {
+    if x.mode == XformMode::Off || x.points().is_empty() {
+        return XformApply::NoOp;
+    }
+    let active = doc.active;
+    let stale = match x.base.as_ref() {
+        None => true,
+        Some(b) => b.layer != active || b.rev != doc.revision(),
+    };
+    if stale {
+        let pins = if x.grab.is_some() {
+            x.grab_from.clone()
+        } else {
+            x.points().to_vec()
+        };
+        let pins = if pins.len() == x.points().len() {
+            pins
+        } else {
+            x.points().to_vec()
+        };
+        let layer = &doc.layers[active];
+        x.base = Some(XformBase {
+            pixels: layer.pixels.clone(),
+            mask: layer.mask.clone(),
+            layer: active,
+            pins,
+            rev: doc.revision(),
+        });
+    }
+    let base_pins = x.base.as_ref().map(|b| b.pins.clone()).unwrap_or_default();
+    if x.points() == base_pins.as_slice() {
+        // Pins back on the base: hand back the pristine pixels (also the
+        // cancel path), nothing to resample.
+        {
+            let b = x.base.as_ref().expect("base captured above");
+            let layer = &mut doc.layers[active];
+            layer.pixels.clone_from(&b.pixels);
+            layer.mask.clone_from(&b.mask);
+        }
+        doc.mark_full_dirty();
+        if let Some(b) = x.base.as_mut() {
+            b.rev = doc.revision();
+        }
+        return XformApply::Restored;
+    }
+    let (w, h) = (doc.w as f32, doc.h as f32);
+    enum Warp {
+        Quad([(f32, f32); 4]),
+        Mesh(Vec<(f32, f32)>),
+    }
+    // Inverse solve: the pin positions written in as pull coords would
+    // move content the opposite way.
+    let warp = match x.mode {
+        XformMode::Corners => match pull_quad(x.quad, &base_pins, w, h) {
+            Some(q) => Warp::Quad(q),
+            None => return XformApply::Skipped,
+        },
+        XformMode::Mesh => {
+            match pull_grid(&x.grid, &base_pins, w, h, XFORM_MESH_COLS, XFORM_MESH_ROWS) {
+                Some(g) => Warp::Mesh(g),
+                None => return XformApply::Skipped,
+            }
+        }
+        XformMode::Off => return XformApply::NoOp,
+    };
+    // One undo step per gesture, pushed before its first pixel write
+    // (tap-grabs that never move never checkpoint).
+    if !x.checkpointed {
+        doc.checkpoint();
+        x.checkpointed = true;
+    }
+    // Swap the pristine base in, then let the engine warp it: the result
+    // always comes from the base, never from a previous preview.
+    {
+        let b = x.base.as_ref().expect("base captured above");
+        let layer = &mut doc.layers[active];
+        layer.pixels.clone_from(&b.pixels);
+        layer.mask.clone_from(&b.mask);
+    }
+    match warp {
+        Warp::Quad(q) => doc.distort_layer(active, q),
+        Warp::Mesh(g) => doc.warp_layer(active, XFORM_MESH_COLS, XFORM_MESH_ROWS, &g),
+    }
+    if let Some(b) = x.base.as_mut() {
+        b.rev = doc.revision();
+    }
+    XformApply::Applied
+}
+
+/// Armed transform state. Handles drag on the canvas; every tick previews
+/// the transform live from the session base (see [`xform_preview`]), so
+/// repeated gestures never compound resampling loss and release keeps
+/// whatever the preview showed.
 struct XformState {
     mode: XformMode,
     quad: [(f32, f32); 4],
@@ -2051,9 +2175,13 @@ struct XformState {
     grab_at: (f32, f32),
     /// Points as they were when the current grab started; a release
     /// applies only when they differ (drag-away-and-back included),
-    /// cancel restores them, and the apply solve maps pins back onto
+    /// cancel restores them, and the preview solve maps pins back onto
     /// them so content keeps following the pin across gestures.
     grab_from: Vec<(f32, f32)>,
+    /// Live-preview session base (captured lazily; see [`xform_preview`]).
+    base: Option<XformBase>,
+    /// Whether the current gesture already pushed its undo checkpoint.
+    checkpointed: bool,
 }
 
 impl XformState {
@@ -2065,6 +2193,8 @@ impl XformState {
             grab: None,
             grab_at: (0.0, 0.0),
             grab_from: Vec::new(),
+            base: None,
+            checkpointed: false,
         }
     }
 
@@ -2090,6 +2220,7 @@ impl XformState {
         self.grab = Some(i);
         self.grab_at = at;
         self.grab_from = self.points().to_vec();
+        self.checkpointed = false;
     }
 
     /// Move the grabbed pin by the pointer's displacement since the
@@ -2119,16 +2250,31 @@ impl XformState {
 
     /// Switch modes: restore any in-flight grab into the mode that owns
     /// the points, then seed identity positions for the new mode. Off
-    /// keeps the last positions (re-arming is cheap).
+    /// keeps the last positions (re-arming is cheap). Re-arming also
+    /// resets the preview session: the next preview captures a fresh
+    /// base from the current canvas.
     fn arm(&mut self, mode: XformMode, w: f32, h: f32) {
         self.cancel_grab();
         self.mode = mode;
+        self.base = None;
+        self.checkpointed = false;
         match mode {
             XformMode::Corners => self.quad = identity_quad(w, h),
             XformMode::Mesh => self.grid = identity_grid(w, h, XFORM_MESH_COLS, XFORM_MESH_ROWS),
             XformMode::Off => {}
         }
     }
+}
+
+/// Per-point stabilizer coefficient for an `n`-point input trail: applying
+/// it `n` times composes to the same per-frame convergence as one step of
+/// `a` (the single-step coefficient), so trail stamping never changes the
+/// stabilizer's feel. `n <= 1` returns `a` bit-for-bit.
+fn stabilizer_substep(a: f32, n: usize) -> f32 {
+    if n <= 1 || a <= 0.0 || a >= 1.0 {
+        return a;
+    }
+    1.0 - (1.0 - a).powf(1.0 / n as f32)
 }
 
 /// Textured quad for a rotated canvas view: `corners` are TL, TR, BR, BL
@@ -2390,9 +2536,14 @@ impl eframe::App for ProCraftApp {
             self.lasso_points.clear();
             self.lasso_poly.clear();
             self.sel_edges_dirty = true;
-            // Armed transform handles drop their grab; the pins snap
-            // back to the gesture start (apply happens on release only).
+            // Armed transform handles roll back: the pins snap back to
+            // the gesture start and, if a live preview session exists,
+            // the pixels follow (recomputed from its base).
+            let had_xform = self.xform.grab.is_some() || self.xform.base.is_some();
             self.xform.cancel_grab();
+            if had_xform {
+                xform_preview(&mut self.doc, &mut self.xform);
+            }
         }
         // Multi-finger taps (touch): two fingers = undo, three = redo.
         // A tap is a quick clean release with no travel; pans and pinches
@@ -4892,8 +5043,8 @@ impl eframe::App for ProCraftApp {
                         }
                     });
                     // M48 transform handles: arm corner pins or the warp
-                    // lattice for on-canvas dragging (applies on release,
-                    // one undo step per gesture).
+                    // lattice for on-canvas dragging (live previews while
+                    // dragging, one undo step per gesture).
                     ui.horizontal(|ui| {
                         ui.label("Handles:");
                         let mut mode = self.xform.mode;
@@ -4908,10 +5059,10 @@ impl eframe::App for ProCraftApp {
                                     "Transform handles off — painting resumes.".to_string()
                                 }
                                 XformMode::Corners => "Corner pins armed — painting pauses while \
-                                     armed; drag a pin, release applies."
+                                     armed; drag a pin to preview."
                                     .to_string(),
                                 XformMode::Mesh => "Mesh lattice armed — painting pauses while \
-                                     armed; drag a point, release applies."
+                                     armed; drag a point to preview."
                                     .to_string(),
                             };
                         }
@@ -5435,7 +5586,11 @@ impl eframe::App for ProCraftApp {
                 self.fill_preview = None;
                 self.vp_grab = None;
                 self.sym_grab = false;
+                let had_xform = self.xform.grab.is_some() || self.xform.base.is_some();
                 self.xform.cancel_grab();
+                if had_xform {
+                    xform_preview(&mut self.doc, &mut self.xform);
+                }
             }
             let z = self.zoom;
             // No scrollbar visuals over the artwork (v13 iPad: a full-width
@@ -5852,9 +6007,10 @@ impl eframe::App for ProCraftApp {
 
                 // Transform handles (M48, armed in the Transform panel):
                 // grabs pause painting and move the nearest pin by the
-                // pointer's displacement; the engine op applies once on
-                // release (a resample per tick would hang like the
-                // pre-throttle filter previews).
+                // pointer's displacement. Every tick re-warps from the
+                // session base (see xform_preview), so the drag previews
+                // live and repeated gestures never compound resampling;
+                // release just reports the already-previewed result.
                 if self.xform.mode == XformMode::Corners || self.xform.mode == XformMode::Mesh {
                     if resp.drag_started() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
@@ -5875,67 +6031,35 @@ impl eframe::App for ProCraftApp {
                                 }
                             }
                         }
-                    } else if resp.dragged() {
+                    } else if resp.dragged() && self.xform.grab.is_some() {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
                             let (dx, dy) = (x - self.xform.grab_at.0, y - self.xform.grab_at.1);
                             self.xform.drag_by(dx, dy);
+                            if xform_preview(&mut self.doc, &mut self.xform) == XformApply::Skipped
+                            {
+                                self.status = "Pins overlap — transform skipped.".to_string();
+                            }
                         }
                     }
                     if resp.drag_stopped() {
                         let was_grabbed = self.xform.grab.take().is_some();
                         let from = std::mem::take(&mut self.xform.grab_from);
-                        if was_grabbed {
-                            match self.xform.mode {
-                                XformMode::Corners => {
-                                    let pins = self.xform.quad;
-                                    if from.as_slice() != pins.as_slice() {
-                                        // Inverse-solve: writing the pin
-                                        // positions in as pull coords would
-                                        // move content the opposite way.
-                                        match pull_quad(pins, &from, w, h) {
-                                            Some(q) => {
-                                                self.doc.checkpoint();
-                                                self.doc.distort_layer(self.doc.active, q);
-                                                self.status = "Distort applied.".to_string();
-                                            }
-                                            None => {
-                                                self.status =
-                                                    "Pins overlap — transform skipped.".to_string();
-                                            }
-                                        }
-                                    }
+                        if was_grabbed && from.as_slice() != self.xform.points() {
+                            // Re-run once with the release positions (the
+                            // last render already showed this) and commit
+                            // the status message.
+                            self.status = match xform_preview(&mut self.doc, &mut self.xform) {
+                                XformApply::Skipped => {
+                                    "Pins overlap — transform skipped.".to_string()
                                 }
-                                XformMode::Mesh => {
-                                    let pins = self.xform.grid.clone();
-                                    if from.as_slice() != pins.as_slice() {
-                                        match pull_grid(
-                                            &pins,
-                                            &from,
-                                            w,
-                                            h,
-                                            XFORM_MESH_COLS,
-                                            XFORM_MESH_ROWS,
-                                        ) {
-                                            Some(q) => {
-                                                self.doc.checkpoint();
-                                                self.doc.warp_layer(
-                                                    self.doc.active,
-                                                    XFORM_MESH_COLS,
-                                                    XFORM_MESH_ROWS,
-                                                    &q,
-                                                );
-                                                self.status = "Mesh warp applied.".to_string();
-                                            }
-                                            None => {
-                                                self.status =
-                                                    "Pins overlap — transform skipped.".to_string();
-                                            }
-                                        }
-                                    }
-                                }
-                                XformMode::Off => {}
-                            }
+                                XformApply::Restored => "Transform reset.".to_string(),
+                                XformApply::Applied => match self.xform.mode {
+                                    XformMode::Mesh => "Mesh warp applied.".to_string(),
+                                    _ => "Distort applied.".to_string(),
+                                },
+                                XformApply::NoOp => self.status.clone(),
+                            };
                         }
                     }
                     self.painting = false;
@@ -6671,95 +6795,118 @@ impl eframe::App for ProCraftApp {
                 }
                 if self.painting && resp.dragged() {
                     if let Some(pos) = resp.hover_pos() {
-                        let (x, y) = to_canvas(pos);
-                        // Clamp: off-page drags paint nothing instead of
-                        // streaking the canvas edge (and poisoning the
-                        // dirty rect, which used to quit the app).
-                        let (x, y) = clamp_pt(x, y);
+                        // Stamp through every pointer position the backend
+                        // recorded this frame (device rate), not just the
+                        // frame-end hover point: fast strokes stop turning
+                        // into straight chords between frames. Frames with
+                        // no extra events keep the exact old behavior.
+                        let mut pts: Vec<egui::Pos2> = ctx.input(|i| {
+                            i.events
+                                .iter()
+                                .filter_map(|e| match e {
+                                    egui::Event::PointerMoved(p) => Some(*p),
+                                    _ => None,
+                                })
+                                .collect()
+                        });
+                        if pts.last() != Some(&pos) {
+                            pts.push(pos);
+                        }
                         let now = ctx.input(|i| i.time);
-                        let dt = (now - self.last_t).max(1.0 / 240.0) as f32;
+                        let frame_dt = (now - self.last_t).max(1.0 / 240.0) as f32;
                         self.last_t = now;
+                        let dt = frame_dt / pts.len() as f32;
                         let brush = self.base_brush();
                         // Pressure: Pencil/touch force when the backend
                         // forwards it, else full pressure (mice have no
                         // sensor; velocity taper below still applies).
                         let pressure = latest_touch_force(&ctx).unwrap_or(1.0);
                         // Stabilizer: exponential smoothing toward the raw
-                        // pointer; 0 keeps the raw point bit-for-bit.
+                        // pointer; 0 keeps the raw point bit-for-bit. Spread
+                        // across the trail points so per-frame convergence
+                        // (and with it the feel) matches the single-step form.
                         let a = brush.stabilizer.clamp(0.0, 1.0) * 0.85;
-                        let (sx, sy) = match self.smooth_pt {
-                            Some((px, py)) => {
-                                (px + (x - px) * (1.0 - a), py + (y - py) * (1.0 - a))
-                            }
-                            None => (x, y),
-                        };
-                        self.smooth_pt = Some((sx, sy));
-                        // Drawing Assist: ride an engaged ray/axis lock,
-                        // else fall back to guide point-snap (shapes stay
-                        // free). Projected points re-clamp so rays running
-                        // off-canvas never streak the edge.
-                        let (sx, sy) = if self.assist && self.guides.kind != GuideKind::Off {
-                            match self.assist_lock {
-                                Some(lock) => {
-                                    let (px, py) = lock.project(sx, sy);
-                                    clamp_pt(px, py)
+                        let a = stabilizer_substep(a, pts.len());
+                        for pt in pts {
+                            let (x, y) = to_canvas(pt);
+                            // Clamp: off-page drags paint nothing instead of
+                            // streaking the canvas edge (and poisoning the
+                            // dirty rect, which used to quit the app).
+                            let (x, y) = clamp_pt(x, y);
+                            let (sx, sy) = match self.smooth_pt {
+                                Some((px, py)) => {
+                                    (px + (x - px) * (1.0 - a), py + (y - py) * (1.0 - a))
                                 }
-                                None => {
-                                    let lock = self
-                                        .assist_start
-                                        .and_then(|s| self.guides.assist_lock(w, h, s, (sx, sy)));
-                                    match lock {
-                                        Some(l) => {
-                                            self.assist_lock = Some(l);
-                                            let (px, py) = l.project(sx, sy);
-                                            clamp_pt(px, py)
+                                None => (x, y),
+                            };
+                            self.smooth_pt = Some((sx, sy));
+                            // Drawing Assist: ride an engaged ray/axis lock,
+                            // else fall back to guide point-snap (shapes stay
+                            // free). Projected points re-clamp so rays running
+                            // off-canvas never streak the edge.
+                            let (sx, sy) = if self.assist && self.guides.kind != GuideKind::Off {
+                                match self.assist_lock {
+                                    Some(lock) => {
+                                        let (px, py) = lock.project(sx, sy);
+                                        clamp_pt(px, py)
+                                    }
+                                    None => {
+                                        let lock = self.assist_start.and_then(|s| {
+                                            self.guides.assist_lock(w, h, s, (sx, sy))
+                                        });
+                                        match lock {
+                                            Some(l) => {
+                                                self.assist_lock = Some(l);
+                                                let (px, py) = l.project(sx, sy);
+                                                clamp_pt(px, py)
+                                            }
+                                            None => self.guides.snap_point(w, h, sx, sy),
                                         }
-                                        None => self.guides.snap_point(w, h, sx, sy),
                                     }
                                 }
-                            }
-                        } else {
-                            self.guides.snap_point(w, h, sx, sy)
-                        };
-                        self.smooth_pressure += (pressure - self.smooth_pressure) * (1.0 - a);
-                        // Speed + direction from the smoothed trail.
-                        let (speed_norm, angle) = match self.last {
-                            Some((lx, ly)) => {
-                                let dist = ((sx - lx).powi(2) + (sy - ly).powi(2)).sqrt();
-                                let n = (dist / dt / 3500.0).clamp(0.0, 1.0);
-                                let ang = if dist > 0.001 {
-                                    (sy - ly).atan2(sx - lx)
-                                } else {
-                                    self.last_dyn.angle
-                                };
-                                (n, ang)
-                            }
-                            None => (0.0, self.last_dyn.angle),
-                        };
-                        let from_dyn = if self.last.is_some() {
-                            self.last_dyn
-                        } else {
-                            DabDynamics::default()
-                        };
-                        let to_dyn = DabDynamics {
-                            pressure: self.smooth_pressure,
-                            speed_norm,
-                            angle,
-                        };
-                        let color = self.current_color();
-                        let (last, leftover) = self.doc.stroke_to_dyn(
-                            &brush,
-                            color,
-                            self.last,
-                            from_dyn,
-                            (sx, sy),
-                            to_dyn,
-                            self.leftover,
-                        );
-                        self.last = last;
-                        self.last_dyn = to_dyn;
-                        self.leftover = leftover;
-                        self.stroke_painted = true;
+                            } else {
+                                self.guides.snap_point(w, h, sx, sy)
+                            };
+                            self.smooth_pressure += (pressure - self.smooth_pressure) * (1.0 - a);
+                            // Speed + direction from the smoothed trail.
+                            let (speed_norm, angle) = match self.last {
+                                Some((lx, ly)) => {
+                                    let dist = ((sx - lx).powi(2) + (sy - ly).powi(2)).sqrt();
+                                    let n = (dist / dt / 3500.0).clamp(0.0, 1.0);
+                                    let ang = if dist > 0.001 {
+                                        (sy - ly).atan2(sx - lx)
+                                    } else {
+                                        self.last_dyn.angle
+                                    };
+                                    (n, ang)
+                                }
+                                None => (0.0, self.last_dyn.angle),
+                            };
+                            let from_dyn = if self.last.is_some() {
+                                self.last_dyn
+                            } else {
+                                DabDynamics::default()
+                            };
+                            let to_dyn = DabDynamics {
+                                pressure: self.smooth_pressure,
+                                speed_norm,
+                                angle,
+                            };
+                            let color = self.current_color();
+                            let (last, leftover) = self.doc.stroke_to_dyn(
+                                &brush,
+                                color,
+                                self.last,
+                                from_dyn,
+                                (sx, sy),
+                                to_dyn,
+                                self.leftover,
+                            );
+                            self.last = last;
+                            self.last_dyn = to_dyn;
+                            self.leftover = leftover;
+                            self.stroke_painted = true;
+                        }
                     }
                 }
                 if resp.drag_stopped() {
@@ -6844,6 +6991,22 @@ fn android_main(app: android_activity::AndroidApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stabilizer_substeps_compose_to_one_frame_step() {
+        // Two half-steps must converge exactly like one frame-sized step:
+        // the trail rewrite must not change the stabilizer's feel.
+        let a = 0.3_f32;
+        let s = stabilizer_substep(a, 2);
+        let (s0, p) = (0.0_f32, 1.0_f32);
+        let s1 = s0 + (p - s0) * s;
+        let s2 = s1 + (p - s1) * s;
+        assert!((s2 - (s0 + (p - s0) * a)).abs() < 1e-6);
+        // A single point keeps today's coefficient bit-for-bit.
+        assert_eq!(stabilizer_substep(a, 1), a);
+        // Raw mode (no stabilizer) stays raw for any trail length.
+        assert_eq!(stabilizer_substep(0.0, 7), 0.0);
+    }
 
     #[test]
     fn pixels_hash_sees_any_change() {
@@ -7043,5 +7206,171 @@ mod tests {
         s.arm(XformMode::Corners, 8.0, 8.0);
         assert_eq!(s.grid[4], (4.0, 4.0));
         assert_eq!(s.quad, identity_quad(8.0, 8.0));
+    }
+
+    // --- Live transform preview session: drag previews from a base ---
+
+    /// 8x8 layer with a solid opaque 4x4 red square at (2..6, 2..6).
+    fn xform_test_doc() -> Document {
+        let mut doc = Document::new(8, 8);
+        let l = &mut doc.layers[0];
+        l.pixels = vec![0u8; 8 * 8 * 4];
+        for y in 2..6 {
+            for x in 2..6 {
+                let i = (y * 8 + x) * 4;
+                l.pixels[i] = 255;
+                l.pixels[i + 3] = 255;
+            }
+        }
+        doc
+    }
+
+    fn xform_alpha(doc: &Document, x: usize, y: usize) -> u8 {
+        doc.layers[0].pixels[(y * 8 + x) * 4 + 3]
+    }
+
+    /// One gesture: grab pin 0, translate every pin by (dx, dy), preview,
+    /// then drop the grab the way a release does.
+    fn xform_translate(doc: &mut Document, x: &mut XformState, dx: f32, dy: f32) -> XformApply {
+        x.begin_grab(0, (0.0, 0.0));
+        let moved: Vec<(f32, f32)> = x
+            .points()
+            .iter()
+            .map(|&(px, py)| (px + dx, py + dy))
+            .collect();
+        match x.mode {
+            XformMode::Corners => x.quad.copy_from_slice(&moved),
+            XformMode::Mesh => x.grid = moved,
+            XformMode::Off => {}
+        }
+        let r = xform_preview(doc, x);
+        x.grab = None;
+        x.grab_from.clear();
+        r
+    }
+
+    #[test]
+    fn xform_drag_previews_live_and_content_follows() {
+        let mut doc = xform_test_doc();
+        let before = doc.layers[0].pixels.clone();
+        let mut x = XformState::off();
+        x.arm(XformMode::Corners, 8.0, 8.0);
+        // Mid-drag tick: the pixels change on the same call, no release.
+        assert_eq!(
+            xform_translate(&mut doc, &mut x, 2.0, 0.0),
+            XformApply::Applied
+        );
+        assert_ne!(doc.layers[0].pixels, before);
+        // Content followed the pins: the square sits 2px to the right.
+        assert_eq!(xform_alpha(&doc, 3, 3), 0);
+        assert_eq!(xform_alpha(&doc, 4, 3), 255);
+        assert_eq!(xform_alpha(&doc, 7, 3), 255);
+    }
+
+    #[test]
+    fn xform_session_does_not_compound() {
+        let mut doc = xform_test_doc();
+        let mut x = XformState::off();
+        x.arm(XformMode::Corners, 8.0, 8.0);
+        // Two half-pixel gestures: every tick re-warps from the session
+        // base, so the sum is one clean pixel — no double-resampled edges
+        // (which would fade 255 -> ~127 -> ~64).
+        assert_eq!(
+            xform_translate(&mut doc, &mut x, 0.5, 0.0),
+            XformApply::Applied
+        );
+        assert_eq!(
+            xform_translate(&mut doc, &mut x, 0.5, 0.0),
+            XformApply::Applied
+        );
+        assert_eq!(xform_alpha(&doc, 2, 3), 0);
+        assert_eq!(xform_alpha(&doc, 3, 3), 255);
+        assert_eq!(xform_alpha(&doc, 6, 3), 255);
+        assert_eq!(xform_alpha(&doc, 7, 3), 0);
+    }
+
+    #[test]
+    fn xform_cancel_restores_pixels_from_base() {
+        let mut doc = xform_test_doc();
+        let mut x = XformState::off();
+        x.arm(XformMode::Corners, 8.0, 8.0);
+        assert_eq!(
+            xform_translate(&mut doc, &mut x, 1.0, 0.0),
+            XformApply::Applied
+        );
+        let after_one = doc.layers[0].pixels.clone();
+        // Gesture 2 runs, then aborts (Esc / pinch): pins snap back to
+        // the gesture start and the pixels follow — bit-for-bit the
+        // state before gesture 2.
+        x.begin_grab(0, (0.0, 0.0));
+        let moved: Vec<(f32, f32)> = x.points().iter().map(|&(px, py)| (px + 4.0, py)).collect();
+        x.quad.copy_from_slice(&moved);
+        assert_eq!(xform_preview(&mut doc, &mut x), XformApply::Applied);
+        assert_ne!(doc.layers[0].pixels, after_one);
+        x.cancel_grab();
+        assert_eq!(xform_preview(&mut doc, &mut x), XformApply::Applied);
+        assert_eq!(doc.layers[0].pixels, after_one);
+    }
+
+    #[test]
+    fn xform_offcanvas_content_returns() {
+        let mut doc = xform_test_doc();
+        let pristine = doc.layers[0].pixels.clone();
+        let mut x = XformState::off();
+        x.arm(XformMode::Corners, 8.0, 8.0);
+        // Fling the content far off-canvas: everything clips to nothing.
+        assert_eq!(
+            xform_translate(&mut doc, &mut x, 40.0, 0.0),
+            XformApply::Applied
+        );
+        assert_eq!(xform_alpha(&doc, 4, 3), 0);
+        // Drag the pins straight back onto the base positions: the
+        // content was never destroyed, so it returns bit-for-bit.
+        assert_eq!(
+            xform_translate(&mut doc, &mut x, -40.0, 0.0),
+            XformApply::Restored
+        );
+        assert_eq!(doc.layers[0].pixels, pristine);
+    }
+
+    #[test]
+    fn xform_mesh_preview_translates_and_restores() {
+        let mut doc = xform_test_doc();
+        let pristine = doc.layers[0].pixels.clone();
+        let mut x = XformState::off();
+        x.arm(XformMode::Mesh, 8.0, 8.0);
+        assert_eq!(
+            xform_translate(&mut doc, &mut x, 2.0, 0.0),
+            XformApply::Applied
+        );
+        assert_eq!(xform_alpha(&doc, 3, 3), 0);
+        assert_eq!(xform_alpha(&doc, 6, 3), 255);
+        assert_eq!(
+            xform_translate(&mut doc, &mut x, -2.0, 0.0),
+            XformApply::Restored
+        );
+        assert_eq!(doc.layers[0].pixels, pristine);
+    }
+
+    #[test]
+    fn xform_external_change_recaptures_base() {
+        let mut doc = xform_test_doc();
+        let mut x = XformState::off();
+        x.arm(XformMode::Corners, 8.0, 8.0);
+        assert_eq!(
+            xform_translate(&mut doc, &mut x, 0.5, 0.0),
+            XformApply::Applied
+        );
+        // Something else edits the canvas behind the session's back.
+        let i = ((8 + 1) * 4) as usize;
+        doc.layers[0].pixels[i + 1] = 200;
+        doc.layers[0].pixels[i + 3] = 255;
+        doc.mark_full_dirty();
+        assert_eq!(
+            xform_translate(&mut doc, &mut x, 0.5, 0.0),
+            XformApply::Applied
+        );
+        // The edit was baked into the re-captured base and survives.
+        assert!(doc.layers[0].pixels.chunks(4).any(|p| p[1] >= 100));
     }
 }

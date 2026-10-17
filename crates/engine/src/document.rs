@@ -342,6 +342,10 @@ pub struct Document {
     /// Running pickup color for the smudge stroke (straight RGBA f32s);
     /// reset on every stroke start, never saved.
     pub(crate) smudge_finger: Option<[f32; 4]>,
+    /// Content revision, bumped by every dirty mark: lets callers detect
+    /// mutations made behind their back (e.g. a transform session holding
+    /// a pre-transform pixel base). Session-only, never saved.
+    rev: u64,
 }
 
 /// History cap: at most 32 steps per stack (backstop)…
@@ -392,6 +396,7 @@ impl Document {
             groups: Vec::new(),
             next_group_id: 1,
             smudge_finger: None,
+            rev: 0,
         }
     }
 
@@ -419,6 +424,7 @@ impl Document {
             groups: Vec::new(),
             next_group_id: 1,
             smudge_finger: None,
+            rev: 0,
         }
     }
     /// Mirror center in canvas pixels (canvas middle when never moved).
@@ -443,10 +449,17 @@ impl Document {
         self.dirty.take()
     }
 
+    /// Content revision: bumped by every pixel-changing dirty mark. Callers
+    /// snapshot it to detect mutations that happen behind their back.
+    pub fn revision(&self) -> u64 {
+        self.rev
+    }
+
     /// Mark the whole canvas dirty (structural changes, undo, background).
     pub fn mark_full_dirty(&mut self) {
         if self.w > 0 && self.h > 0 {
             self.dirty = Some((0, 0, self.w - 1, self.h - 1));
+            self.rev = self.rev.wrapping_add(1);
         }
     }
 
@@ -457,6 +470,7 @@ impl Document {
         if x0 > x1 || y0 > y1 {
             return;
         }
+        self.rev = self.rev.wrapping_add(1);
         let r = (
             x0.min(self.w.saturating_sub(1)),
             y0.min(self.h.saturating_sub(1)),
@@ -3113,6 +3127,7 @@ impl Document {
             groups,
             next_group_id,
             smudge_finger: None,
+            rev: 0,
         })
     }
 }
@@ -3201,6 +3216,19 @@ pub fn curves_lut(shadow: i32, mid: i32, high: i32) -> [u8; 256] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revision_advances_on_dirty_marks() {
+        let mut doc = Document::new(8, 8);
+        let r0 = doc.revision();
+        doc.mark_full_dirty();
+        assert_eq!(doc.revision(), r0 + 1);
+        doc.mark_dirty(1, 1, 2, 2);
+        assert_eq!(doc.revision(), r0 + 2);
+        // A dab fully outside the canvas paints nothing: no bump.
+        doc.mark_dirty(5, 5, 1, 1);
+        assert_eq!(doc.revision(), r0 + 2);
+    }
 
     #[test]
     fn opaque_top_layer_wins() {

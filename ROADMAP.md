@@ -29,6 +29,18 @@ people touch daily. Ranked by user-visible value per effort.
 - Deferred to Batch 6: 8K canvas + lazy compositing (standalone perf
   epic, riskiest — Batch 5 stays shippable without it).
 
+## Batch 6 slice: M48 — Transform handles (done, user-verified)
+
+- [x] **M48 — On-canvas transform handles.** Corner pins (Distort) +
+  3x3 warp lattice (Mesh): arm in the Transform panel, drag handles,
+  release-apply; live drag preview from a revision-tracked session
+  base, Esc/pinch cancel restore, Reset. Retest rounds hardened the
+  pin session (substep stabilizer, trail sampling), smoothed strokes
+  (midpoint-quadratic `StrokeCurve`), and the Transform-layer buttons
+  (session base — no compounding resample). All user-verified good;
+  pushed bb5c777.
+- Batch 6 remainder: 8K canvas + lazy compositing perf epic.
+
 ## Batch 1: M23–M27 (done, awaiting PC check #1)
 
 - [x] **M23 — Layer groups + group ops.** Nested model with effective
@@ -85,7 +97,8 @@ people touch daily. Ranked by user-visible value per effort.
 
 ## P1 — depth on what exists
 
-- [ ] Freeform transform: distort + warp mesh (scale/rotate/flip exist).
+- [x] Freeform transform: distort + warp mesh (M43/M44 engine,
+  M48 on-canvas handles).
 - [ ] Liquify-lite (push field on layer).
 - [ ] Adjustments pack: Curves, HSL, Levels, Color Balance, Recolor.
 - [ ] Selection upgrades: save/load, transform selection, on-canvas

@@ -12,13 +12,13 @@ use procraft_engine::{
     import_gif_document, import_gpl_file, levels_lut, next_frame, onion_ghost, open_brush_library,
     open_palette, open_psd, palette_from_rgba, pan_offset, prev_frame, rasterize_frame,
     rasterize_frame_region, save_brush_library, save_palette, save_psd, shift_wheel_remap,
-    starter_palette, step_playback_visible, triadic, zoom_drag_factor, ActionId, AssistLine,
-    BlendMode, Brush, BrushPreset, ChordKey, Color, DabDynamics, Document, DragActionId, GuideKind,
-    Guides, KeyChord, LoopMode, ModSet, PaintTarget, Palette, PaletteSet, Settings, ShapePoly,
-    Shortcuts, SymmetryMode, TapAction, TextStyle, ToolId, LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD,
-    MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX,
-    MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
-    SETTINGS_VERSION,
+    size_drag_factor, starter_palette, step_playback_visible, triadic, zoom_drag_factor, ActionId,
+    AssistLine, BlendMode, Brush, BrushPreset, ChordKey, Color, DabDynamics, Document,
+    DragActionId, GuideKind, Guides, KeyChord, LoopMode, ModSet, PaintTarget, Palette, PaletteSet,
+    Settings, ShapePoly, Shortcuts, SymmetryMode, TapAction, TextStyle, ToolId, LAPSE_SIDE,
+    MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES,
+    MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING,
+    MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX, SETTINGS_VERSION,
 };
 #[cfg(target_os = "android")]
 use procraft_engine::{ext_matches, file_size_label};
@@ -554,6 +554,12 @@ fn resolve_capture_event(ev: &egui::Event) -> CaptureOutcome {
             None => CaptureOutcome::Ignore,
         },
     }
+}
+
+/// M49: brush size after a horizontal size-drag of `dx` px, clamped to
+/// the size slider's range (1..=200).
+fn drag_size(cur: f32, dx: f32) -> f32 {
+    (cur * size_drag_factor(dx)).clamp(1.0, 200.0)
 }
 
 fn page_presets() -> Vec<(&'static str, [u8; 3])> {
@@ -3285,22 +3291,31 @@ impl eframe::App for ProCraftApp {
                 .ctx()
                 .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
-            self.doc.clear_selection();
-            self.sel_anchor = None;
-            self.sel_current = None;
-            self.crop_anchor = None;
-            self.crop_current = None;
-            self.crop_rect = None;
-            self.lasso_points.clear();
-            self.lasso_poly.clear();
-            self.sel_edges_dirty = true;
-            // Armed transform handles roll back: the pins snap back to
-            // the gesture start and, if a live preview session exists,
-            // the pixels follow (recomputed from its base).
-            let had_xform = self.xform.grab.is_some() || self.xform.base.is_some();
-            self.xform.cancel_grab();
-            if had_xform {
-                xform_preview(&mut self.doc, &mut self.xform);
+            if let Some(sd) = self.size_drag.take() {
+                // M49: an in-flight size drag reverts to its pinned base
+                // (Esc means "undo this gesture" before anything else).
+                self.brush.size = sd.base;
+                self.painting = false;
+                self.last = None;
+                self.status = "Brush size reverted.".to_string();
+            } else {
+                self.doc.clear_selection();
+                self.sel_anchor = None;
+                self.sel_current = None;
+                self.crop_anchor = None;
+                self.crop_current = None;
+                self.crop_rect = None;
+                self.lasso_points.clear();
+                self.lasso_poly.clear();
+                self.sel_edges_dirty = true;
+                // Armed transform handles roll back: the pins snap back to
+                // the gesture start and, if a live preview session exists,
+                // the pixels follow (recomputed from its base).
+                let had_xform = self.xform.grab.is_some() || self.xform.base.is_some();
+                self.xform.cancel_grab();
+                if had_xform {
+                    xform_preview(&mut self.doc, &mut self.xform);
+                }
             }
         }
         // Multi-finger taps (touch): two fingers = undo, three = redo.
@@ -6895,6 +6910,44 @@ impl eframe::App for ProCraftApp {
                     self.mmb_last = None;
                 }
 
+                // M49 brush-size drag (default Shift, remappable): while the
+                // bound modifiers are held with a paint tool, a primary drag
+                // scales size by horizontal travel via `size_drag_factor`
+                // (same 1.25/120px step as zoom); release keeps it, Esc
+                // during the drag reverts to the pinned base.
+                let size_mod = self.shortcuts.drag_get(DragActionId::BrushSize);
+                let size_mods = ui.ctx().input(|i| {
+                    size_mod.matches(i.modifiers.ctrl, i.modifiers.shift, i.modifiers.alt)
+                });
+                let paint_tool = matches!(self.tool, Tool::Brush | Tool::Eraser | Tool::Smudge);
+                if let Some(sd) = &mut self.size_drag {
+                    if resp.dragged_by(egui::PointerButton::Primary) {
+                        if let Some(pos) = resp.hover_pos() {
+                            self.brush.size = drag_size(self.brush.size, pos.x - sd.last_x);
+                            sd.last_x = pos.x;
+                        }
+                    }
+                    if resp.drag_stopped() {
+                        self.status = format!("Brush size {:.0}", self.brush.size);
+                        self.size_drag = None;
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                } else if paint_tool
+                    && size_mods
+                    && !gesture
+                    && resp.drag_started_by(egui::PointerButton::Primary)
+                {
+                    self.size_drag = Some(SizeDrag {
+                        base: self.brush.size,
+                        last_x: resp.hover_pos().map(|p| p.x).unwrap_or(0.0),
+                    });
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                }
+
                 if self.tool == Tool::Select {
                     // Marquee selection.
                     if resp.drag_started() && !gesture {
@@ -7939,6 +7992,14 @@ mod tests {
             resolve_capture_event(&release),
             CaptureOutcome::Ignore
         ));
+    }
+
+    #[test]
+    fn drag_size_clamps_to_the_slider_range() {
+        assert_eq!(drag_size(50.0, 0.0), 50.0);
+        assert_eq!(drag_size(50.0, 120.0), 62.5);
+        assert_eq!(drag_size(1.0, -120.0), 1.0); // floor
+        assert_eq!(drag_size(200.0, 120.0), 200.0); // ceiling
     }
 
     #[test]

@@ -21,6 +21,14 @@ pub fn zoom_drag_factor(dy: f32) -> f32 {
     1.25f32.powf(-dy / 120.0)
 }
 
+/// Brush-size drag (Shift by default, remappable): horizontal travel
+/// scales the paint size on the same x1.25/120px step the wheel zoom
+/// and Ctrl+MMB use, so all three gestures feel identical. `dx` is
+/// screen px dragged (positive = right = grow).
+pub fn size_drag_factor(dx: f32) -> f32 {
+    1.25f32.powf(dx / 120.0)
+}
+
 /// Pan the view by `delta`, clamped so a 60px margin of canvas always
 /// stays on screen (the canvas can never get lost off-view). `cw`/`ch`
 /// are canvas size in screen px, `aw`/`ah` the viewport size.
@@ -61,6 +69,14 @@ mod tests {
         assert_eq!(zoom_drag_factor(-120.0), 1.25);
         // 120px down: one wheel-step out.
         assert!((zoom_drag_factor(120.0) - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn size_drag_factor_mirrors_the_zoom_step() {
+        assert_eq!(size_drag_factor(0.0), 1.0);
+        assert_eq!(size_drag_factor(120.0), 1.25); // drag right = grow
+        assert!((size_drag_factor(-120.0) - 0.8).abs() < 1e-6);
+        assert!(size_drag_factor(60.0) > 1.0 && size_drag_factor(60.0) < 1.25);
     }
 
     #[test]

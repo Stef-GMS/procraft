@@ -11,6 +11,7 @@ mod palette;
 mod pointer;
 mod probrush;
 mod psd;
+mod shortcuts;
 mod tap;
 mod text;
 
@@ -38,6 +39,9 @@ pub use palette::{
 pub use pointer::{pan_offset, shift_wheel_remap, zoom_drag_factor};
 pub use probrush::{export_tip_png, import_brush_file, ImportedBrush};
 pub use psd::{open_psd, save_psd};
+pub use shortcuts::{
+    ActionId, ChordKey, DragActionId, KeyChord, ModSet, Shortcuts, StoredShortcuts, ToolId,
+};
 pub use tap::{classify_touch_tap, TapAction};
 pub use text::{
     check_font, layout_text, layout_text_styled, TextLayout, TextStyle, FONT_BYTES,

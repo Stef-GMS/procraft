@@ -11,6 +11,7 @@ mod palette;
 mod pointer;
 mod probrush;
 mod psd;
+mod settings;
 mod shortcuts;
 mod tap;
 mod text;
@@ -39,6 +40,7 @@ pub use palette::{
 pub use pointer::{pan_offset, shift_wheel_remap, zoom_drag_factor};
 pub use probrush::{export_tip_png, import_brush_file, ImportedBrush};
 pub use psd::{open_psd, save_psd};
+pub use settings::{Settings, SETTINGS_VERSION};
 pub use shortcuts::{
     ActionId, ChordKey, DragActionId, KeyChord, ModSet, Shortcuts, StoredShortcuts, ToolId,
 };

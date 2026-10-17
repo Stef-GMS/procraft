@@ -22,9 +22,7 @@ use std::sync::{Mutex, OnceLock};
 
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
-use objc2::{
-    define_class, msg_send, ClassType, Encode, Encoding, MainThreadMarker, MainThreadOnly,
-};
+use objc2::{define_class, msg_send, ClassType, MainThreadMarker, MainThreadOnly};
 use objc2_foundation::{NSArray, NSMutableArray, NSObject, NSString, NSURL};
 use objc2_ui_kit::{
     UIActivityViewController, UIApplication, UIDocumentPickerDelegate, UIDocumentPickerMode,
@@ -176,30 +174,10 @@ fn find_root() -> Result<Retained<UIViewController>, &'static str> {
     find_window()?.rootViewController().ok_or("no-root-vc")
 }
 
-/// `UIEdgeInsets` layout (four `CGFloat`s). Defined locally because the
-/// vendored objc2-ui-kit exposes the real type only behind its `UIGeometry`
-/// and `objc2-core-foundation` features, which this crate does not enable.
-#[repr(C)]
-struct UIEdgeInsets {
-    top: f64,
-    left: f64,
-    bottom: f64,
-    right: f64,
-}
-
-// SAFETY: `repr(C)` four-double layout and `{UIEdgeInsets=dddd}` encoding
-// match UIKit's struct on the 64-bit iOS ABIs this crate targets.
-unsafe impl Encode for UIEdgeInsets {
-    const ENCODING: Encoding = Encoding::Struct(
-        "UIEdgeInsets",
-        &[f64::ENCODING, f64::ENCODING, f64::ENCODING, f64::ENCODING],
-    );
-}
-
 /// Window safe-area insets (top, bottom) in points for edge-to-edge padding.
 pub(super) fn safe_area_insets() -> Result<(u32, u32), &'static str> {
     let window = find_window()?;
-    let insets: UIEdgeInsets = unsafe { msg_send![&window, safeAreaInsets] };
+    let insets = window.safeAreaInsets();
     Ok((
         insets.top.max(0.0).round() as u32,
         insets.bottom.max(0.0).round() as u32,

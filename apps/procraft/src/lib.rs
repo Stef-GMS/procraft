@@ -14,15 +14,17 @@ use procraft_engine::{
     rasterize_frame_region, save_brush_library, save_palette, save_psd, shift_wheel_remap,
     starter_palette, step_playback_visible, triadic, zoom_drag_factor, AssistLine, BlendMode,
     Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides, LoopMode, PaintTarget,
-    Palette, PaletteSet, ShapePoly, SymmetryMode, TapAction, TextStyle, LAPSE_SIDE, MAX_ANIM_FPS,
-    MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES,
-    MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING, MIN_ANIM_FPS,
-    MIN_ANIM_HOLD, MIN_TEXT_PX,
+    Palette, PaletteSet, Settings, ShapePoly, SymmetryMode, TapAction, TextStyle, LAPSE_SIDE,
+    MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES,
+    MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING,
+    MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
 };
 #[cfg(target_os = "android")]
 use procraft_engine::{ext_matches, file_size_label};
 #[cfg(any(target_os = "ios", target_os = "android"))]
 use rfd_shim as rfd;
+
+mod settings;
 
 /// Android: accepted extensions per open kind (mirrors the desktop filters).
 #[cfg(target_os = "android")]
@@ -7328,6 +7330,9 @@ pub fn run() {
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(app: android_activity::AndroidApp) {
+    if let Some(p) = app.internal_data_path() {
+        crate::settings::set_android_data_dir(p);
+    }
     let mut options = build_options();
     options.android_app = Some(app);
     run_with(options);

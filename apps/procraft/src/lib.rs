@@ -502,6 +502,8 @@ struct ProCraftApp {
     vp_grab: Option<usize>,
     sym_move: bool,
     sym_grab: bool,
+    /// M48 transform handles: on-canvas corner pins / warp lattice.
+    xform: XformState,
     assist: bool,
     assist_start: Option<(f32, f32)>,
     assist_lock: Option<AssistLine>,
@@ -700,6 +702,7 @@ impl ProCraftApp {
             vp_grab: None,
             sym_move: false,
             sym_grab: false,
+            xform: XformState::off(),
             assist: false,
             assist_start: None,
             assist_lock: None,
@@ -1865,6 +1868,73 @@ fn bar_layout(width: f32) -> BarLayout {
 #[cfg(any(target_os = "android", test))]
 fn clamp_status_inset(px: u32) -> f32 {
     (px as f32).clamp(0.0, 200.0)
+}
+
+/// M48 transform-handle mode: Off = normal painting; Corners = four
+/// corner pins drive `distort_layer`. Mesh (3x3 warp lattice) arrives
+/// with its drag chain in the next slice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum XformMode {
+    Off,
+    Corners,
+}
+
+/// Source coords sampled at destination corners [TL, TR, BR, BL] for a
+/// no-op distort: each corner samples itself (engine
+/// `distort_identity_quad_is_noop`).
+fn identity_quad(w: f32, h: f32) -> [(f32, f32); 4] {
+    [
+        (0.0, 0.0),
+        (w - 1.0, 0.0),
+        (w - 1.0, h - 1.0),
+        (0.0, h - 1.0),
+    ]
+}
+
+fn quad_with_drag(mut quad: [(f32, f32); 4], i: usize, p: (f32, f32)) -> [(f32, f32); 4] {
+    if i < quad.len() {
+        quad[i] = p;
+    }
+    quad
+}
+
+fn quad_differs_from_identity(quad: [(f32, f32); 4], w: f32, h: f32) -> bool {
+    quad != identity_quad(w, h)
+}
+
+/// Armed transform state. Handles drag on the canvas; the engine op
+/// applies once on release (checkpoint + resample), so mid-drag ticks
+/// never resample and a release with no movement never checkpoints.
+struct XformState {
+    mode: XformMode,
+    quad: [(f32, f32); 4],
+    grab: Option<usize>,
+    /// Points as they were when the current grab started; a release
+    /// applies only when they differ (drag-away-and-back included).
+    grab_from: Vec<(f32, f32)>,
+}
+
+impl XformState {
+    fn off() -> Self {
+        Self {
+            mode: XformMode::Off,
+            quad: identity_quad(1.0, 1.0),
+            grab: None,
+            grab_from: Vec::new(),
+        }
+    }
+
+    fn points(&self) -> &[(f32, f32)] {
+        match self.mode {
+            XformMode::Corners => &self.quad,
+            XformMode::Off => &[],
+        }
+    }
+
+    fn cancel_grab(&mut self) {
+        self.grab = None;
+        self.grab_from.clear();
+    }
 }
 
 /// Textured quad for a rotated canvas view: `corners` are TL, TR, BR, BL
@@ -5138,6 +5208,7 @@ impl eframe::App for ProCraftApp {
                 self.fill_preview = None;
                 self.vp_grab = None;
                 self.sym_grab = false;
+                self.xform.cancel_grab();
             }
             let z = self.zoom;
             // No scrollbar visuals over the artwork (v13 iPad: a full-width
@@ -5319,6 +5390,36 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                 }
+                // Transform handles (M48): corner pins while the Transform
+                // panel has Distort armed. Off-canvas pins park on the
+                // canvas edge as diamonds, exactly like VP handles.
+                if self.xform.mode == XformMode::Corners {
+                    let red = Color32::from_rgb(220, 60, 60);
+                    for (i, &(x, y)) in self.xform.quad.iter().enumerate() {
+                        let (p0, parked) = vp_handle_pos(rect, z, x, y);
+                        let p = rot_pt(p0, cc, ang);
+                        if parked {
+                            let r = 10.0;
+                            let diamond = vec![
+                                p + egui::Vec2::new(0.0, -r),
+                                p + egui::Vec2::new(r, 0.0),
+                                p + egui::Vec2::new(0.0, r),
+                                p + egui::Vec2::new(-r, 0.0),
+                            ];
+                            ui.painter()
+                                .add(egui::Shape::closed_line(diamond, (3.0, red)));
+                            ui.painter().circle_filled(p, 2.0, Color32::WHITE);
+                        } else {
+                            let r = if self.xform.grab == Some(i) {
+                                11.0
+                            } else {
+                                9.0
+                            };
+                            ui.painter().circle_filled(p, r, red);
+                            ui.painter().circle_stroke(p, r, (2.0, Color32::WHITE));
+                        }
+                    }
+                }
                 // Onion skins over the current frame (assist only, not in
                 // mask view, hidden while playing so ghosts never tint
                 // the page as frames change).
@@ -5484,6 +5585,54 @@ impl eframe::App for ProCraftApp {
                     }
                     if resp.drag_stopped() {
                         self.sym_grab = false;
+                    }
+                    self.painting = false;
+                    self.last = None;
+                    return;
+                }
+
+                // Transform handles (M48, armed in the Transform panel):
+                // grabs pause painting and move the nearest pin; the
+                // engine op applies once on release (a resample per tick
+                // would hang like the pre-throttle filter previews).
+                if self.xform.mode == XformMode::Corners {
+                    if resp.drag_started() && !gesture {
+                        if let Some(pos) = resp.hover_pos() {
+                            let mut best: Option<(usize, f32)> = None;
+                            for (i, &(x, y)) in self.xform.points().iter().enumerate() {
+                                let (p0, _) = vp_handle_pos(rect, z, x, y);
+                                let p = rot_pt(p0, cc, ang);
+                                let d = (p.x - pos.x).hypot(p.y - pos.y);
+                                if best.is_none_or(|(_, bd)| d < bd) {
+                                    best = Some((i, d));
+                                }
+                            }
+                            // Generous 28px radius like the VP handles.
+                            if let Some((i, d)) = best {
+                                if d <= 28.0 {
+                                    self.xform.grab = Some(i);
+                                    self.xform.grab_from = self.xform.points().to_vec();
+                                }
+                            }
+                        }
+                    } else if resp.dragged() {
+                        if let (Some(i), Some(pos)) = (self.xform.grab, resp.hover_pos()) {
+                            let (x, y) = to_canvas(pos);
+                            self.xform.quad = quad_with_drag(self.xform.quad, i, (x, y));
+                        }
+                    }
+                    if resp.drag_stopped() {
+                        let was_grabbed = self.xform.grab.take().is_some();
+                        let from = std::mem::take(&mut self.xform.grab_from);
+                        let quad = self.xform.quad;
+                        if was_grabbed
+                            && from.as_slice() != quad.as_slice()
+                            && quad_differs_from_identity(quad, w, h)
+                        {
+                            self.doc.checkpoint();
+                            self.doc.distort_layer(self.doc.active, quad);
+                            self.status = "Distort applied.".to_string();
+                        }
                     }
                     self.painting = false;
                     self.last = None;
@@ -6431,5 +6580,23 @@ mod tests {
         assert_eq!(clamp_status_inset(0), 0.0);
         assert_eq!(clamp_status_inset(72), 72.0);
         assert_eq!(clamp_status_inset(9999), 200.0);
+    }
+
+    #[test]
+    fn xform_quad_tracks_dragged_corner() {
+        let quad = quad_with_drag(identity_quad(8.0, 8.0), 1, (6.0, 1.0));
+        assert_eq!(quad[1], (6.0, 1.0));
+        assert_eq!(quad[0], (0.0, 0.0));
+    }
+
+    #[test]
+    fn xform_quad_identity_needs_no_apply() {
+        assert!(!quad_differs_from_identity(
+            identity_quad(8.0, 8.0),
+            8.0,
+            8.0
+        ));
+        let moved = quad_with_drag(identity_quad(8.0, 8.0), 1, (6.0, 1.0));
+        assert!(quad_differs_from_identity(moved, 8.0, 8.0));
     }
 }

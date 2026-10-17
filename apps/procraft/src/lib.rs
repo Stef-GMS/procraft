@@ -523,6 +523,39 @@ fn tool_from_id(id: ToolId) -> Tool {
     }
 }
 
+/// M49: how one key event resolves while capture mode is armed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CaptureOutcome {
+    /// Escape: leave capture without changing anything.
+    Cancel,
+    /// Delete/Backspace: unbind the captured action.
+    Clear,
+    /// A mappable key press: bind it to the captured action.
+    Bind(KeyChord),
+    /// Anything else (Enter, modifier keys, releases): keep waiting.
+    Ignore,
+}
+
+/// M49: resolve a key event during capture. Escape and Delete/Backspace
+/// are checked before chord mapping (both are unmappable anyway); only
+/// pressed events ever resolve.
+fn resolve_capture_event(ev: &egui::Event) -> CaptureOutcome {
+    let egui::Event::Key {
+        key, pressed: true, ..
+    } = ev
+    else {
+        return CaptureOutcome::Ignore;
+    };
+    match key {
+        egui::Key::Escape => CaptureOutcome::Cancel,
+        egui::Key::Delete | egui::Key::Backspace => CaptureOutcome::Clear,
+        _ => match chord_from_event(ev) {
+            Some(c) => CaptureOutcome::Bind(c),
+            None => CaptureOutcome::Ignore,
+        },
+    }
+}
+
 fn page_presets() -> Vec<(&'static str, [u8; 3])> {
     vec![
         ("White", [255, 255, 255]),
@@ -1145,6 +1178,150 @@ impl ProCraftApp {
         }
     }
 
+    /// M49: while capture is armed, the first resolvable key event picks
+    /// the chord (or cancels / clears). Runs before the dispatcher so the
+    /// editor never triggers the action it is editing.
+    fn handle_capture(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.capture else {
+            return;
+        };
+        let ev = ctx.input_mut(|i| {
+            let pos = i
+                .events
+                .iter()
+                .position(|ev| resolve_capture_event(ev) != CaptureOutcome::Ignore)?;
+            Some(i.events.remove(pos))
+        });
+        let Some(ev) = ev else {
+            return;
+        };
+        match resolve_capture_event(&ev) {
+            CaptureOutcome::Cancel => {
+                self.capture = None;
+                self.status = "Shortcut capture cancelled.".to_string();
+            }
+            CaptureOutcome::Clear => {
+                self.shortcuts.clear_binding(action);
+                self.capture = None;
+                self.status = format!("Unbound {}.", self.action_label(action));
+            }
+            CaptureOutcome::Bind(chord) => match self.shortcuts.set_binding(action, chord) {
+                Ok(()) => {
+                    self.capture = None;
+                    self.status =
+                        format!("Bound {} to {}", self.action_label(action), chord.format());
+                }
+                Err(owner) => {
+                    // Capture stays armed: the next key can be the fix.
+                    self.status =
+                        format!("{} is used by {}", chord.format(), self.action_label(owner));
+                }
+            },
+            CaptureOutcome::Ignore => {}
+        }
+    }
+
+    /// M49: display name for an action row (tools reuse the toolbar's
+    /// symbol-aware labels).
+    fn action_label(&self, a: ActionId) -> String {
+        match a {
+            ActionId::Tool(t) => tool_label(tool_from_id(t), self.has_symbols).to_string(),
+            other => other.label(),
+        }
+    }
+
+    /// M49: toolbar hover hint ("Brush — B", or "— unbound").
+    fn tool_hint(&self, id: ToolId) -> String {
+        let binding = match self.shortcuts.get(ActionId::Tool(id)) {
+            Some(c) => c.format(),
+            None => "unbound".to_string(),
+        };
+        format!(
+            "{} — {}",
+            tool_label(tool_from_id(id), self.has_symbols),
+            binding
+        )
+    }
+
+    /// M49: the Shortcuts editor — one row per action, the drag-modifier
+    /// row, and Reset all. Clicking a binding arms capture for that row.
+    fn shortcuts_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_shortcuts;
+        egui::Window::new("Shortcuts")
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                if let Some(note) = &self.settings_note {
+                    ui.colored_label(egui::Color32::from_rgb(200, 120, 40), note);
+                    ui.separator();
+                }
+                ui.label("Click a binding, then press the keys you want.");
+                egui::ScrollArea::vertical()
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        for a in ActionId::ALL {
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [150.0, 18.0],
+                                    egui::Label::new(self.action_label(a)).truncate(),
+                                );
+                                let capturing = self.capture == Some(a);
+                                let text = if capturing {
+                                    "Press keys… (Esc cancels, Del clears)".to_string()
+                                } else {
+                                    self.shortcuts
+                                        .get(a)
+                                        .map(|c| c.format())
+                                        .unwrap_or_else(|| "—".to_string())
+                                };
+                                if ui.button(text).clicked() {
+                                    self.capture = Some(a);
+                                }
+                                let clear = if self.has_symbols { "✕" } else { "x" };
+                                if self.shortcuts.get(a).is_some()
+                                    && ui.small_button(clear).clicked()
+                                {
+                                    self.shortcuts.clear_binding(a);
+                                    if self.capture == Some(a) {
+                                        self.capture = None;
+                                    }
+                                }
+                            });
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [150.0, 18.0],
+                        egui::Label::new("Drag on canvas — Brush size"),
+                    );
+                    let cur = self.shortcuts.drag_get(DragActionId::BrushSize);
+                    let mut ctrl = cur.ctrl;
+                    let mut shift = cur.shift;
+                    ui.checkbox(&mut ctrl, "Ctrl");
+                    ui.checkbox(&mut shift, "Shift");
+                    // Alt is deliberately absent: it drives the pick loupe.
+                    let next = ModSet {
+                        ctrl,
+                        shift,
+                        alt: false,
+                    };
+                    if !next.is_empty() && next != cur {
+                        self.shortcuts.set_drag(DragActionId::BrushSize, next);
+                    }
+                });
+                ui.separator();
+                if ui.button("Reset all").clicked() {
+                    self.shortcuts.reset_all();
+                    self.capture = None;
+                    self.status = "Shortcuts reset to defaults.".to_string();
+                }
+            });
+        self.show_shortcuts = open;
+    }
+
     fn base_brush(&self) -> Brush {
         Brush {
             eraser: self.tool == Tool::Eraser,
@@ -1539,6 +1716,17 @@ impl ProCraftApp {
                 ui.close();
             }
             self.show_about = !self.show_about;
+        }
+        let shortcuts = if self.has_symbols {
+            "⌨ Shortcuts"
+        } else {
+            "Shortcuts"
+        };
+        if ui.button(shortcuts).clicked() {
+            if in_menu {
+                ui.close();
+            }
+            self.show_shortcuts = !self.show_shortcuts;
         }
     }
 
@@ -3090,6 +3278,7 @@ impl eframe::App for ProCraftApp {
         // M49: remappable shortcuts through the exact-chord table
         // (Ctrl+Shift+Z is redo again), and Esc — unbound, typing-guarded
         // — clearing the selection.
+        self.handle_capture(ui.ctx());
         self.dispatch_shortcuts(ui.ctx());
         if !ui.ctx().text_edit_focused()
             && ui
@@ -3884,6 +4073,11 @@ impl eframe::App for ProCraftApp {
                 });
         }
 
+        // M49: shortcuts editor window.
+        if self.show_shortcuts {
+            self.shortcuts_window(ui.ctx());
+        }
+
         // Text dialog: type, size, then Render bakes the block to the
         // active layer at the canvas anchor (one undo step).
         if self.text_open {
@@ -4063,19 +4257,32 @@ impl eframe::App for ProCraftApp {
                     }
                 });
             });
-            ui.radio_value(&mut self.tool, Tool::Brush, tool_label(Tool::Brush, self.has_symbols));
-            ui.radio_value(&mut self.tool, Tool::Eraser, tool_label(Tool::Eraser, self.has_symbols));
-            ui.radio_value(&mut self.tool, Tool::Smudge, tool_label(Tool::Smudge, self.has_symbols));
-            ui.radio_value(&mut self.tool, Tool::Select, tool_label(Tool::Select, self.has_symbols));
-            ui.radio_value(&mut self.tool, Tool::Lasso, tool_label(Tool::Lasso, self.has_symbols));
-            ui.radio_value(&mut self.tool, Tool::Fill, tool_label(Tool::Fill, self.has_symbols));
-            ui.radio_value(&mut self.tool, Tool::Picker, tool_label(Tool::Picker, self.has_symbols));
-            ui.radio_value(&mut self.tool, Tool::Move, tool_label(Tool::Move, self.has_symbols));
-            ui.radio_value(&mut self.tool, Tool::Hand, tool_label(Tool::Hand, self.has_symbols));
-            ui.radio_value(&mut self.tool, Tool::Liquify, tool_label(Tool::Liquify, self.has_symbols));
-            ui.radio_value(&mut self.tool, Tool::Crop, tool_label(Tool::Crop, self.has_symbols));
-            ui.radio_value(&mut self.tool, Tool::Shapes, tool_label(Tool::Shapes, self.has_symbols));
-            ui.radio_value(&mut self.tool, Tool::Text, tool_label(Tool::Text, self.has_symbols));
+            ui.radio_value(&mut self.tool, Tool::Brush, tool_label(Tool::Brush, self.has_symbols))
+                .on_hover_text(self.tool_hint(ToolId::Brush));
+            ui.radio_value(&mut self.tool, Tool::Eraser, tool_label(Tool::Eraser, self.has_symbols))
+                .on_hover_text(self.tool_hint(ToolId::Eraser));
+            ui.radio_value(&mut self.tool, Tool::Smudge, tool_label(Tool::Smudge, self.has_symbols))
+                .on_hover_text(self.tool_hint(ToolId::Smudge));
+            ui.radio_value(&mut self.tool, Tool::Select, tool_label(Tool::Select, self.has_symbols))
+                .on_hover_text(self.tool_hint(ToolId::Select));
+            ui.radio_value(&mut self.tool, Tool::Lasso, tool_label(Tool::Lasso, self.has_symbols))
+                .on_hover_text(self.tool_hint(ToolId::Lasso));
+            ui.radio_value(&mut self.tool, Tool::Fill, tool_label(Tool::Fill, self.has_symbols))
+                .on_hover_text(self.tool_hint(ToolId::Fill));
+            ui.radio_value(&mut self.tool, Tool::Picker, tool_label(Tool::Picker, self.has_symbols))
+                .on_hover_text(self.tool_hint(ToolId::Picker));
+            ui.radio_value(&mut self.tool, Tool::Move, tool_label(Tool::Move, self.has_symbols))
+                .on_hover_text(self.tool_hint(ToolId::Move));
+            ui.radio_value(&mut self.tool, Tool::Hand, tool_label(Tool::Hand, self.has_symbols))
+                .on_hover_text(self.tool_hint(ToolId::Hand));
+            ui.radio_value(&mut self.tool, Tool::Liquify, tool_label(Tool::Liquify, self.has_symbols))
+                .on_hover_text(self.tool_hint(ToolId::Liquify));
+            ui.radio_value(&mut self.tool, Tool::Crop, tool_label(Tool::Crop, self.has_symbols))
+                .on_hover_text(self.tool_hint(ToolId::Crop));
+            ui.radio_value(&mut self.tool, Tool::Shapes, tool_label(Tool::Shapes, self.has_symbols))
+                .on_hover_text(self.tool_hint(ToolId::Shapes));
+            ui.radio_value(&mut self.tool, Tool::Text, tool_label(Tool::Text, self.has_symbols))
+                .on_hover_text(self.tool_hint(ToolId::Text));
             if self.tool == Tool::Fill {
                 stepped_slider(ui, &mut self.fill_tolerance, 0..=255, 1.0, "Tolerance");
                 ui.label("Tap fills; hold + drag sideways to sweep tolerance.");
@@ -7697,6 +7904,41 @@ mod tests {
         assert_eq!(tool_from_id(ToolId::Brush), Tool::Brush);
         assert_eq!(tool_from_id(ToolId::Text), Tool::Text);
         assert_eq!(tool_from_id(ToolId::Liquify), Tool::Liquify);
+    }
+
+    #[test]
+    fn capture_resolution_pins_esc_delete_and_bind() {
+        let esc = key_ev(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(matches!(
+            resolve_capture_event(&esc),
+            CaptureOutcome::Cancel
+        ));
+        let del = key_ev(egui::Key::Delete, egui::Modifiers::NONE);
+        assert!(matches!(resolve_capture_event(&del), CaptureOutcome::Clear));
+        let back = key_ev(egui::Key::Backspace, egui::Modifiers::NONE);
+        assert!(matches!(
+            resolve_capture_event(&back),
+            CaptureOutcome::Clear
+        ));
+        let b = key_ev(egui::Key::B, egui::Modifiers::NONE);
+        assert!(matches!(resolve_capture_event(&b), CaptureOutcome::Bind(c)
+            if c == KeyChord::new(ChordKey::B, false, false, false)));
+        let enter = key_ev(egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(matches!(
+            resolve_capture_event(&enter),
+            CaptureOutcome::Ignore
+        ));
+        let release = egui::Event::Key {
+            key: egui::Key::B,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert!(matches!(
+            resolve_capture_event(&release),
+            CaptureOutcome::Ignore
+        ));
     }
 
     #[test]

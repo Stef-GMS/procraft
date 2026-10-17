@@ -1961,6 +1961,18 @@ impl XformState {
         self.grab = None;
         self.grab_from.clear();
     }
+
+    /// Switch modes: seed identity positions for the new mode and drop
+    /// any grab. Off keeps the last positions (re-arming is cheap).
+    fn arm(&mut self, mode: XformMode, w: f32, h: f32) {
+        self.mode = mode;
+        self.cancel_grab();
+        match mode {
+            XformMode::Corners => self.quad = identity_quad(w, h),
+            XformMode::Mesh => self.grid = identity_grid(w, h, XFORM_MESH_COLS, XFORM_MESH_ROWS),
+            XformMode::Off => {}
+        }
+    }
 }
 
 /// Textured quad for a rotated canvas view: `corners` are TL, TR, BR, BL
@@ -2222,6 +2234,9 @@ impl eframe::App for ProCraftApp {
             self.lasso_points.clear();
             self.lasso_poly.clear();
             self.sel_edges_dirty = true;
+            // Armed transform handles drop their grab; nothing was
+            // mutated (apply happens on release only).
+            self.xform.cancel_grab();
         }
         // Multi-finger taps (touch): two fingers = undo, three = redo.
         // A tap is a quick clean release with no travel; pans and pinches
@@ -4720,6 +4735,34 @@ impl eframe::App for ProCraftApp {
                             self.status = "Layer flipped vertically.".to_string();
                         }
                     });
+                    // M48 transform handles: arm corner pins or the warp
+                    // lattice for on-canvas dragging (applies on release,
+                    // one undo step per gesture).
+                    ui.horizontal(|ui| {
+                        ui.label("Handles:");
+                        let mut mode = self.xform.mode;
+                        ui.radio_value(&mut mode, XformMode::Off, "Off");
+                        ui.radio_value(&mut mode, XformMode::Corners, "Distort");
+                        ui.radio_value(&mut mode, XformMode::Mesh, "Mesh");
+                        if mode != self.xform.mode {
+                            let (w, h) = (self.doc.w as f32, self.doc.h as f32);
+                            self.xform.arm(mode, w, h);
+                            self.status = match mode {
+                                XformMode::Off => "Transform handles off.".to_string(),
+                                XformMode::Corners => {
+                                    "Drag corner pins; applies on release.".to_string()
+                                }
+                                XformMode::Mesh => {
+                                    "Drag lattice points; applies on release.".to_string()
+                                }
+                            };
+                        }
+                    });
+                    if self.xform.mode != XformMode::Off && ui.button("Reset transform").clicked() {
+                        let (w, h) = (self.doc.w as f32, self.doc.h as f32);
+                        self.xform.arm(self.xform.mode, w, h);
+                        self.status = "Transform reset.".to_string();
+                    }
                     ui.separator();
                     ui.heading("Symmetry");
                     for m in SymmetryMode::ALL {
@@ -6701,5 +6744,27 @@ mod tests {
         assert_eq!(g.len(), 9);
         assert_eq!(g[4], (4.0, 4.0));
         assert!(!grid_differs_from_identity(&g, 8.0, 8.0, 2, 2));
+    }
+
+    #[test]
+    fn xform_arm_seeds_identity_and_clears_grab() {
+        let mut s = XformState::off();
+        s.arm(XformMode::Corners, 8.0, 8.0);
+        assert_eq!(s.quad, identity_quad(8.0, 8.0));
+        assert_eq!(s.grab, None);
+        assert_eq!(s.mode, XformMode::Corners);
+        // Switching to Mesh re-seeds the 3x3 lattice and clears the grab.
+        s.grab = Some(2);
+        s.arm(XformMode::Mesh, 8.0, 8.0);
+        assert_eq!(s.grid.len(), 9);
+        assert_eq!(s.grab, None);
+        assert_eq!(s.mode, XformMode::Mesh);
+        // Off keeps the last positions so re-arming starts where the
+        // user left off; it still drops any grab.
+        s.grab = Some(4);
+        s.arm(XformMode::Off, 8.0, 8.0);
+        assert_eq!(s.grid.len(), 9);
+        assert_eq!(s.grab, None);
+        assert_eq!(s.mode, XformMode::Off);
     }
 }

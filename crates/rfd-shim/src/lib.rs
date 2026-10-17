@@ -11,9 +11,9 @@
 //!   UI). Saves resolve into the sandboxed Documents folder and the app
 //!   presents the share sheet afterwards for the real destination.
 
-use std::path::PathBuf;
 #[cfg(any(target_os = "ios", target_os = "android"))]
 use std::path::Path;
+use std::path::PathBuf;
 
 /// Builder matching the `rfd::FileDialog` calls in `apps/procraft`.
 #[derive(Clone, Debug, Default)]
@@ -29,7 +29,8 @@ impl FileDialog {
 
     /// Accept a file-type filter (becomes picker document types on iOS).
     pub fn add_filter(mut self, _name: &str, extensions: &[&str]) -> Self {
-        self.filters.extend(extensions.iter().map(|e| e.to_ascii_lowercase()));
+        self.filters
+            .extend(extensions.iter().map(|e| e.to_ascii_lowercase()));
         self
     }
 
@@ -152,7 +153,7 @@ fn unique_stem() -> String {
     format!("ProCraft-{ms}")
 }
 
-#[cfg(target_os = "ios")]
-mod ios_bridge;
 #[cfg(target_os = "android")]
 mod android_bridge;
+#[cfg(target_os = "ios")]
+mod ios_bridge;

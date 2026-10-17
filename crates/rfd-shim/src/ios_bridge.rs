@@ -91,7 +91,11 @@ define_class!(
                     }
                 }
                 // Balance the manual retain from presentation.
-                unsafe { drop(Retained::<PickerDelegate>::from_raw(key as *mut PickerDelegate)) };
+                unsafe {
+                    drop(Retained::<PickerDelegate>::from_raw(
+                        key as *mut PickerDelegate,
+                    ))
+                };
                 shared.lock().unwrap().done = Some(paths);
             }
         }
@@ -100,7 +104,11 @@ define_class!(
         fn documentPickerWasCancelled(&self, _controller: &UIDocumentPickerViewController) {
             let key = self as *const Self as usize;
             if let Some(shared) = pending().lock().unwrap().remove(&key) {
-                unsafe { drop(Retained::<PickerDelegate>::from_raw(key as *mut PickerDelegate)) };
+                unsafe {
+                    drop(Retained::<PickerDelegate>::from_raw(
+                        key as *mut PickerDelegate,
+                    ))
+                };
                 shared.lock().unwrap().done = Some(Vec::new());
             }
         }
@@ -239,10 +247,18 @@ pub(super) fn present_import(filters: &[String]) {
     let shared = new_shared();
     match present(&utis_for_filters(filters), &shared) {
         Ok(()) => {
-            *slot = Some(Slot { shared, error: None, presented_at: std::time::Instant::now() });
+            *slot = Some(Slot {
+                shared,
+                error: None,
+                presented_at: std::time::Instant::now(),
+            });
         }
         Err(reason) => {
-            *slot = Some(Slot { shared, error: Some(reason), presented_at: std::time::Instant::now() });
+            *slot = Some(Slot {
+                shared,
+                error: Some(reason),
+                presented_at: std::time::Instant::now(),
+            });
         }
     }
 }

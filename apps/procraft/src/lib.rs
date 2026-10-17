@@ -3636,6 +3636,9 @@ impl eframe::App for ProCraftApp {
                     self.ref_open = !self.ref_open;
                 }
                 ui.menu_button("File", |ui| {
+                    if layout == BarLayout::Tablet {
+                        ui.spacing_mut().interact_size.y = 40.0;
+                    }
                     if ui.button("Save PNG").clicked() {
                         ui.close();
                         if let Some(path) = rfd::FileDialog::new()
@@ -3866,6 +3869,9 @@ impl eframe::App for ProCraftApp {
                 // ~600px); desktop keeps the exact inline layout.
                 if matches!(layout, BarLayout::Narrow | BarLayout::Tablet) {
                     ui.menu_button("View", |ui| {
+                        if layout == BarLayout::Tablet {
+                            ui.spacing_mut().interact_size.y = 40.0;
+                        }
                         self.view_controls(ui, true);
                     });
                 } else {

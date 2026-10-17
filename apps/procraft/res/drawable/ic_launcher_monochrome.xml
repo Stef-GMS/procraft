@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive icon monochrome layer (Android 13+ themed icons): the
+     plate silhouette in solid black; the system applies its own tint. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="1024"
+    android:viewportHeight="1024">
+    <group
+        android:scaleX="0.78"
+        android:scaleY="0.78"
+        android:pivotX="512"
+        android:pivotY="512">
+        <path
+            android:pathData="M267 373 L503 373 C571 373 605 407 605 475 L605 711 C605 779 571 813 503 813 L267 813 C199 813 165 779 165 711 L165 475 C165 407 199 373 267 373 Z"
+            android:fillColor="#000000" />
+        <path
+            android:pathData="M394 292 L630 292 C698 292 732 326 732 394 L732 630 C732 698 698 732 630 732 L394 732 C326 732 292 698 292 630 L292 394 C292 326 326 292 394 292 Z"
+            android:fillColor="#000000" />
+        <path
+            android:pathData="M521 211 L757 211 C825 211 859 245 859 313 L859 549 C859 617 825 651 757 651 L521 651 C453 651 419 617 419 549 L419 313 C419 245 453 211 521 211 Z"
+            android:fillColor="#000000" />
+    </group>
+</vector>

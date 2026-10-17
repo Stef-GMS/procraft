@@ -59,6 +59,9 @@ jobs:
           # is how the first attempt passed vacuously.)
           "$BT/aapt" dump badging "$APK" | grep -q "icon='res/" || (echo "NO LAUNCHER ICON" && exit 1)
           "$BT/aapt" dump badging "$APK" | grep -q "application-label:'ProCraft'" || (echo "NO APP LABEL" && exit 1)
+          # Issue #3 proof: adaptive icon present — v0.8.5 shipped a legacy
+          # PNG only, which launchers wrapped in a padded plate.
+          "$BT/aapt" list "$APK" | grep -q "res/.*mipmap-anydpi-v26/ic_launcher.xml" || (echo "NO ADAPTIVE ICON" && exit 1)
           VER=$(grep '^version' Cargo.toml | head -n 1 | cut -d'"' -f2)
           if [ "${{ inputs.profile }}" = "release" ]; then OUT="ProCraft-android-v$VER.apk"; else OUT="ProCraft-android-v1.apk"; fi
           cp "$APK" "$OUT"

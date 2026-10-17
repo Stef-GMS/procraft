@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Issue #3: adaptive launcher icon (API 26+; minSdk is 29, so this is
+     the icon every supported device resolves to). Legacy mipmap PNGs
+     stay as density fallbacks for non-launcher tooling. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
+</adaptive-icon>

@@ -13,11 +13,12 @@ use procraft_engine::{
     open_palette, open_psd, palette_from_rgba, pan_offset, prev_frame, rasterize_frame,
     rasterize_frame_region, save_brush_library, save_palette, save_psd, shift_wheel_remap,
     starter_palette, step_playback_visible, triadic, zoom_drag_factor, ActionId, AssistLine,
-    BlendMode, Brush, BrushPreset, Color, DabDynamics, Document, GuideKind, Guides, LoopMode,
-    PaintTarget, Palette, PaletteSet, Settings, ShapePoly, Shortcuts, SymmetryMode, TapAction,
-    TextStyle, LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS,
-    MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS,
-    MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX, SETTINGS_VERSION,
+    BlendMode, Brush, BrushPreset, ChordKey, Color, DabDynamics, Document, DragActionId, GuideKind,
+    Guides, KeyChord, LoopMode, ModSet, PaintTarget, Palette, PaletteSet, Settings, ShapePoly,
+    Shortcuts, SymmetryMode, TapAction, TextStyle, ToolId, LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD,
+    MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX,
+    MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
+    SETTINGS_VERSION,
 };
 #[cfg(target_os = "android")]
 use procraft_engine::{ext_matches, file_size_label};
@@ -93,7 +94,7 @@ fn latest_touch_force(ctx: &egui::Context) -> Option<f32> {
     })
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
     Brush,
     Eraser,
@@ -387,6 +388,139 @@ fn settings_differ(a: &Settings, b: &Settings) -> bool {
         || a.show_layers != b.show_layers
         || a.recent != b.recent
         || a.shortcuts != b.shortcuts
+}
+
+/// M49: the persistable ChordKey for an egui key (None for keys the
+/// shortcut table has no slot for: Escape, Enter, modifier keys, F13+).
+fn chord_key_from_egui(k: egui::Key) -> Option<ChordKey> {
+    Some(match k {
+        egui::Key::A => ChordKey::A,
+        egui::Key::B => ChordKey::B,
+        egui::Key::C => ChordKey::C,
+        egui::Key::D => ChordKey::D,
+        egui::Key::E => ChordKey::E,
+        egui::Key::F => ChordKey::F,
+        egui::Key::G => ChordKey::G,
+        egui::Key::H => ChordKey::H,
+        egui::Key::I => ChordKey::I,
+        egui::Key::J => ChordKey::J,
+        egui::Key::K => ChordKey::K,
+        egui::Key::L => ChordKey::L,
+        egui::Key::M => ChordKey::M,
+        egui::Key::N => ChordKey::N,
+        egui::Key::O => ChordKey::O,
+        egui::Key::P => ChordKey::P,
+        egui::Key::Q => ChordKey::Q,
+        egui::Key::R => ChordKey::R,
+        egui::Key::S => ChordKey::S,
+        egui::Key::T => ChordKey::T,
+        egui::Key::U => ChordKey::U,
+        egui::Key::V => ChordKey::V,
+        egui::Key::W => ChordKey::W,
+        egui::Key::X => ChordKey::X,
+        egui::Key::Y => ChordKey::Y,
+        egui::Key::Z => ChordKey::Z,
+        egui::Key::Num0 => ChordKey::Num0,
+        egui::Key::Num1 => ChordKey::Num1,
+        egui::Key::Num2 => ChordKey::Num2,
+        egui::Key::Num3 => ChordKey::Num3,
+        egui::Key::Num4 => ChordKey::Num4,
+        egui::Key::Num5 => ChordKey::Num5,
+        egui::Key::Num6 => ChordKey::Num6,
+        egui::Key::Num7 => ChordKey::Num7,
+        egui::Key::Num8 => ChordKey::Num8,
+        egui::Key::Num9 => ChordKey::Num9,
+        egui::Key::F1 => ChordKey::F1,
+        egui::Key::F2 => ChordKey::F2,
+        egui::Key::F3 => ChordKey::F3,
+        egui::Key::F4 => ChordKey::F4,
+        egui::Key::F5 => ChordKey::F5,
+        egui::Key::F6 => ChordKey::F6,
+        egui::Key::F7 => ChordKey::F7,
+        egui::Key::F8 => ChordKey::F8,
+        egui::Key::F9 => ChordKey::F9,
+        egui::Key::F10 => ChordKey::F10,
+        egui::Key::F11 => ChordKey::F11,
+        egui::Key::F12 => ChordKey::F12,
+        egui::Key::ArrowUp => ChordKey::ArrowUp,
+        egui::Key::ArrowDown => ChordKey::ArrowDown,
+        egui::Key::ArrowLeft => ChordKey::ArrowLeft,
+        egui::Key::ArrowRight => ChordKey::ArrowRight,
+        egui::Key::Home => ChordKey::Home,
+        egui::Key::End => ChordKey::End,
+        egui::Key::PageUp => ChordKey::PageUp,
+        egui::Key::PageDown => ChordKey::PageDown,
+        egui::Key::Insert => ChordKey::Insert,
+        egui::Key::Space => ChordKey::Space,
+        egui::Key::Tab => ChordKey::Tab,
+        egui::Key::Comma => ChordKey::Comma,
+        egui::Key::Period => ChordKey::Period,
+        egui::Key::Slash => ChordKey::Slash,
+        egui::Key::Semicolon => ChordKey::Semicolon,
+        egui::Key::Quote => ChordKey::Quote,
+        egui::Key::Minus => ChordKey::Minus,
+        egui::Key::Equals => ChordKey::Equals,
+        egui::Key::OpenBracket => ChordKey::OpenBracket,
+        egui::Key::CloseBracket => ChordKey::CloseBracket,
+        egui::Key::Backslash => ChordKey::Backslash,
+        egui::Key::Backtick => ChordKey::Backtick,
+        _ => return None,
+    })
+}
+
+/// M49: this event as a chord, when it is a key press (repeats included,
+/// matching the old `consume_key` handling).
+fn chord_from_event(ev: &egui::Event) -> Option<KeyChord> {
+    let egui::Event::Key {
+        key,
+        pressed: true,
+        modifiers,
+        ..
+    } = ev
+    else {
+        return None;
+    };
+    Some(KeyChord::new(
+        chord_key_from_egui(*key)?,
+        modifiers.ctrl,
+        modifiers.shift,
+        modifiers.alt,
+    ))
+}
+
+/// M49: consume the first key event whose exact chord the table owns and
+/// return that action (the event leaves the queue so nothing below
+/// re-reads it). The `while` loop at the call site terminates: every hit
+/// removes one event.
+fn take_shortcut_action(shortcuts: &Shortcuts, ctx: &egui::Context) -> Option<ActionId> {
+    ctx.input_mut(|i| {
+        let pos = i.events.iter().position(|ev| {
+            chord_from_event(ev)
+                .and_then(|c| shortcuts.owner_of(c))
+                .is_some()
+        })?;
+        let ev = i.events.remove(pos);
+        shortcuts.owner_of(chord_from_event(&ev)?)
+    })
+}
+
+/// M49: the app's Tool enum for a shortcut ToolId (toolbar order).
+fn tool_from_id(id: ToolId) -> Tool {
+    match id {
+        ToolId::Brush => Tool::Brush,
+        ToolId::Eraser => Tool::Eraser,
+        ToolId::Smudge => Tool::Smudge,
+        ToolId::Select => Tool::Select,
+        ToolId::Lasso => Tool::Lasso,
+        ToolId::Fill => Tool::Fill,
+        ToolId::Picker => Tool::Picker,
+        ToolId::Move => Tool::Move,
+        ToolId::Hand => Tool::Hand,
+        ToolId::Liquify => Tool::Liquify,
+        ToolId::Crop => Tool::Crop,
+        ToolId::Shapes => Tool::Shapes,
+        ToolId::Text => Tool::Text,
+    }
 }
 
 fn page_presets() -> Vec<(&'static str, [u8; 3])> {
@@ -973,6 +1107,41 @@ impl ProCraftApp {
             self.zoom_dirty = false;
             self.settings_snapshot = cur.clone();
             let _ = self.save_settings_file(&cur);
+        }
+    }
+
+    /// M49: run this frame's key events through the shortcut table.
+    /// Capture mode owns every key; a focused text field keeps plain
+    /// typing (spec call #6) — the table must not steal letters.
+    fn dispatch_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.capture.is_some() {
+            return;
+        }
+        if ctx.text_edit_focused() {
+            return;
+        }
+        while let Some(action) = take_shortcut_action(&self.shortcuts, ctx) {
+            self.apply_action(action);
+        }
+    }
+
+    /// M49: perform one shortcut action — the same effect and status
+    /// strings the toolbar buttons and the old hardwired keys used.
+    fn apply_action(&mut self, action: ActionId) {
+        match action {
+            ActionId::Tool(t) => self.tool = tool_from_id(t),
+            ActionId::Undo => {
+                if self.doc.undo() {
+                    self.ghost_dirty = true;
+                    self.status = "Undone.".to_string();
+                }
+            }
+            ActionId::Redo | ActionId::RedoAlt => {
+                if self.doc.redo() {
+                    self.ghost_dirty = true;
+                    self.status = "Redone.".to_string();
+                }
+            }
         }
     }
 
@@ -2918,36 +3087,14 @@ impl eframe::App for ProCraftApp {
         }
         // M49: first thing each frame — sync the previous frame's edits.
         self.settings_sync(ui.ctx());
-        // Ctrl+Z undo, Ctrl+Y / Ctrl+Shift+Z redo, Esc clears selection.
-        if ui
-            .ctx()
-            .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z))
-            && self.doc.undo()
-        {
-            self.ghost_dirty = true;
-            self.status = "Undone.".to_string();
-        }
-        if ui
-            .ctx()
-            .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Y))
-            && self.doc.redo()
-        {
-            self.ghost_dirty = true;
-            self.status = "Redone.".to_string();
-        }
-        if ui.ctx().input_mut(|i| {
-            i.consume_key(
-                egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
-                egui::Key::Z,
-            )
-        }) && self.doc.redo()
-        {
-            self.ghost_dirty = true;
-            self.status = "Redone.".to_string();
-        }
-        if ui
-            .ctx()
-            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        // M49: remappable shortcuts through the exact-chord table
+        // (Ctrl+Shift+Z is redo again), and Esc — unbound, typing-guarded
+        // — clearing the selection.
+        self.dispatch_shortcuts(ui.ctx());
+        if !ui.ctx().text_edit_focused()
+            && ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             self.doc.clear_selection();
             self.sel_anchor = None;
@@ -7509,6 +7656,48 @@ fn android_main(app: android_activity::AndroidApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_ev(key: egui::Key, mods: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: mods,
+        }
+    }
+
+    #[test]
+    fn chord_from_event_maps_letters_digits_and_fkeys() {
+        let b = chord_from_event(&key_ev(egui::Key::B, egui::Modifiers::NONE)).unwrap();
+        assert_eq!(b, KeyChord::new(ChordKey::B, false, false, false));
+        let n0 = chord_from_event(&key_ev(egui::Key::Num0, egui::Modifiers::CTRL)).unwrap();
+        assert_eq!(n0, KeyChord::new(ChordKey::Num0, true, false, false));
+        let f5 = chord_from_event(&key_ev(egui::Key::F5, egui::Modifiers::NONE)).unwrap();
+        assert_eq!(f5, KeyChord::new(ChordKey::F5, false, false, false));
+        assert!(chord_from_event(&key_ev(egui::Key::Escape, egui::Modifiers::NONE)).is_none());
+        assert!(chord_from_event(&key_ev(egui::Key::Enter, egui::Modifiers::NONE)).is_none());
+    }
+
+    #[test]
+    fn exact_matching_sends_ctrl_shift_z_to_redoalt() {
+        let s = Shortcuts::default();
+        let ev = key_ev(egui::Key::Z, egui::Modifiers::CTRL | egui::Modifiers::SHIFT);
+        let chord = chord_from_event(&ev).unwrap();
+        assert_eq!(s.owner_of(chord), Some(ActionId::RedoAlt));
+        let ev2 = key_ev(egui::Key::Z, egui::Modifiers::CTRL);
+        assert_eq!(
+            s.owner_of(chord_from_event(&ev2).unwrap()),
+            Some(ActionId::Undo)
+        );
+    }
+
+    #[test]
+    fn tool_id_round_trips_to_tool() {
+        assert_eq!(tool_from_id(ToolId::Brush), Tool::Brush);
+        assert_eq!(tool_from_id(ToolId::Text), Tool::Text);
+        assert_eq!(tool_from_id(ToolId::Liquify), Tool::Liquify);
+    }
 
     #[test]
     fn settings_differ_ignores_zoom_but_catches_discrete_changes() {

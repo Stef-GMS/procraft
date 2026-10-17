@@ -4695,142 +4695,143 @@ impl eframe::App for ProCraftApp {
                 }
             });
             ui.separator();
-            ui.heading("My brushes");
-            ui.horizontal(|ui| {
-                // Fixed widths: a free-size text edit would keep pushing the
-                // whole left panel wider every frame.
-                ui.add_sized(
-                    [110.0, 22.0],
-                    egui::TextEdit::singleline(&mut self.new_brush_name).hint_text("Name"),
-                );
-                if ui.add_sized([90.0, 22.0], egui::Button::new("Add current")).clicked() {
-                    let want = self.new_brush_name.trim().to_string();
-                    if want.is_empty() {
-                        self.status = "Name the brush first.".to_string();
-                    } else if self.custom_brushes.len() >= MAX_LIBRARY_BRUSHES {
-                        self.status = format!("Brush library is full ({MAX_LIBRARY_BRUSHES}).");
-                    } else {
-                        let name = self.unique_brush_name(&want);
-                        let brush = Brush { eraser: false, ..self.brush.clone() };
-                        self.custom_brushes.push(BrushPreset { name: name.clone(), brush });
-                        self.new_brush_name.clear();
-                        self.status = format!("Brush '{name}' added.");
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Import").clicked() {
-                    #[cfg(not(target_os = "ios"))]
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Brushes", &[
-                            "pcbrush", "json", "abr", "brush", "brushset",
-                            "kpp", "bundle", "gbr", "png", "jpg", "jpeg", "webp", "bmp",
-                        ])
-                        .pick_file()
-                    {
-                        match load_brush_file(&path) {
-                            Ok(libs) => self.status = self.absorb_brushes(libs, &path),
-                            Err(e) => self.status = format!("Brush import failed: {e}"),
+            ui.collapsing("My brushes", |ui| {
+                ui.horizontal(|ui| {
+                    // Fixed widths: a free-size text edit would keep pushing the
+                    // whole left panel wider every frame.
+                    ui.add_sized(
+                        [110.0, 22.0],
+                        egui::TextEdit::singleline(&mut self.new_brush_name).hint_text("Name"),
+                    );
+                    if ui.add_sized([90.0, 22.0], egui::Button::new("Add current")).clicked() {
+                        let want = self.new_brush_name.trim().to_string();
+                        if want.is_empty() {
+                            self.status = "Name the brush first.".to_string();
+                        } else if self.custom_brushes.len() >= MAX_LIBRARY_BRUSHES {
+                            self.status = format!("Brush library is full ({MAX_LIBRARY_BRUSHES}).");
+                        } else {
+                            let name = self.unique_brush_name(&want);
+                            let brush = Brush { eraser: false, ..self.brush.clone() };
+                            self.custom_brushes.push(BrushPreset { name: name.clone(), brush });
+                            self.new_brush_name.clear();
+                            self.status = format!("Brush '{name}' added.");
                         }
                     }
-                    #[cfg(target_os = "ios")]
-                    {
-                        let _ = rfd::FileDialog::new()
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Import").clicked() {
+                        #[cfg(not(target_os = "ios"))]
+                        if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Brushes", &[
                                 "pcbrush", "json", "abr", "brush", "brushset",
                                 "kpp", "bundle", "gbr", "png", "jpg", "jpeg", "webp", "bmp",
                             ])
-                            .pick_file();
-                        self.pending_open = Some(PendingOpen::Brushes);
-                        self.status = "Pick brushes…".to_string();
-                    }
-                    #[cfg(target_os = "android")]
-                    {
-                        self.android_browse = Some(PendingOpen::Brushes);
-                    }
-                }
-                if ui.button("Export set").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("ProCraft brushes", &["pcbrush"])
-                        .save_file()
-                    {
-                        let path = ensure_extension(path, "pcbrush");
-                        match save_brush_library(&path, &self.custom_brushes) {
-                            Ok(()) => {
-                                self.status = format!("Brushes saved {}", path.display());
-                                #[cfg(target_os = "ios")]
-                                rfd::ios_share_file(&path);
-                                #[cfg(target_os = "android")]
-                                rfd::android_scan_file(&path);
+                            .pick_file()
+                        {
+                            match load_brush_file(&path) {
+                                Ok(libs) => self.status = self.absorb_brushes(libs, &path),
+                                Err(e) => self.status = format!("Brush import failed: {e}"),
                             }
-                            Err(e) => self.status = format!("Brush save failed: {e}"),
+                        }
+                        #[cfg(target_os = "ios")]
+                        {
+                            let _ = rfd::FileDialog::new()
+                                .add_filter("Brushes", &[
+                                    "pcbrush", "json", "abr", "brush", "brushset",
+                                    "kpp", "bundle", "gbr", "png", "jpg", "jpeg", "webp", "bmp",
+                                ])
+                                .pick_file();
+                            self.pending_open = Some(PendingOpen::Brushes);
+                            self.status = "Pick brushes…".to_string();
+                        }
+                        #[cfg(target_os = "android")]
+                        {
+                            self.android_browse = Some(PendingOpen::Brushes);
                         }
                     }
-                }
-                if ui.button("Tip PNG").clicked() {
-                    // Grayscale tip of the current brush for Photoshop,
-                    // Procreate, Krita and GIMP.
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PNG image", &["png"])
-                        .save_file()
-                    {
-                        let path = ensure_extension(path, "png");
-                        let brush = Brush { eraser: false, ..self.brush.clone() };
-                        match export_tip_png(&path, &brush) {
-                            Ok(()) => {
-                                self.status = format!("Tip saved {}", path.display());
-                                #[cfg(target_os = "ios")]
-                                rfd::ios_share_file(&path);
-                                #[cfg(target_os = "android")]
-                                rfd::android_scan_file(&path);
+                    if ui.button("Export set").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("ProCraft brushes", &["pcbrush"])
+                            .save_file()
+                        {
+                            let path = ensure_extension(path, "pcbrush");
+                            match save_brush_library(&path, &self.custom_brushes) {
+                                Ok(()) => {
+                                    self.status = format!("Brushes saved {}", path.display());
+                                    #[cfg(target_os = "ios")]
+                                    rfd::ios_share_file(&path);
+                                    #[cfg(target_os = "android")]
+                                    rfd::android_scan_file(&path);
+                                }
+                                Err(e) => self.status = format!("Brush save failed: {e}"),
                             }
-                            Err(e) => self.status = format!("Tip save failed: {e}"),
                         }
+                    }
+                    if ui.button("Tip PNG").clicked() {
+                        // Grayscale tip of the current brush for Photoshop,
+                        // Procreate, Krita and GIMP.
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("PNG image", &["png"])
+                            .save_file()
+                        {
+                            let path = ensure_extension(path, "png");
+                            let brush = Brush { eraser: false, ..self.brush.clone() };
+                            match export_tip_png(&path, &brush) {
+                                Ok(()) => {
+                                    self.status = format!("Tip saved {}", path.display());
+                                    #[cfg(target_os = "ios")]
+                                    rfd::ios_share_file(&path);
+                                    #[cfg(target_os = "android")]
+                                    rfd::android_scan_file(&path);
+                                }
+                                Err(e) => self.status = format!("Tip save failed: {e}"),
+                            }
+                        }
+                    }
+                });
+                let custom_count = self.custom_brushes.len();
+                if custom_count > 0 {
+                    let base = procraft_engine::presets().len();
+                    let mut remove: Option<usize> = None;
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 3.0);
+                        for idx in 0..custom_count {
+                            let (name, brush) = {
+                                let p = &self.custom_brushes[idx];
+                                (p.name.clone(), p.brush.clone())
+                            };
+                            let active = self.brush == brush;
+                            ui.horizontal(|ui| {
+                                if ui.add_sized([64.0, 22.0], egui::Button::new(&name).selected(active)).clicked() {
+                                    self.brush = brush.clone();
+                                    self.tool = Tool::Brush;
+                                }
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    if let Some(tex) = self.preset_textures.get(base + idx) {
+                                        let thumb = ui.add(
+                                            egui::Image::new((tex.id(), Vec2::new(96.0, 24.0)))
+                                                .sense(Sense::click()),
+                                        );
+                                        if thumb.clicked() {
+                                            self.brush = brush.clone();
+                                            self.tool = Tool::Brush;
+                                        }
+                                    }
+                                });
+                                let preset_del = if self.has_symbols { "✕" } else { "Del" };
+                                if ui.small_button(preset_del).clicked() {
+                                    remove = Some(idx);
+                                }
+                            });
+                        }
+                    });
+                    if let Some(idx) = remove {
+                        let name = self.custom_brushes[idx].name.clone();
+                        self.custom_brushes.remove(idx);
+                        self.status = format!("Brush '{name}' removed.");
                     }
                 }
             });
-            let custom_count = self.custom_brushes.len();
-            if custom_count > 0 {
-                let base = procraft_engine::presets().len();
-                let mut remove: Option<usize> = None;
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 3.0);
-                    for idx in 0..custom_count {
-                        let (name, brush) = {
-                            let p = &self.custom_brushes[idx];
-                            (p.name.clone(), p.brush.clone())
-                        };
-                        let active = self.brush == brush;
-                        ui.horizontal(|ui| {
-                            if ui.add_sized([64.0, 22.0], egui::Button::new(&name).selected(active)).clicked() {
-                                self.brush = brush.clone();
-                                self.tool = Tool::Brush;
-                            }
-                            egui::Frame::group(ui.style()).show(ui, |ui| {
-                                if let Some(tex) = self.preset_textures.get(base + idx) {
-                                    let thumb = ui.add(
-                                        egui::Image::new((tex.id(), Vec2::new(96.0, 24.0)))
-                                            .sense(Sense::click()),
-                                    );
-                                    if thumb.clicked() {
-                                        self.brush = brush.clone();
-                                        self.tool = Tool::Brush;
-                                    }
-                                }
-                            });
-                            let preset_del = if self.has_symbols { "✕" } else { "Del" };
-                            if ui.small_button(preset_del).clicked() {
-                                remove = Some(idx);
-                            }
-                        });
-                    }
-                });
-                if let Some(idx) = remove {
-                    let name = self.custom_brushes[idx].name.clone();
-                    self.custom_brushes.remove(idx);
-                    self.status = format!("Brush '{name}' removed.");
-                }
-            }
             ui.separator();
             ui.heading("Color");
             stepped_slider(ui, &mut self.picker_size, 140.0..=420.0, 5.0, "Picker px");
@@ -5142,64 +5143,66 @@ impl eframe::App for ProCraftApp {
                 stepped_slider(ui, &mut self.brush.stabilizer, 0.0..=1.0, 0.05, "Stabilizer");
             });
             ui.separator();
-            ui.heading("Page");
-            ui.horizontal(|ui| {
-                for (name, rgb) in page_presets() {
-                    let active = self.doc.background[..3] == rgb;
-                    if ui.add(egui::Button::new(name).selected(active)).clicked() {
-                        self.set_page_color(rgb);
+            ui.collapsing("Page", |ui| {
+                ui.horizontal(|ui| {
+                    for (name, rgb) in page_presets() {
+                        let active = self.doc.background[..3] == rgb;
+                        if ui.add(egui::Button::new(name).selected(active)).clicked() {
+                            self.set_page_color(rgb);
+                        }
                     }
+                });
+                if egui::color_picker::color_edit_button_srgb(ui, &mut self.page_custom).changed() {
+                    self.set_page_color(self.page_custom);
                 }
             });
-            if egui::color_picker::color_edit_button_srgb(ui, &mut self.page_custom).changed() {
-                self.set_page_color(self.page_custom);
-            }
             ui.separator();
-            ui.heading("Guides");
-            let mut kind_changed = false;
-            ui.horizontal_wrapped(|ui| {
-                for k in GuideKind::ALL {
-                    if ui.radio_value(&mut self.guides.kind, k, k.name()).changed() {
-                        kind_changed = true;
+            ui.collapsing("Guides", |ui| {
+                let mut kind_changed = false;
+                ui.horizontal_wrapped(|ui| {
+                    for k in GuideKind::ALL {
+                        if ui.radio_value(&mut self.guides.kind, k, k.name()).changed() {
+                            kind_changed = true;
+                        }
                     }
+                });
+                if kind_changed {
+                    self.vp_move = false;
+                    self.vp_grab = None;
+                }
+                if self.guides.kind != GuideKind::Off {
+                    match self.guides.kind {
+                        GuideKind::Square | GuideKind::Isometric => {
+                            stepped_slider(ui, &mut self.guides.spacing, 8.0..=256.0, 1.0, "Spacing");
+                        }
+                        GuideKind::OnePoint | GuideKind::TwoPoint => {
+                            if ui.checkbox(&mut self.vp_move, "Move VPs (drag handles on canvas)").changed()
+                            {
+                                self.vp_grab = None;
+                                self.status = if self.vp_move {
+                                    "Drag a handle; off-canvas VPs park as diamonds on the edge. Painting pauses while armed.".to_string()
+                                } else {
+                                    "Vanishing-point move off.".to_string()
+                                };
+                            }
+                            if ui.button("Reset VPs").clicked() {
+                                self.guides.reset_vps();
+                                self.status = "Vanishing points reset to defaults.".to_string();
+                            }
+                        }
+                        GuideKind::Off => {}
+                    }
+                    ui.checkbox(&mut self.guides.snap, "Snap while painting");
+                    if self.guides.snap {
+                        stepped_slider(ui, &mut self.guides.snap_px, 2.0..=32.0, 1.0, "Snap range (px)");
+                    }
+                    ui.checkbox(&mut self.assist, "Drawing Assist (lock strokes to guides)");
+                    if self.assist {
+                        ui.label("Rays/axes engage as you draw; taps stay free.");
+                    }
+                    stepped_slider(ui, &mut self.guides.opacity, 0.05..=1.0, 0.05, "Opacity");
                 }
             });
-            if kind_changed {
-                self.vp_move = false;
-                self.vp_grab = None;
-            }
-            if self.guides.kind != GuideKind::Off {
-                match self.guides.kind {
-                    GuideKind::Square | GuideKind::Isometric => {
-                        stepped_slider(ui, &mut self.guides.spacing, 8.0..=256.0, 1.0, "Spacing");
-                    }
-                    GuideKind::OnePoint | GuideKind::TwoPoint => {
-                        if ui.checkbox(&mut self.vp_move, "Move VPs (drag handles on canvas)").changed()
-                        {
-                            self.vp_grab = None;
-                            self.status = if self.vp_move {
-                                "Drag a handle; off-canvas VPs park as diamonds on the edge. Painting pauses while armed.".to_string()
-                            } else {
-                                "Vanishing-point move off.".to_string()
-                            };
-                        }
-                        if ui.button("Reset VPs").clicked() {
-                            self.guides.reset_vps();
-                            self.status = "Vanishing points reset to defaults.".to_string();
-                        }
-                    }
-                    GuideKind::Off => {}
-                }
-                ui.checkbox(&mut self.guides.snap, "Snap while painting");
-                if self.guides.snap {
-                    stepped_slider(ui, &mut self.guides.snap_px, 2.0..=32.0, 1.0, "Snap range (px)");
-                }
-                ui.checkbox(&mut self.assist, "Drawing Assist (lock strokes to guides)");
-                if self.assist {
-                    ui.label("Rays/axes engage as you draw; taps stay free.");
-                }
-                stepped_slider(ui, &mut self.guides.opacity, 0.05..=1.0, 0.05, "Opacity");
-            }
             if self.doc.selection_mask.is_some() {
                 ui.separator();
                 ui.label(format!("Lasso: {} px", self.doc.selection_pixel_count()));
@@ -5639,777 +5642,814 @@ impl eframe::App for ProCraftApp {
                             .unwrap_or("-")
                     ));
                     ui.separator();
-                    ui.heading("Animation");
-                    ui.label("Layers are frames, bottom first.");
-                    ui.horizontal(|ui| {
-                        if ui.checkbox(&mut self.anim_assist, "Assist").changed() {
-                            self.anim_playing = false;
-                            self.texture = None; // rebuild the view (frame vs composite)
-                            self.ghost_dirty = true;
-                            self.status = if self.anim_assist {
-                                "Animation Assist on: one frame at a time.".to_string()
-                            } else {
-                                "Animation Assist off.".to_string()
-                            };
-                        }
-                        let playing = self.anim_playing;
-                        if ui.button(if playing { "Stop" } else { "Play" }).clicked() {
-                            if playing {
+                    ui.collapsing("Animation", |ui| {
+                        ui.label("Layers are frames, bottom first.");
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut self.anim_assist, "Assist").changed() {
                                 self.anim_playing = false;
-                                self.status = "Playback stopped.".to_string();
-                            } else if self.doc.layers.len() < 2 {
-                                self.status = "Need at least 2 layers to play.".to_string();
-                            } else {
-                                self.anim_assist = true;
-                                self.anim_playing = true;
-                                self.anim_fwd = true;
-                                self.anim_last_t = ui.ctx().input(|i| i.time);
-                                self.texture = None;
+                                self.texture = None; // rebuild the view (frame vs composite)
                                 self.ghost_dirty = true;
-                                self.status = "Playing.".to_string();
+                                self.status = if self.anim_assist {
+                                    "Animation Assist on: one frame at a time.".to_string()
+                                } else {
+                                    "Animation Assist off.".to_string()
+                                };
                             }
-                        }
-                    });
-                    if self.anim_assist && !self.doc.layers.is_empty() {
-                        ui.horizontal(|ui| {
-                            if ui.button("|<").clicked() {
-                                let n = self.doc.layers.len();
-                                self.doc.active = (self.doc.active + n - 1) % n;
-                                self.doc.mark_full_dirty();
-                            }
-                            ui.label(format!(
-                                "Frame {}/{}",
-                                self.doc.active + 1,
-                                self.doc.layers.len()
-                            ));
-                            if ui.button(">|").clicked() {
-                                let n = self.doc.layers.len();
-                                self.doc.active = (self.doc.active + 1) % n;
-                                self.doc.mark_full_dirty();
-                            }
-                            if ui.button("Duplicate frame").clicked() {
-                                let active = self.doc.active;
-                                self.doc.duplicate_layer(active);
-                                self.ghost_dirty = true;
-                                self.status = format!("Frame {} duplicated.", self.doc.active + 1);
+                            let playing = self.anim_playing;
+                            if ui.button(if playing { "Stop" } else { "Play" }).clicked() {
+                                if playing {
+                                    self.anim_playing = false;
+                                    self.status = "Playback stopped.".to_string();
+                                } else if self.doc.layers.len() < 2 {
+                                    self.status = "Need at least 2 layers to play.".to_string();
+                                } else {
+                                    self.anim_assist = true;
+                                    self.anim_playing = true;
+                                    self.anim_fwd = true;
+                                    self.anim_last_t = ui.ctx().input(|i| i.time);
+                                    self.texture = None;
+                                    self.ghost_dirty = true;
+                                    self.status = "Playing.".to_string();
+                                }
                             }
                         });
-                        stepped_slider(
-                            ui,
-                            &mut self.anim_fps,
-                            MIN_ANIM_FPS..=MAX_ANIM_FPS,
-                            1.0,
-                            "FPS",
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label("Loop:");
-                            for m in LoopMode::ALL {
-                                ui.radio_value(&mut self.anim_loop, m, m.name());
-                            }
-                        });
-                        // Per-frame hold: the stepper edits the current frame only.
-                        let mut hold = self
-                            .doc
-                            .layers
-                            .get(self.doc.active)
-                            .map(|l| l.hold)
-                            .unwrap_or(MIN_ANIM_HOLD)
-                            .clamp(MIN_ANIM_HOLD, MAX_ANIM_HOLD);
-                        stepped_slider(
-                            ui,
-                            &mut hold,
-                            MIN_ANIM_HOLD..=MAX_ANIM_HOLD,
-                            1.0,
-                            "Frame hold",
-                        );
-                        if let Some(layer) = self.doc.layers.get_mut(self.doc.active) {
-                            if layer.hold != hold {
-                                layer.hold = hold;
-                            }
-                        }
-                        if ui.checkbox(&mut self.onion, "Onion skin").changed() {
-                            self.ghost_dirty = true;
-                        }
-                        if self.onion {
-                            let before = (self.onion_prev, self.onion_next);
+                        if self.anim_assist && !self.doc.layers.is_empty() {
+                            ui.horizontal(|ui| {
+                                if ui.button("|<").clicked() {
+                                    let n = self.doc.layers.len();
+                                    self.doc.active = (self.doc.active + n - 1) % n;
+                                    self.doc.mark_full_dirty();
+                                }
+                                ui.label(format!(
+                                    "Frame {}/{}",
+                                    self.doc.active + 1,
+                                    self.doc.layers.len()
+                                ));
+                                if ui.button(">|").clicked() {
+                                    let n = self.doc.layers.len();
+                                    self.doc.active = (self.doc.active + 1) % n;
+                                    self.doc.mark_full_dirty();
+                                }
+                                if ui.button("Duplicate frame").clicked() {
+                                    let active = self.doc.active;
+                                    self.doc.duplicate_layer(active);
+                                    self.ghost_dirty = true;
+                                    self.status =
+                                        format!("Frame {} duplicated.", self.doc.active + 1);
+                                }
+                            });
                             stepped_slider(
                                 ui,
-                                &mut self.onion_prev,
-                                0.05..=0.8,
-                                0.05,
-                                "Prev ghost",
+                                &mut self.anim_fps,
+                                MIN_ANIM_FPS..=MAX_ANIM_FPS,
+                                1.0,
+                                "FPS",
                             );
+                            ui.horizontal(|ui| {
+                                ui.label("Loop:");
+                                for m in LoopMode::ALL {
+                                    ui.radio_value(&mut self.anim_loop, m, m.name());
+                                }
+                            });
+                            // Per-frame hold: the stepper edits the current frame only.
+                            let mut hold = self
+                                .doc
+                                .layers
+                                .get(self.doc.active)
+                                .map(|l| l.hold)
+                                .unwrap_or(MIN_ANIM_HOLD)
+                                .clamp(MIN_ANIM_HOLD, MAX_ANIM_HOLD);
                             stepped_slider(
                                 ui,
-                                &mut self.onion_next,
-                                0.05..=0.8,
-                                0.05,
-                                "Next ghost",
+                                &mut hold,
+                                MIN_ANIM_HOLD..=MAX_ANIM_HOLD,
+                                1.0,
+                                "Frame hold",
                             );
-                            if (self.onion_prev, self.onion_next) != before {
+                            if let Some(layer) = self.doc.layers.get_mut(self.doc.active) {
+                                if layer.hold != hold {
+                                    layer.hold = hold;
+                                }
+                            }
+                            if ui.checkbox(&mut self.onion, "Onion skin").changed() {
                                 self.ghost_dirty = true;
                             }
-                        }
-                        if ui.button("Export GIF").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("GIF image", &["gif"])
-                                .save_file()
-                            {
-                                let path = ensure_extension(path, "gif");
-                                match export_gif_ext(&self.doc, self.anim_fps, self.anim_loop) {
-                                    Ok(bytes) => match std::fs::write(&path, &bytes) {
-                                        Ok(()) => {
-                                            let shown = self
-                                                .doc
-                                                .layers
-                                                .iter()
-                                                .filter(|l| l.visible)
-                                                .count();
-                                            let exported = if self.anim_loop == LoopMode::PingPong
-                                                && shown > 2
-                                            {
-                                                2 * shown - 2
-                                            } else {
-                                                shown
-                                            };
-                                            let held = self
-                                                .doc
-                                                .layers
-                                                .iter()
-                                                .filter(|l| l.hold > 1)
-                                                .count();
-                                            let extra = match (self.anim_loop, held) {
-                                                (LoopMode::PingPong, 0) => {
-                                                    ", ping-pong".to_string()
-                                                }
-                                                (LoopMode::PingPong, _) => {
-                                                    format!(", ping-pong, {held} held")
-                                                }
-                                                (LoopMode::Forward, 0) => String::new(),
-                                                (LoopMode::Forward, _) => format!(", {held} held"),
-                                            };
-                                            self.status = format!(
+                            if self.onion {
+                                let before = (self.onion_prev, self.onion_next);
+                                stepped_slider(
+                                    ui,
+                                    &mut self.onion_prev,
+                                    0.05..=0.8,
+                                    0.05,
+                                    "Prev ghost",
+                                );
+                                stepped_slider(
+                                    ui,
+                                    &mut self.onion_next,
+                                    0.05..=0.8,
+                                    0.05,
+                                    "Next ghost",
+                                );
+                                if (self.onion_prev, self.onion_next) != before {
+                                    self.ghost_dirty = true;
+                                }
+                            }
+                            if ui.button("Export GIF").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("GIF image", &["gif"])
+                                    .save_file()
+                                {
+                                    let path = ensure_extension(path, "gif");
+                                    match export_gif_ext(&self.doc, self.anim_fps, self.anim_loop) {
+                                        Ok(bytes) => match std::fs::write(&path, &bytes) {
+                                            Ok(()) => {
+                                                let shown = self
+                                                    .doc
+                                                    .layers
+                                                    .iter()
+                                                    .filter(|l| l.visible)
+                                                    .count();
+                                                let exported = if self.anim_loop
+                                                    == LoopMode::PingPong
+                                                    && shown > 2
+                                                {
+                                                    2 * shown - 2
+                                                } else {
+                                                    shown
+                                                };
+                                                let held = self
+                                                    .doc
+                                                    .layers
+                                                    .iter()
+                                                    .filter(|l| l.hold > 1)
+                                                    .count();
+                                                let extra = match (self.anim_loop, held) {
+                                                    (LoopMode::PingPong, 0) => {
+                                                        ", ping-pong".to_string()
+                                                    }
+                                                    (LoopMode::PingPong, _) => {
+                                                        format!(", ping-pong, {held} held")
+                                                    }
+                                                    (LoopMode::Forward, 0) => String::new(),
+                                                    (LoopMode::Forward, _) => {
+                                                        format!(", {held} held")
+                                                    }
+                                                };
+                                                self.status = format!(
                                                 "GIF saved {} ({} frames, hidden skipped{extra}).",
                                                 path.display(),
                                                 exported
                                             );
-                                            #[cfg(target_os = "ios")]
-                                            rfd::ios_share_file(&path);
-                                            #[cfg(target_os = "android")]
-                                            rfd::android_scan_file(&path);
-                                        }
-                                        Err(e) => self.status = format!("GIF save failed: {e}"),
-                                    },
-                                    Err(e) => self.status = format!("GIF export failed: {e}"),
-                                }
-                            }
-                        }
-                        if ui.button("Import GIF").clicked() {
-                            #[cfg(not(target_os = "ios"))]
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("GIF image", &["gif"])
-                                .pick_file()
-                            {
-                                match std::fs::read(&path)
-                                    .map_err(|e| e.to_string())
-                                    .and_then(|b| import_gif_document(&b))
-                                {
-                                    Ok((doc, fps)) => {
-                                        self.status = format!(
-                                            "GIF imported {} ({} frames, {} fps).",
-                                            path.display(),
-                                            doc.layers.len(),
-                                            fps
-                                        );
-                                        self.adopt_gif(doc, fps);
+                                                #[cfg(target_os = "ios")]
+                                                rfd::ios_share_file(&path);
+                                                #[cfg(target_os = "android")]
+                                                rfd::android_scan_file(&path);
+                                            }
+                                            Err(e) => self.status = format!("GIF save failed: {e}"),
+                                        },
+                                        Err(e) => self.status = format!("GIF export failed: {e}"),
                                     }
-                                    Err(e) => self.status = format!("GIF import failed: {e}"),
                                 }
                             }
-                            #[cfg(target_os = "ios")]
-                            {
-                                let _ = rfd::FileDialog::new()
+                            if ui.button("Import GIF").clicked() {
+                                #[cfg(not(target_os = "ios"))]
+                                if let Some(path) = rfd::FileDialog::new()
                                     .add_filter("GIF image", &["gif"])
-                                    .pick_file();
-                                self.pending_open = Some(PendingOpen::Gif);
-                                self.status = "Pick GIF…".to_string();
-                            }
-                            #[cfg(target_os = "android")]
-                            {
-                                self.android_browse = Some(PendingOpen::Gif);
-                            }
-                        }
-                        // M41 Time-lapse: staged snapshots while recording
-                        // (session-only, capped small thumbs), exported as GIF.
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.lapse_on, "Time-lapse");
-                            ui.label(format!("{} frames", self.lapse_frames.len()));
-                        });
-                        if !self.lapse_frames.is_empty() {
-                            ui.horizontal_wrapped(|ui| {
-                                if ui
-                                    .add_sized([110.0, 28.0], egui::Button::new("Export lapse"))
-                                    .clicked()
+                                    .pick_file()
                                 {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("GIF image", &["gif"])
-                                        .save_file()
+                                    match std::fs::read(&path)
+                                        .map_err(|e| e.to_string())
+                                        .and_then(|b| import_gif_document(&b))
                                     {
-                                        let path = ensure_extension(path, "gif");
-                                        match export_timelapse(&self.lapse_frames, 10) {
-                                            Ok(bytes) => match std::fs::write(&path, &bytes) {
-                                                Ok(()) => {
-                                                    self.status = format!(
-                                                        "Time-lapse saved {} ({} frames).",
-                                                        path.display(),
-                                                        self.lapse_frames.len()
-                                                    );
-                                                    #[cfg(target_os = "ios")]
-                                                    rfd::ios_share_file(&path);
-                                                    #[cfg(target_os = "android")]
-                                                    rfd::android_scan_file(&path);
-                                                }
+                                        Ok((doc, fps)) => {
+                                            self.status = format!(
+                                                "GIF imported {} ({} frames, {} fps).",
+                                                path.display(),
+                                                doc.layers.len(),
+                                                fps
+                                            );
+                                            self.adopt_gif(doc, fps);
+                                        }
+                                        Err(e) => self.status = format!("GIF import failed: {e}"),
+                                    }
+                                }
+                                #[cfg(target_os = "ios")]
+                                {
+                                    let _ = rfd::FileDialog::new()
+                                        .add_filter("GIF image", &["gif"])
+                                        .pick_file();
+                                    self.pending_open = Some(PendingOpen::Gif);
+                                    self.status = "Pick GIF…".to_string();
+                                }
+                                #[cfg(target_os = "android")]
+                                {
+                                    self.android_browse = Some(PendingOpen::Gif);
+                                }
+                            }
+                            // M41 Time-lapse: staged snapshots while recording
+                            // (session-only, capped small thumbs), exported as GIF.
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.lapse_on, "Time-lapse");
+                                ui.label(format!("{} frames", self.lapse_frames.len()));
+                            });
+                            if !self.lapse_frames.is_empty() {
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .add_sized([110.0, 28.0], egui::Button::new("Export lapse"))
+                                        .clicked()
+                                    {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("GIF image", &["gif"])
+                                            .save_file()
+                                        {
+                                            let path = ensure_extension(path, "gif");
+                                            match export_timelapse(&self.lapse_frames, 10) {
+                                                Ok(bytes) => match std::fs::write(&path, &bytes) {
+                                                    Ok(()) => {
+                                                        self.status = format!(
+                                                            "Time-lapse saved {} ({} frames).",
+                                                            path.display(),
+                                                            self.lapse_frames.len()
+                                                        );
+                                                        #[cfg(target_os = "ios")]
+                                                        rfd::ios_share_file(&path);
+                                                        #[cfg(target_os = "android")]
+                                                        rfd::android_scan_file(&path);
+                                                    }
+                                                    Err(e) => {
+                                                        self.status =
+                                                            format!("Time-lapse save failed: {e}")
+                                                    }
+                                                },
                                                 Err(e) => {
                                                     self.status =
-                                                        format!("Time-lapse save failed: {e}")
+                                                        format!("Time-lapse export failed: {e}")
                                                 }
-                                            },
-                                            Err(e) => {
-                                                self.status =
-                                                    format!("Time-lapse export failed: {e}")
                                             }
                                         }
                                     }
-                                }
-                                if ui
-                                    .add_sized([110.0, 28.0], egui::Button::new("Clear lapse"))
-                                    .clicked()
-                                {
-                                    self.lapse_frames.clear();
-                                    self.status = "Time-lapse cleared.".to_string();
-                                }
-                            });
+                                    if ui
+                                        .add_sized([110.0, 28.0], egui::Button::new("Clear lapse"))
+                                        .clicked()
+                                    {
+                                        self.lapse_frames.clear();
+                                        self.status = "Time-lapse cleared.".to_string();
+                                    }
+                                });
+                            }
                         }
-                    }
+                    });
                     ui.separator();
-                    ui.heading("Transform layer");
-                    // Buttons compose into one session that always
-                    // re-applies from the pristine base (see tform_button):
-                    // mashing them never compounds resampling blur.
-                    ui.horizontal(|ui| {
-                        if ui.button("Scale +").clicked() {
-                            tform_button(
-                                &mut self.doc,
-                                &mut self.tform_press,
-                                TformOp::Scale(1.25),
-                            );
-                        }
-                        if ui.button("Scale −").clicked() {
-                            tform_button(
-                                &mut self.doc,
-                                &mut self.tform_press,
-                                TformOp::Scale(1.0 / 1.25),
-                            );
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(if self.has_symbols {
-                                "⟲ −15°"
-                            } else {
-                                "−15°"
-                            })
-                            .clicked()
-                        {
-                            tform_button(
-                                &mut self.doc,
-                                &mut self.tform_press,
-                                TformOp::Rotate(-15.0),
-                            );
-                        }
-                        if ui
-                            .button(if self.has_symbols {
-                                "⟳ +15°"
-                            } else {
-                                "+15°"
-                            })
-                            .clicked()
-                        {
-                            tform_button(
-                                &mut self.doc,
-                                &mut self.tform_press,
-                                TformOp::Rotate(15.0),
-                            );
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Flip H").clicked() {
-                            self.status = match tform_button(
-                                &mut self.doc,
-                                &mut self.tform_press,
-                                TformOp::FlipH,
-                            ) {
-                                XformApply::Restored => {
-                                    "Layer flip reset (back to the session start).".to_string()
-                                }
-                                _ => "Layer flipped horizontally.".to_string(),
-                            };
-                        }
-                        if ui.button("Flip V").clicked() {
-                            self.status = match tform_button(
-                                &mut self.doc,
-                                &mut self.tform_press,
-                                TformOp::FlipV,
-                            ) {
-                                XformApply::Restored => {
-                                    "Layer flip reset (back to the session start).".to_string()
-                                }
-                                _ => "Layer flipped vertically.".to_string(),
-                            };
-                        }
-                    });
-                    // M48 transform handles: arm corner pins or the warp
-                    // lattice for on-canvas dragging (live previews while
-                    // dragging, one undo step per gesture).
-                    ui.horizontal(|ui| {
-                        ui.label("Handles:");
-                        let mut mode = self.xform.mode;
-                        ui.radio_value(&mut mode, XformMode::Off, "Off");
-                        ui.radio_value(&mut mode, XformMode::Corners, "Distort");
-                        ui.radio_value(&mut mode, XformMode::Mesh, "Mesh");
-                        if mode != self.xform.mode {
-                            let (w, h) = (self.doc.w as f32, self.doc.h as f32);
-                            self.xform.arm(mode, w, h);
-                            self.status = match mode {
-                                XformMode::Off => {
-                                    "Transform handles off — painting resumes.".to_string()
-                                }
-                                XformMode::Corners => "Corner pins armed — painting pauses while \
+                    ui.collapsing("Transform layer", |ui| {
+                        // Buttons compose into one session that always
+                        // re-applies from the pristine base (see tform_button):
+                        // mashing them never compounds resampling blur.
+                        ui.horizontal(|ui| {
+                            if ui.button("Scale +").clicked() {
+                                tform_button(
+                                    &mut self.doc,
+                                    &mut self.tform_press,
+                                    TformOp::Scale(1.25),
+                                );
+                            }
+                            if ui.button("Scale −").clicked() {
+                                tform_button(
+                                    &mut self.doc,
+                                    &mut self.tform_press,
+                                    TformOp::Scale(1.0 / 1.25),
+                                );
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(if self.has_symbols {
+                                    "⟲ −15°"
+                                } else {
+                                    "−15°"
+                                })
+                                .clicked()
+                            {
+                                tform_button(
+                                    &mut self.doc,
+                                    &mut self.tform_press,
+                                    TformOp::Rotate(-15.0),
+                                );
+                            }
+                            if ui
+                                .button(if self.has_symbols {
+                                    "⟳ +15°"
+                                } else {
+                                    "+15°"
+                                })
+                                .clicked()
+                            {
+                                tform_button(
+                                    &mut self.doc,
+                                    &mut self.tform_press,
+                                    TformOp::Rotate(15.0),
+                                );
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("Flip H").clicked() {
+                                self.status = match tform_button(
+                                    &mut self.doc,
+                                    &mut self.tform_press,
+                                    TformOp::FlipH,
+                                ) {
+                                    XformApply::Restored => {
+                                        "Layer flip reset (back to the session start).".to_string()
+                                    }
+                                    _ => "Layer flipped horizontally.".to_string(),
+                                };
+                            }
+                            if ui.button("Flip V").clicked() {
+                                self.status = match tform_button(
+                                    &mut self.doc,
+                                    &mut self.tform_press,
+                                    TformOp::FlipV,
+                                ) {
+                                    XformApply::Restored => {
+                                        "Layer flip reset (back to the session start).".to_string()
+                                    }
+                                    _ => "Layer flipped vertically.".to_string(),
+                                };
+                            }
+                        });
+                        // M48 transform handles: arm corner pins or the warp
+                        // lattice for on-canvas dragging (live previews while
+                        // dragging, one undo step per gesture).
+                        ui.horizontal(|ui| {
+                            ui.label("Handles:");
+                            let mut mode = self.xform.mode;
+                            ui.radio_value(&mut mode, XformMode::Off, "Off");
+                            ui.radio_value(&mut mode, XformMode::Corners, "Distort");
+                            ui.radio_value(&mut mode, XformMode::Mesh, "Mesh");
+                            if mode != self.xform.mode {
+                                let (w, h) = (self.doc.w as f32, self.doc.h as f32);
+                                self.xform.arm(mode, w, h);
+                                self.status = match mode {
+                                    XformMode::Off => {
+                                        "Transform handles off — painting resumes.".to_string()
+                                    }
+                                    XformMode::Corners => {
+                                        "Corner pins armed — painting pauses while \
                                      armed; drag a pin to preview."
-                                    .to_string(),
-                                XformMode::Mesh => "Mesh lattice armed — painting pauses while \
+                                            .to_string()
+                                    }
+                                    XformMode::Mesh => {
+                                        "Mesh lattice armed — painting pauses while \
                                      armed; drag a point to preview."
-                                    .to_string(),
-                            };
+                                            .to_string()
+                                    }
+                                };
+                            }
+                        });
+                        if self.xform.mode != XformMode::Off
+                            && ui.button("Reset transform").clicked()
+                        {
+                            let (w, h) = (self.doc.w as f32, self.doc.h as f32);
+                            self.xform.arm(self.xform.mode, w, h);
+                            self.status = "Transform pins reset.".to_string();
                         }
                     });
-                    if self.xform.mode != XformMode::Off && ui.button("Reset transform").clicked() {
-                        let (w, h) = (self.doc.w as f32, self.doc.h as f32);
-                        self.xform.arm(self.xform.mode, w, h);
-                        self.status = "Transform pins reset.".to_string();
-                    }
                     ui.separator();
-                    ui.heading("Symmetry");
-                    for m in SymmetryMode::ALL {
-                        if ui
-                            .radio_value(&mut self.doc.symmetry, m, m.name())
-                            .changed()
-                        {
-                            self.sym_move = false;
-                            self.sym_grab = false;
-                            self.status = format!("Symmetry: {}.", m.name());
+                    ui.collapsing("Symmetry", |ui| {
+                        for m in SymmetryMode::ALL {
+                            if ui
+                                .radio_value(&mut self.doc.symmetry, m, m.name())
+                                .changed()
+                            {
+                                self.sym_move = false;
+                                self.sym_grab = false;
+                                self.status = format!("Symmetry: {}.", m.name());
+                            }
                         }
-                    }
-                    if self.doc.symmetry != SymmetryMode::Off {
-                        if ui
-                            .checkbox(&mut self.sym_move, "Move center (drag it on canvas)")
-                            .changed()
-                        {
-                            self.sym_grab = false;
-                            self.status = if self.sym_move {
-                                "Drag the mirror center; painting pauses while armed.".to_string()
-                            } else {
-                                "Mirror-center move off.".to_string()
-                            };
+                        if self.doc.symmetry != SymmetryMode::Off {
+                            if ui
+                                .checkbox(&mut self.sym_move, "Move center (drag it on canvas)")
+                                .changed()
+                            {
+                                self.sym_grab = false;
+                                self.status = if self.sym_move {
+                                    "Drag the mirror center; painting pauses while armed."
+                                        .to_string()
+                                } else {
+                                    "Mirror-center move off.".to_string()
+                                };
+                            }
+                            if ui.button("Reset center").clicked() {
+                                self.doc.reset_symmetry_center();
+                                self.status = "Mirror center reset to canvas middle.".to_string();
+                            }
                         }
-                        if ui.button("Reset center").clicked() {
-                            self.doc.reset_symmetry_center();
-                            self.status = "Mirror center reset to canvas middle.".to_string();
+                        if self.doc.symmetry == SymmetryMode::Kaleidoscope {
+                            stepped_slider(
+                                ui,
+                                &mut self.doc.symmetry_segments,
+                                2..=16,
+                                1.0,
+                                "Segments",
+                            );
                         }
-                    }
-                    if self.doc.symmetry == SymmetryMode::Kaleidoscope {
-                        stepped_slider(
-                            ui,
-                            &mut self.doc.symmetry_segments,
-                            2..=16,
-                            1.0,
-                            "Segments",
-                        );
-                    }
+                    });
                     ui.separator();
-                    ui.heading("Filters");
-                    ui.label(
+                    ui.collapsing("Filters", |ui| {
+                        ui.label(
                         "Active layer. Sliders preview live; Apply keeps. Selections mask filters.",
                     );
-                    // Tone previews live from a snapshot (one undo step); Apply
-                    // keeps the preview, or applies once when nothing is pending.
-                    let tone_before = (self.filt_brightness, self.filt_contrast);
-                    stepped_slider_label_end(
-                        ui,
-                        &mut self.filt_brightness,
-                        -100..=100,
-                        1.0,
-                        "Brightness",
-                    );
-                    stepped_slider_label_end(
-                        ui,
-                        &mut self.filt_contrast,
-                        0.0..=200.0,
-                        1.0,
-                        "Contrast %",
-                    );
-                    if (self.filt_brightness, self.filt_contrast) != tone_before {
-                        let (b, c) = (self.filt_brightness, self.filt_contrast);
-                        self.filter_scrub(0, move |doc, layer| {
-                            doc.adjust_tone(layer, (b as f32 * 2.55).round() as i32, c / 100.0);
-                        });
-                        self.status = "Previewing tone — Apply to keep.".to_string();
-                    }
-                    if ui.button("Apply tone").clicked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 0) {
+                        // Tone previews live from a snapshot (one undo step); Apply
+                        // keeps the preview, or applies once when nothing is pending.
+                        let tone_before = (self.filt_brightness, self.filt_contrast);
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_brightness,
+                            -100..=100,
+                            1.0,
+                            "Brightness",
+                        );
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_contrast,
+                            0.0..=200.0,
+                            1.0,
+                            "Contrast %",
+                        );
+                        if (self.filt_brightness, self.filt_contrast) != tone_before {
                             let (b, c) = (self.filt_brightness, self.filt_contrast);
-                            self.doc.checkpoint();
-                            self.doc.adjust_tone(
-                                self.doc.active,
-                                (b as f32 * 2.55).round() as i32,
-                                c / 100.0,
-                            );
-                        } else {
-                            // Throttled-stale preview (or a fresh one): stamp the
-                            // latest values over the scrub snapshot — same undo step.
-                            let (b, c) = (self.filt_brightness, self.filt_contrast);
-                            self.restamp_preview(move |doc, layer| {
+                            self.filter_scrub(0, move |doc, layer| {
                                 doc.adjust_tone(layer, (b as f32 * 2.55).round() as i32, c / 100.0);
                             });
+                            self.status = "Previewing tone — Apply to keep.".to_string();
                         }
-                        self.filter_preview = None;
-                        self.status = "Tone applied.".to_string();
-                        self.capture_timelapse();
-                    }
-                    let blur_before = self.filt_blur;
-                    stepped_slider_label_end(ui, &mut self.filt_blur, 0..=25, 1.0, "Blur");
-                    if self.filt_blur != blur_before {
-                        let r = self.filt_blur.max(0) as u32;
-                        self.filter_scrub(1, move |doc, layer| {
-                            doc.blur_layer(layer, r);
-                        });
-                        self.status = "Previewing blur — Apply to keep.".to_string();
-                    }
-                    if ui.button("Apply blur").clicked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 1) {
-                            self.doc.checkpoint();
-                            self.doc
-                                .blur_layer(self.doc.active, self.filt_blur.max(0) as u32);
-                        } else {
+                        if ui.button("Apply tone").clicked() {
+                            if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 0) {
+                                let (b, c) = (self.filt_brightness, self.filt_contrast);
+                                self.doc.checkpoint();
+                                self.doc.adjust_tone(
+                                    self.doc.active,
+                                    (b as f32 * 2.55).round() as i32,
+                                    c / 100.0,
+                                );
+                            } else {
+                                // Throttled-stale preview (or a fresh one): stamp the
+                                // latest values over the scrub snapshot — same undo step.
+                                let (b, c) = (self.filt_brightness, self.filt_contrast);
+                                self.restamp_preview(move |doc, layer| {
+                                    doc.adjust_tone(
+                                        layer,
+                                        (b as f32 * 2.55).round() as i32,
+                                        c / 100.0,
+                                    );
+                                });
+                            }
+                            self.filter_preview = None;
+                            self.status = "Tone applied.".to_string();
+                            self.capture_timelapse();
+                        }
+                        let blur_before = self.filt_blur;
+                        stepped_slider_label_end(ui, &mut self.filt_blur, 0..=25, 1.0, "Blur");
+                        if self.filt_blur != blur_before {
                             let r = self.filt_blur.max(0) as u32;
-                            self.restamp_preview(move |doc, layer| {
+                            self.filter_scrub(1, move |doc, layer| {
                                 doc.blur_layer(layer, r);
                             });
+                            self.status = "Previewing blur — Apply to keep.".to_string();
                         }
-                        self.filter_preview = None;
-                        self.status = "Blur applied.".to_string();
-                        self.capture_timelapse();
-                    }
-                    let sharp_before = self.filt_sharpen;
-                    stepped_slider_label_end(
-                        ui,
-                        &mut self.filt_sharpen,
-                        0.0..=200.0,
-                        1.0,
-                        "Sharpen %",
-                    );
-                    if self.filt_sharpen != sharp_before {
-                        let s = self.filt_sharpen / 100.0;
-                        self.filter_scrub(2, move |doc, layer| {
-                            doc.sharpen_layer(layer, s);
-                        });
-                        self.status = "Previewing sharpen — Apply to keep.".to_string();
-                    }
-                    if ui.button("Apply sharpen").clicked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 2) {
-                            self.doc.checkpoint();
-                            self.doc
-                                .sharpen_layer(self.doc.active, self.filt_sharpen / 100.0);
-                        } else {
+                        if ui.button("Apply blur").clicked() {
+                            if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 1) {
+                                self.doc.checkpoint();
+                                self.doc
+                                    .blur_layer(self.doc.active, self.filt_blur.max(0) as u32);
+                            } else {
+                                let r = self.filt_blur.max(0) as u32;
+                                self.restamp_preview(move |doc, layer| {
+                                    doc.blur_layer(layer, r);
+                                });
+                            }
+                            self.filter_preview = None;
+                            self.status = "Blur applied.".to_string();
+                            self.capture_timelapse();
+                        }
+                        let sharp_before = self.filt_sharpen;
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_sharpen,
+                            0.0..=200.0,
+                            1.0,
+                            "Sharpen %",
+                        );
+                        if self.filt_sharpen != sharp_before {
                             let s = self.filt_sharpen / 100.0;
-                            self.restamp_preview(move |doc, layer| {
+                            self.filter_scrub(2, move |doc, layer| {
                                 doc.sharpen_layer(layer, s);
                             });
+                            self.status = "Previewing sharpen — Apply to keep.".to_string();
                         }
-                        self.filter_preview = None;
-                        self.status = "Sharpen applied.".to_string();
-                        self.capture_timelapse();
-                    }
-                    // M36 Levels: black/white points + mid gamma, same live
-                    // preview + Apply rhythm as tone (preview kind 3).
-                    let levels_before = (
-                        self.filt_levels_shadow,
-                        self.filt_levels_gamma,
-                        self.filt_levels_high,
-                    );
-                    stepped_slider_label_end(
-                        ui,
-                        &mut self.filt_levels_shadow,
-                        0..=255,
-                        1.0,
-                        "Shadow",
-                    );
-                    stepped_slider_label_end(
-                        ui,
-                        &mut self.filt_levels_gamma,
-                        10.0..=400.0,
-                        1.0,
-                        "Gamma %",
-                    );
-                    stepped_slider_label_end(
-                        ui,
-                        &mut self.filt_levels_high,
-                        0..=255,
-                        1.0,
-                        "Highlight",
-                    );
-                    if (
-                        self.filt_levels_shadow,
-                        self.filt_levels_gamma,
-                        self.filt_levels_high,
-                    ) != levels_before
-                    {
-                        let (s, g, h) = (
+                        if ui.button("Apply sharpen").clicked() {
+                            if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 2) {
+                                self.doc.checkpoint();
+                                self.doc
+                                    .sharpen_layer(self.doc.active, self.filt_sharpen / 100.0);
+                            } else {
+                                let s = self.filt_sharpen / 100.0;
+                                self.restamp_preview(move |doc, layer| {
+                                    doc.sharpen_layer(layer, s);
+                                });
+                            }
+                            self.filter_preview = None;
+                            self.status = "Sharpen applied.".to_string();
+                            self.capture_timelapse();
+                        }
+                        // M36 Levels: black/white points + mid gamma, same live
+                        // preview + Apply rhythm as tone (preview kind 3).
+                        let levels_before = (
                             self.filt_levels_shadow,
-                            self.filt_levels_gamma / 100.0,
+                            self.filt_levels_gamma,
                             self.filt_levels_high,
                         );
-                        let lut = levels_lut(s, g, h);
-                        self.filter_scrub(3, move |doc, layer| {
-                            doc.apply_lut(layer, &lut);
-                        });
-                        self.status = "Previewing levels — Apply to keep.".to_string();
-                    }
-                    if ui.button("Apply levels").clicked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 3) {
-                            let lut = levels_lut(
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_levels_shadow,
+                            0..=255,
+                            1.0,
+                            "Shadow",
+                        );
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_levels_gamma,
+                            10.0..=400.0,
+                            1.0,
+                            "Gamma %",
+                        );
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_levels_high,
+                            0..=255,
+                            1.0,
+                            "Highlight",
+                        );
+                        if (
+                            self.filt_levels_shadow,
+                            self.filt_levels_gamma,
+                            self.filt_levels_high,
+                        ) != levels_before
+                        {
+                            let (s, g, h) = (
                                 self.filt_levels_shadow,
                                 self.filt_levels_gamma / 100.0,
                                 self.filt_levels_high,
                             );
-                            self.doc.checkpoint();
-                            self.doc.apply_lut(self.doc.active, &lut);
-                        } else {
-                            let lut = levels_lut(
-                                self.filt_levels_shadow,
-                                self.filt_levels_gamma / 100.0,
-                                self.filt_levels_high,
-                            );
-                            self.restamp_preview(move |doc, layer| {
+                            let lut = levels_lut(s, g, h);
+                            self.filter_scrub(3, move |doc, layer| {
                                 doc.apply_lut(layer, &lut);
                             });
+                            self.status = "Previewing levels — Apply to keep.".to_string();
                         }
-                        self.filter_preview = None;
-                        self.status = "Levels applied.".to_string();
-                        self.capture_timelapse();
-                    }
-                    // M36 Curves (parametric shadows/mids/highlights through a
-                    // pinned-endpoint LUT; preview kind 4).
-                    let curves_before = (
-                        self.filt_curve_shadow,
-                        self.filt_curve_mid,
-                        self.filt_curve_high,
-                    );
-                    stepped_slider_label_end(
-                        ui,
-                        &mut self.filt_curve_shadow,
-                        -100..=100,
-                        1.0,
-                        "Shadows",
-                    );
-                    stepped_slider_label_end(
-                        ui,
-                        &mut self.filt_curve_mid,
-                        -100..=100,
-                        1.0,
-                        "Midtones",
-                    );
-                    stepped_slider_label_end(
-                        ui,
-                        &mut self.filt_curve_high,
-                        -100..=100,
-                        1.0,
-                        "Highlights",
-                    );
-                    if (
-                        self.filt_curve_shadow,
-                        self.filt_curve_mid,
-                        self.filt_curve_high,
-                    ) != curves_before
-                    {
-                        let (s, m, h) = (
+                        if ui.button("Apply levels").clicked() {
+                            if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 3) {
+                                let lut = levels_lut(
+                                    self.filt_levels_shadow,
+                                    self.filt_levels_gamma / 100.0,
+                                    self.filt_levels_high,
+                                );
+                                self.doc.checkpoint();
+                                self.doc.apply_lut(self.doc.active, &lut);
+                            } else {
+                                let lut = levels_lut(
+                                    self.filt_levels_shadow,
+                                    self.filt_levels_gamma / 100.0,
+                                    self.filt_levels_high,
+                                );
+                                self.restamp_preview(move |doc, layer| {
+                                    doc.apply_lut(layer, &lut);
+                                });
+                            }
+                            self.filter_preview = None;
+                            self.status = "Levels applied.".to_string();
+                            self.capture_timelapse();
+                        }
+                        // M36 Curves (parametric shadows/mids/highlights through a
+                        // pinned-endpoint LUT; preview kind 4).
+                        let curves_before = (
                             self.filt_curve_shadow,
                             self.filt_curve_mid,
                             self.filt_curve_high,
                         );
-                        let lut = curves_lut(s, m, h);
-                        self.filter_scrub(4, move |doc, layer| {
-                            doc.apply_lut(layer, &lut);
-                        });
-                        self.status = "Previewing curves — Apply to keep.".to_string();
-                    }
-                    if ui.button("Apply curves").clicked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 4) {
-                            let lut = curves_lut(
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_curve_shadow,
+                            -100..=100,
+                            1.0,
+                            "Shadows",
+                        );
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_curve_mid,
+                            -100..=100,
+                            1.0,
+                            "Midtones",
+                        );
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_curve_high,
+                            -100..=100,
+                            1.0,
+                            "Highlights",
+                        );
+                        if (
+                            self.filt_curve_shadow,
+                            self.filt_curve_mid,
+                            self.filt_curve_high,
+                        ) != curves_before
+                        {
+                            let (s, m, h) = (
                                 self.filt_curve_shadow,
                                 self.filt_curve_mid,
                                 self.filt_curve_high,
                             );
-                            self.doc.checkpoint();
-                            self.doc.apply_lut(self.doc.active, &lut);
-                        } else {
-                            let lut = curves_lut(
-                                self.filt_curve_shadow,
-                                self.filt_curve_mid,
-                                self.filt_curve_high,
-                            );
-                            self.restamp_preview(move |doc, layer| {
+                            let lut = curves_lut(s, m, h);
+                            self.filter_scrub(4, move |doc, layer| {
                                 doc.apply_lut(layer, &lut);
                             });
+                            self.status = "Previewing curves — Apply to keep.".to_string();
                         }
-                        self.filter_preview = None;
-                        self.status = "Curves applied.".to_string();
-                        self.capture_timelapse();
-                    }
-                    // M37 HSL: hue spin + saturation scale + lightness shift
-                    // (preview kind 5). Grays only answer to lightness.
-                    let hsl_before = (self.filt_hue, self.filt_sat, self.filt_light);
-                    stepped_slider_label_end(ui, &mut self.filt_hue, -180.0..=180.0, 1.0, "Hue°");
-                    stepped_slider_label_end(ui, &mut self.filt_sat, 0.0..=400.0, 1.0, "Sat %");
-                    stepped_slider_label_end(ui, &mut self.filt_light, -100..=100, 1.0, "Light");
-                    if (self.filt_hue, self.filt_sat, self.filt_light) != hsl_before {
-                        let (h, s, l) = (
-                            self.filt_hue,
-                            self.filt_sat / 100.0,
-                            self.filt_light as f32 / 100.0,
+                        if ui.button("Apply curves").clicked() {
+                            if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 4) {
+                                let lut = curves_lut(
+                                    self.filt_curve_shadow,
+                                    self.filt_curve_mid,
+                                    self.filt_curve_high,
+                                );
+                                self.doc.checkpoint();
+                                self.doc.apply_lut(self.doc.active, &lut);
+                            } else {
+                                let lut = curves_lut(
+                                    self.filt_curve_shadow,
+                                    self.filt_curve_mid,
+                                    self.filt_curve_high,
+                                );
+                                self.restamp_preview(move |doc, layer| {
+                                    doc.apply_lut(layer, &lut);
+                                });
+                            }
+                            self.filter_preview = None;
+                            self.status = "Curves applied.".to_string();
+                            self.capture_timelapse();
+                        }
+                        // M37 HSL: hue spin + saturation scale + lightness shift
+                        // (preview kind 5). Grays only answer to lightness.
+                        let hsl_before = (self.filt_hue, self.filt_sat, self.filt_light);
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_hue,
+                            -180.0..=180.0,
+                            1.0,
+                            "Hue°",
                         );
-                        self.filter_scrub(5, move |doc, layer| {
-                            doc.adjust_hsl(layer, h, s, l);
-                        });
-                        self.status = "Previewing HSL — Apply to keep.".to_string();
-                    }
-                    if ui.button("Apply HSL").clicked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 5) {
-                            self.doc.checkpoint();
-                            let active = self.doc.active;
-                            self.doc.adjust_hsl(
-                                active,
-                                self.filt_hue,
-                                self.filt_sat / 100.0,
-                                self.filt_light as f32 / 100.0,
-                            );
-                        } else {
+                        stepped_slider_label_end(ui, &mut self.filt_sat, 0.0..=400.0, 1.0, "Sat %");
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_light,
+                            -100..=100,
+                            1.0,
+                            "Light",
+                        );
+                        if (self.filt_hue, self.filt_sat, self.filt_light) != hsl_before {
                             let (h, s, l) = (
                                 self.filt_hue,
                                 self.filt_sat / 100.0,
                                 self.filt_light as f32 / 100.0,
                             );
-                            self.restamp_preview(move |doc, layer| {
+                            self.filter_scrub(5, move |doc, layer| {
                                 doc.adjust_hsl(layer, h, s, l);
                             });
+                            self.status = "Previewing HSL — Apply to keep.".to_string();
                         }
-                        self.filter_preview = None;
-                        self.status = "HSL applied.".to_string();
-                        self.capture_timelapse();
-                    }
-                    // M37 Color balance: − toward cyan/magenta/yellow, + toward
-                    // red/green/blue (preview kind 6).
-                    let bal_before = (self.filt_bal_r, self.filt_bal_g, self.filt_bal_b);
-                    stepped_slider_label_end(ui, &mut self.filt_bal_r, -100..=100, 1.0, "Red−Cyan");
-                    stepped_slider_label_end(
-                        ui,
-                        &mut self.filt_bal_g,
-                        -100..=100,
-                        1.0,
-                        "Green−Magenta",
-                    );
-                    stepped_slider_label_end(
-                        ui,
-                        &mut self.filt_bal_b,
-                        -100..=100,
-                        1.0,
-                        "Blue−Yellow",
-                    );
-                    if (self.filt_bal_r, self.filt_bal_g, self.filt_bal_b) != bal_before {
-                        let (r, g, b) = (
-                            (self.filt_bal_r as f32 * 2.55).round() as i32,
-                            (self.filt_bal_g as f32 * 2.55).round() as i32,
-                            (self.filt_bal_b as f32 * 2.55).round() as i32,
+                        if ui.button("Apply HSL").clicked() {
+                            if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 5) {
+                                self.doc.checkpoint();
+                                let active = self.doc.active;
+                                self.doc.adjust_hsl(
+                                    active,
+                                    self.filt_hue,
+                                    self.filt_sat / 100.0,
+                                    self.filt_light as f32 / 100.0,
+                                );
+                            } else {
+                                let (h, s, l) = (
+                                    self.filt_hue,
+                                    self.filt_sat / 100.0,
+                                    self.filt_light as f32 / 100.0,
+                                );
+                                self.restamp_preview(move |doc, layer| {
+                                    doc.adjust_hsl(layer, h, s, l);
+                                });
+                            }
+                            self.filter_preview = None;
+                            self.status = "HSL applied.".to_string();
+                            self.capture_timelapse();
+                        }
+                        // M37 Color balance: − toward cyan/magenta/yellow, + toward
+                        // red/green/blue (preview kind 6).
+                        let bal_before = (self.filt_bal_r, self.filt_bal_g, self.filt_bal_b);
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_bal_r,
+                            -100..=100,
+                            1.0,
+                            "Red−Cyan",
                         );
-                        self.filter_scrub(6, move |doc, layer| {
-                            doc.color_balance(layer, r, g, b);
-                        });
-                        self.status = "Previewing balance — Apply to keep.".to_string();
-                    }
-                    if ui.button("Apply balance").clicked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 6) {
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_bal_g,
+                            -100..=100,
+                            1.0,
+                            "Green−Magenta",
+                        );
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_bal_b,
+                            -100..=100,
+                            1.0,
+                            "Blue−Yellow",
+                        );
+                        if (self.filt_bal_r, self.filt_bal_g, self.filt_bal_b) != bal_before {
                             let (r, g, b) = (
                                 (self.filt_bal_r as f32 * 2.55).round() as i32,
                                 (self.filt_bal_g as f32 * 2.55).round() as i32,
                                 (self.filt_bal_b as f32 * 2.55).round() as i32,
                             );
-                            self.doc.checkpoint();
-                            self.doc.color_balance(self.doc.active, r, g, b);
-                        } else {
-                            let (r, g, b) = (
-                                (self.filt_bal_r as f32 * 2.55).round() as i32,
-                                (self.filt_bal_g as f32 * 2.55).round() as i32,
-                                (self.filt_bal_b as f32 * 2.55).round() as i32,
-                            );
-                            self.restamp_preview(move |doc, layer| {
+                            self.filter_scrub(6, move |doc, layer| {
                                 doc.color_balance(layer, r, g, b);
                             });
+                            self.status = "Previewing balance — Apply to keep.".to_string();
                         }
-                        self.filter_preview = None;
-                        self.status = "Balance applied.".to_string();
-                        self.capture_timelapse();
-                    }
-                    // M37 Recolor (colorize) toward the current paint color at
-                    // strength (preview kind 7). White stays white by definition.
-                    ui.label(format!(
-                        "Recolor target: #{:02X}{:02X}{:02X} (paint color).",
-                        self.color[0], self.color[1], self.color[2]
-                    ));
-                    let recolor_before = self.filt_recolor_strength;
-                    stepped_slider_label_end(
-                        ui,
-                        &mut self.filt_recolor_strength,
-                        0.0..=100.0,
-                        1.0,
-                        "Strength %",
-                    );
-                    if self.filt_recolor_strength != recolor_before {
-                        let (target, s) = (self.color, self.filt_recolor_strength / 100.0);
-                        self.filter_scrub(7, move |doc, layer| {
-                            doc.colorize(layer, target, s);
-                        });
-                        self.status = "Previewing recolor — Apply to keep.".to_string();
-                    }
-                    if ui.button("Apply recolor").clicked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 7) {
-                            self.doc.checkpoint();
-                            let active = self.doc.active;
-                            self.doc.colorize(
-                                active,
-                                self.color,
-                                self.filt_recolor_strength / 100.0,
-                            );
-                        } else {
+                        if ui.button("Apply balance").clicked() {
+                            if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 6) {
+                                let (r, g, b) = (
+                                    (self.filt_bal_r as f32 * 2.55).round() as i32,
+                                    (self.filt_bal_g as f32 * 2.55).round() as i32,
+                                    (self.filt_bal_b as f32 * 2.55).round() as i32,
+                                );
+                                self.doc.checkpoint();
+                                self.doc.color_balance(self.doc.active, r, g, b);
+                            } else {
+                                let (r, g, b) = (
+                                    (self.filt_bal_r as f32 * 2.55).round() as i32,
+                                    (self.filt_bal_g as f32 * 2.55).round() as i32,
+                                    (self.filt_bal_b as f32 * 2.55).round() as i32,
+                                );
+                                self.restamp_preview(move |doc, layer| {
+                                    doc.color_balance(layer, r, g, b);
+                                });
+                            }
+                            self.filter_preview = None;
+                            self.status = "Balance applied.".to_string();
+                            self.capture_timelapse();
+                        }
+                        // M37 Recolor (colorize) toward the current paint color at
+                        // strength (preview kind 7). White stays white by definition.
+                        ui.label(format!(
+                            "Recolor target: #{:02X}{:02X}{:02X} (paint color).",
+                            self.color[0], self.color[1], self.color[2]
+                        ));
+                        let recolor_before = self.filt_recolor_strength;
+                        stepped_slider_label_end(
+                            ui,
+                            &mut self.filt_recolor_strength,
+                            0.0..=100.0,
+                            1.0,
+                            "Strength %",
+                        );
+                        if self.filt_recolor_strength != recolor_before {
                             let (target, s) = (self.color, self.filt_recolor_strength / 100.0);
-                            self.restamp_preview(move |doc, layer| {
+                            self.filter_scrub(7, move |doc, layer| {
                                 doc.colorize(layer, target, s);
                             });
+                            self.status = "Previewing recolor — Apply to keep.".to_string();
                         }
-                        self.filter_preview = None;
-                        self.status = "Recolor applied.".to_string();
-                        self.capture_timelapse();
-                    }
+                        if ui.button("Apply recolor").clicked() {
+                            if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 7) {
+                                self.doc.checkpoint();
+                                let active = self.doc.active;
+                                self.doc.colorize(
+                                    active,
+                                    self.color,
+                                    self.filt_recolor_strength / 100.0,
+                                );
+                            } else {
+                                let (target, s) = (self.color, self.filt_recolor_strength / 100.0);
+                                self.restamp_preview(move |doc, layer| {
+                                    doc.colorize(layer, target, s);
+                                });
+                            }
+                            self.filter_preview = None;
+                            self.status = "Recolor applied.".to_string();
+                            self.capture_timelapse();
+                        }
+                    });
                 });
             });
         self.show_layers = layers_open && self.show_layers;

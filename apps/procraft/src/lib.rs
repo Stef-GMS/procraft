@@ -1478,6 +1478,9 @@ impl ProCraftApp {
         self.crop_current = None;
         self.move_from = None;
         self.liquify_from = None;
+        // M48 pins are canvas-sized state: a new/resized canvas
+        // invalidates them (they were seeded at the old dimensions).
+        self.xform = XformState::off();
         self.canvas_sync = (self.doc.w, self.doc.h);
         self.canvas_w = self.doc.w;
         self.canvas_h = self.doc.h;
@@ -1897,13 +1900,10 @@ fn identity_quad(w: f32, h: f32) -> [(f32, f32); 4] {
     ]
 }
 
-fn quad_with_drag(mut quad: [(f32, f32); 4], i: usize, p: (f32, f32)) -> [(f32, f32); 4] {
-    if i < quad.len() {
-        quad[i] = p;
-    }
-    quad
-}
-
+/// Identity comparison helpers: the release gate is now moved-only (the
+/// apply solve maps pins onto their grab-start positions), so these
+/// exist purely to pin the identity conventions in tests.
+#[cfg(test)]
 fn quad_differs_from_identity(quad: [(f32, f32); 4], w: f32, h: f32) -> bool {
     quad != identity_quad(w, h)
 }
@@ -1921,8 +1921,120 @@ fn identity_grid(w: f32, h: f32, cols: u32, rows: u32) -> Vec<(f32, f32)> {
     grid
 }
 
+#[cfg(test)]
 fn grid_differs_from_identity(grid: &[(f32, f32)], w: f32, h: f32, cols: u32, rows: u32) -> bool {
     grid != identity_grid(w, h, cols, rows).as_slice()
+}
+
+/// Gaussian elimination with partial pivoting (f64 for stability).
+/// `None` when a pivot collapses below tolerance: the pin configuration
+/// is degenerate (overlapping pins) and no sane transform exists.
+fn solve_linear(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let n = b.len();
+    if a.len() != n || a.iter().any(|row| row.len() != n) {
+        return None;
+    }
+    for col in 0..n {
+        let piv = (col..n).max_by(|&r1, &r2| a[r1][col].abs().total_cmp(&a[r2][col].abs()))?;
+        if a[piv][col].abs() < 1e-9 {
+            return None;
+        }
+        if piv != col {
+            a.swap(piv, col);
+            b.swap(piv, col);
+        }
+        let d = a[col][col];
+        let pivot_row = a[col].clone();
+        for r in col + 1..n {
+            let f = a[r][col] / d;
+            for (c, pv) in pivot_row.iter().enumerate() {
+                a[r][c] -= f * pv;
+            }
+            b[r] -= f * b[col];
+        }
+    }
+    let mut x = vec![0.0f64; n];
+    for r in (0..n).rev() {
+        let mut s = b[r];
+        for c in r + 1..n {
+            s -= a[r][c] * x[c];
+        }
+        x[r] = s / a[r][r];
+    }
+    Some(x)
+}
+
+/// Inverse-solve the engine corner-pin params so the content follows the
+/// pins. The engine samples `quad` as source coords at each destination
+/// corner, so writing pin positions in directly moves content the
+/// opposite way; solving "blend-of-quad at each pin = that pin's
+/// grab-start position" means the content under `from` lands exactly at
+/// `pins` (push semantics). Weights mirror `Document::quad_buffer`
+/// exactly (u = x / (w-1)). `None` on degenerate (overlapping) pins.
+fn pull_quad(
+    pins: [(f32, f32); 4],
+    from: &[(f32, f32)],
+    w: f32,
+    h: f32,
+) -> Option<[(f32, f32); 4]> {
+    if w < 2.0 || h < 2.0 || from.len() != 4 {
+        return None;
+    }
+    let mut a = vec![vec![0.0f64; 4]; 4];
+    for (row, &(px, py)) in pins.iter().enumerate() {
+        let u = (px / (w - 1.0)) as f64;
+        let v = (py / (h - 1.0)) as f64;
+        let (iu, iv) = (1.0 - u, 1.0 - v);
+        a[row] = vec![iu * iv, u * iv, u * v, iu * v];
+    }
+    let bx = solve_linear(a.clone(), from.iter().map(|p| p.0 as f64).collect())?;
+    let by = solve_linear(a, from.iter().map(|p| p.1 as f64).collect())?;
+    Some([
+        (bx[0] as f32, by[0] as f32),
+        (bx[1] as f32, by[1] as f32),
+        (bx[2] as f32, by[2] as f32),
+        (bx[3] as f32, by[3] as f32),
+    ])
+}
+
+/// Same inverse solve for the warp lattice. Weights mirror
+/// `Document::warp_buffer` exactly (gx = x/w * cols, clamped); `pins`
+/// and `from` are row-major `(cols+1) * (rows+1)` grids. `None` on
+/// degenerate (collapsed) pins or on a malformed grid.
+fn pull_grid(
+    pins: &[(f32, f32)],
+    from: &[(f32, f32)],
+    w: f32,
+    h: f32,
+    cols: u32,
+    rows: u32,
+) -> Option<Vec<(f32, f32)>> {
+    let n = ((cols + 1) * (rows + 1)) as usize;
+    if w < 2.0 || h < 2.0 || cols < 1 || rows < 1 || pins.len() != n || from.len() != n {
+        return None;
+    }
+    let stride = cols as usize + 1;
+    let mut a = vec![vec![0.0f64; n]; n];
+    for (row, &(px, py)) in pins.iter().enumerate() {
+        let gx = (px / w * cols as f32).clamp(0.0, cols as f32 - 1e-6) as f64;
+        let gy = (py / h * rows as f32).clamp(0.0, rows as f32 - 1e-6) as f64;
+        let i = gx.floor() as usize;
+        let j = gy.floor() as usize;
+        let (fu, fv) = (gx - i as f64, gy - j as f64);
+        let (iu, iv) = (1.0 - fu, 1.0 - fv);
+        a[row][j * stride + i] = iu * iv;
+        a[row][j * stride + i + 1] = fu * iv;
+        a[row][(j + 1) * stride + i] = iu * fv;
+        a[row][(j + 1) * stride + i + 1] = fu * fv;
+    }
+    let bx = solve_linear(a.clone(), from.iter().map(|p| p.0 as f64).collect())?;
+    let by = solve_linear(a, from.iter().map(|p| p.1 as f64).collect())?;
+    Some(
+        bx.into_iter()
+            .zip(by)
+            .map(|(x, y)| (x as f32, y as f32))
+            .collect(),
+    )
 }
 
 /// Armed transform state. Handles drag on the canvas; the engine op
@@ -1933,8 +2045,14 @@ struct XformState {
     quad: [(f32, f32); 4],
     grid: Vec<(f32, f32)>,
     grab: Option<usize>,
+    /// Pointer position (canvas coords) where the current grab began:
+    /// drags move the pin by (pointer now - grab_at), so a long-press
+    /// with no movement never writes a phantom position.
+    grab_at: (f32, f32),
     /// Points as they were when the current grab started; a release
-    /// applies only when they differ (drag-away-and-back included).
+    /// applies only when they differ (drag-away-and-back included),
+    /// cancel restores them, and the apply solve maps pins back onto
+    /// them so content keeps following the pin across gestures.
     grab_from: Vec<(f32, f32)>,
 }
 
@@ -1945,6 +2063,7 @@ impl XformState {
             quad: identity_quad(1.0, 1.0),
             grid: Vec::new(),
             grab: None,
+            grab_at: (0.0, 0.0),
             grab_from: Vec::new(),
         }
     }
@@ -1957,16 +2076,53 @@ impl XformState {
         }
     }
 
+    fn points_mut(&mut self) -> &mut [(f32, f32)] {
+        match self.mode {
+            XformMode::Corners => &mut self.quad,
+            XformMode::Mesh => &mut self.grid,
+            XformMode::Off => &mut [],
+        }
+    }
+
+    /// Start a grab: remember where the pointer is (canvas coords) and
+    /// snapshot the points so drags are relative and cancel can restore.
+    fn begin_grab(&mut self, i: usize, at: (f32, f32)) {
+        self.grab = Some(i);
+        self.grab_at = at;
+        self.grab_from = self.points().to_vec();
+    }
+
+    /// Move the grabbed pin by the pointer's displacement since the
+    /// grab started (never the absolute pointer position: a long-press
+    /// with no movement must not relocate the pin).
+    fn drag_by(&mut self, dx: f32, dy: f32) {
+        if let Some(i) = self.grab {
+            if let Some(from) = self.grab_from.get(i).copied() {
+                if let Some(slot) = self.points_mut().get_mut(i) {
+                    *slot = (from.0 + dx, from.1 + dy);
+                }
+            }
+        }
+    }
+
+    /// Drop any grab; the points snap back to where the grab started so
+    /// Esc and gesture abort leave nothing pending for the next gesture.
     fn cancel_grab(&mut self) {
+        if self.grab.is_some() && self.grab_from.len() == self.points().len() {
+            let from = std::mem::take(&mut self.grab_from);
+            self.points_mut().copy_from_slice(&from);
+            self.grab_from = from;
+        }
         self.grab = None;
         self.grab_from.clear();
     }
 
-    /// Switch modes: seed identity positions for the new mode and drop
-    /// any grab. Off keeps the last positions (re-arming is cheap).
+    /// Switch modes: restore any in-flight grab into the mode that owns
+    /// the points, then seed identity positions for the new mode. Off
+    /// keeps the last positions (re-arming is cheap).
     fn arm(&mut self, mode: XformMode, w: f32, h: f32) {
-        self.mode = mode;
         self.cancel_grab();
+        self.mode = mode;
         match mode {
             XformMode::Corners => self.quad = identity_quad(w, h),
             XformMode::Mesh => self.grid = identity_grid(w, h, XFORM_MESH_COLS, XFORM_MESH_ROWS),
@@ -2234,8 +2390,8 @@ impl eframe::App for ProCraftApp {
             self.lasso_points.clear();
             self.lasso_poly.clear();
             self.sel_edges_dirty = true;
-            // Armed transform handles drop their grab; nothing was
-            // mutated (apply happens on release only).
+            // Armed transform handles drop their grab; the pins snap
+            // back to the gesture start (apply happens on release only).
             self.xform.cancel_grab();
         }
         // Multi-finger taps (touch): two fingers = undo, three = redo.
@@ -4748,20 +4904,22 @@ impl eframe::App for ProCraftApp {
                             let (w, h) = (self.doc.w as f32, self.doc.h as f32);
                             self.xform.arm(mode, w, h);
                             self.status = match mode {
-                                XformMode::Off => "Transform handles off.".to_string(),
-                                XformMode::Corners => {
-                                    "Drag corner pins; applies on release.".to_string()
+                                XformMode::Off => {
+                                    "Transform handles off — painting resumes.".to_string()
                                 }
-                                XformMode::Mesh => {
-                                    "Drag lattice points; applies on release.".to_string()
-                                }
+                                XformMode::Corners => "Corner pins armed — painting pauses while \
+                                     armed; drag a pin, release applies."
+                                    .to_string(),
+                                XformMode::Mesh => "Mesh lattice armed — painting pauses while \
+                                     armed; drag a point, release applies."
+                                    .to_string(),
                             };
                         }
                     });
                     if self.xform.mode != XformMode::Off && ui.button("Reset transform").clicked() {
                         let (w, h) = (self.doc.w as f32, self.doc.h as f32);
                         self.xform.arm(self.xform.mode, w, h);
-                        self.status = "Transform reset.".to_string();
+                        self.status = "Transform pins reset.".to_string();
                     }
                     ui.separator();
                     ui.heading("Symmetry");
@@ -5693,9 +5851,10 @@ impl eframe::App for ProCraftApp {
                 }
 
                 // Transform handles (M48, armed in the Transform panel):
-                // grabs pause painting and move the nearest pin; the
-                // engine op applies once on release (a resample per tick
-                // would hang like the pre-throttle filter previews).
+                // grabs pause painting and move the nearest pin by the
+                // pointer's displacement; the engine op applies once on
+                // release (a resample per tick would hang like the
+                // pre-throttle filter previews).
                 if self.xform.mode == XformMode::Corners || self.xform.mode == XformMode::Mesh {
                     if resp.drag_started() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
@@ -5711,25 +5870,16 @@ impl eframe::App for ProCraftApp {
                             // Generous 28px radius like the VP handles.
                             if let Some((i, d)) = best {
                                 if d <= 28.0 {
-                                    self.xform.grab = Some(i);
-                                    self.xform.grab_from = self.xform.points().to_vec();
+                                    let at = to_canvas(pos);
+                                    self.xform.begin_grab(i, at);
                                 }
                             }
                         }
                     } else if resp.dragged() {
-                        if let (Some(i), Some(pos)) = (self.xform.grab, resp.hover_pos()) {
+                        if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
-                            match self.xform.mode {
-                                XformMode::Corners => {
-                                    self.xform.quad = quad_with_drag(self.xform.quad, i, (x, y));
-                                }
-                                XformMode::Mesh => {
-                                    if let Some(p) = self.xform.grid.get_mut(i) {
-                                        *p = (x, y);
-                                    }
-                                }
-                                XformMode::Off => {}
-                            }
+                            let (dx, dy) = (x - self.xform.grab_at.0, y - self.xform.grab_at.1);
+                            self.xform.drag_by(dx, dy);
                         }
                     }
                     if resp.drag_stopped() {
@@ -5738,34 +5888,50 @@ impl eframe::App for ProCraftApp {
                         if was_grabbed {
                             match self.xform.mode {
                                 XformMode::Corners => {
-                                    let quad = self.xform.quad;
-                                    if from.as_slice() != quad.as_slice()
-                                        && quad_differs_from_identity(quad, w, h)
-                                    {
-                                        self.doc.checkpoint();
-                                        self.doc.distort_layer(self.doc.active, quad);
-                                        self.status = "Distort applied.".to_string();
+                                    let pins = self.xform.quad;
+                                    if from.as_slice() != pins.as_slice() {
+                                        // Inverse-solve: writing the pin
+                                        // positions in as pull coords would
+                                        // move content the opposite way.
+                                        match pull_quad(pins, &from, w, h) {
+                                            Some(q) => {
+                                                self.doc.checkpoint();
+                                                self.doc.distort_layer(self.doc.active, q);
+                                                self.status = "Distort applied.".to_string();
+                                            }
+                                            None => {
+                                                self.status =
+                                                    "Pins overlap — transform skipped.".to_string();
+                                            }
+                                        }
                                     }
                                 }
                                 XformMode::Mesh => {
-                                    let grid = self.xform.grid.clone();
-                                    if from.as_slice() != grid.as_slice()
-                                        && grid_differs_from_identity(
-                                            &grid,
+                                    let pins = self.xform.grid.clone();
+                                    if from.as_slice() != pins.as_slice() {
+                                        match pull_grid(
+                                            &pins,
+                                            &from,
                                             w,
                                             h,
                                             XFORM_MESH_COLS,
                                             XFORM_MESH_ROWS,
-                                        )
-                                    {
-                                        self.doc.checkpoint();
-                                        self.doc.warp_layer(
-                                            self.doc.active,
-                                            XFORM_MESH_COLS,
-                                            XFORM_MESH_ROWS,
-                                            &grid,
-                                        );
-                                        self.status = "Mesh warp applied.".to_string();
+                                        ) {
+                                            Some(q) => {
+                                                self.doc.checkpoint();
+                                                self.doc.warp_layer(
+                                                    self.doc.active,
+                                                    XFORM_MESH_COLS,
+                                                    XFORM_MESH_ROWS,
+                                                    &q,
+                                                );
+                                                self.status = "Mesh warp applied.".to_string();
+                                            }
+                                            None => {
+                                                self.status =
+                                                    "Pins overlap — transform skipped.".to_string();
+                                            }
+                                        }
                                     }
                                 }
                                 XformMode::Off => {}
@@ -6721,20 +6887,14 @@ mod tests {
     }
 
     #[test]
-    fn xform_quad_tracks_dragged_corner() {
-        let quad = quad_with_drag(identity_quad(8.0, 8.0), 1, (6.0, 1.0));
-        assert_eq!(quad[1], (6.0, 1.0));
-        assert_eq!(quad[0], (0.0, 0.0));
-    }
-
-    #[test]
     fn xform_quad_identity_needs_no_apply() {
         assert!(!quad_differs_from_identity(
             identity_quad(8.0, 8.0),
             8.0,
             8.0
         ));
-        let moved = quad_with_drag(identity_quad(8.0, 8.0), 1, (6.0, 1.0));
+        let mut moved = identity_quad(8.0, 8.0);
+        moved[1] = (6.0, 1.0);
         assert!(quad_differs_from_identity(moved, 8.0, 8.0));
     }
 
@@ -6766,5 +6926,122 @@ mod tests {
         assert_eq!(s.grid.len(), 9);
         assert_eq!(s.grab, None);
         assert_eq!(s.mode, XformMode::Off);
+    }
+
+    #[test]
+    fn xform_pull_quad_identity_pins_keep_identity_quad() {
+        let quad = identity_quad(8.0, 8.0);
+        let from = quad.to_vec();
+        let solved = pull_quad(quad, &from, 8.0, 8.0).unwrap();
+        assert_eq!(solved, quad);
+    }
+
+    #[test]
+    fn xform_pull_quad_carries_content_from_to_pin() {
+        // Pin dragged from (2,2) to (4,4): the texel painted at (2,2)
+        // must show at (4,4) after the solved distort (push semantics,
+        // the drag moves content WITH the pin).
+        let mut doc = Document::new(8, 8);
+        let o = ((2 * 8 + 2) * 4) as usize;
+        doc.layers[0].pixels[o..o + 4].copy_from_slice(&[255, 0, 0, 255]);
+        let from = [(2.0, 2.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)];
+        let pins = [(4.0, 4.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)];
+        let quad = pull_quad(pins, &from, 8.0, 8.0).expect("non-degenerate pins solve");
+        doc.distort_layer(doc.active, quad);
+        let o = ((4 * 8 + 4) * 4) as usize;
+        assert_eq!(&doc.layers[0].pixels[o..o + 4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn xform_pull_quad_overlapping_pins_is_none() {
+        let pins = [(4.0, 4.0); 4];
+        assert!(pull_quad(pins, &pins.to_vec(), 8.0, 8.0).is_none());
+    }
+
+    #[test]
+    fn xform_pull_grid_identity_pins_keep_identity_grid() {
+        let grid = identity_grid(8.0, 8.0, 2, 2);
+        let solved = pull_grid(&grid, &grid, 8.0, 8.0, 2, 2).unwrap();
+        for (s, i) in solved.iter().zip(grid.iter()) {
+            assert!(
+                (s.0 - i.0).abs() < 1e-3 && (s.1 - i.1).abs() < 1e-3,
+                "{s:?} vs {i:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn xform_pull_grid_carries_content_from_to_pin() {
+        // Lattice center dragged from (4,4) to (6,4): the texel painted
+        // at (4,4) must show at (6,4) after the solved warp.
+        let mut doc = Document::new(8, 8);
+        let o = ((4 * 8 + 4) * 4) as usize;
+        doc.layers[0].pixels[o..o + 4].copy_from_slice(&[255, 0, 0, 255]);
+        let from = identity_grid(8.0, 8.0, 2, 2);
+        let mut pins = from.clone();
+        pins[4] = (6.0, 4.0);
+        let grid = pull_grid(&pins, &from, 8.0, 8.0, 2, 2).expect("non-degenerate pins solve");
+        doc.warp_layer(doc.active, 2, 2, &grid);
+        let o = ((4 * 8 + 6) * 4) as usize;
+        assert_eq!(&doc.layers[0].pixels[o..o + 4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn xform_pull_grid_collapsed_pins_is_none() {
+        let pins = vec![(4.0, 4.0); 9];
+        assert!(pull_grid(&pins, &pins, 8.0, 8.0, 2, 2).is_none());
+    }
+
+    #[test]
+    fn xform_drag_moves_pin_by_pointer_delta() {
+        let mut s = XformState::off();
+        s.arm(XformMode::Corners, 8.0, 8.0);
+        s.begin_grab(0, (0.0, 0.0));
+        s.drag_by(2.5, 3.5);
+        assert_eq!(s.quad[0], (2.5, 3.5));
+        // Every tick measures from the grab start, not the last tick:
+        // relative dragging never accumulates pointer jitter.
+        s.drag_by(1.0, 1.0);
+        assert_eq!(s.quad[0], (1.0, 1.0));
+    }
+
+    #[test]
+    fn xform_hold_without_move_keeps_pins() {
+        // Long-press fires drag_started with no movement (egui): the pin
+        // must stay put so the release gate sees "not moved" and skips.
+        let mut s = XformState::off();
+        s.arm(XformMode::Mesh, 8.0, 8.0);
+        let before = s.grid.clone();
+        s.begin_grab(4, (4.0, 4.0));
+        s.drag_by(0.0, 0.0);
+        assert_eq!(s.grid, before);
+        assert_eq!(s.grid.as_slice(), s.grab_from.as_slice());
+    }
+
+    #[test]
+    fn xform_cancel_restores_pins_from_grab() {
+        let mut s = XformState::off();
+        s.arm(XformMode::Corners, 8.0, 8.0);
+        let before = s.quad;
+        s.begin_grab(1, (7.0, 0.0));
+        s.drag_by(5.0, 5.0);
+        assert_ne!(s.quad, before);
+        s.cancel_grab();
+        assert_eq!(s.quad, before);
+        assert_eq!(s.grab, None);
+    }
+
+    #[test]
+    fn xform_arm_restores_grab_before_switching_modes() {
+        // Switching modes mid-grab restores the grabbed mode's points
+        // first (into the mode that owns them), then seeds the new mode.
+        let mut s = XformState::off();
+        s.arm(XformMode::Mesh, 8.0, 8.0);
+        s.begin_grab(4, (4.0, 4.0));
+        s.drag_by(3.0, 0.0);
+        assert_eq!(s.grid[4], (7.0, 4.0));
+        s.arm(XformMode::Corners, 8.0, 8.0);
+        assert_eq!(s.grid[4], (4.0, 4.0));
+        assert_eq!(s.quad, identity_quad(8.0, 8.0));
     }
 }

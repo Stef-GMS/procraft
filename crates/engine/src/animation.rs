@@ -159,47 +159,51 @@ pub fn next_frame(doc: &Document, index: usize) -> Option<usize> {
     ((index + 1)..doc.layers.len()).find(|&i| doc.is_layer_shown(i))
 }
 
+/// One pixel of a single-frame raster: the page background with the
+/// frame's layer composited over it (Normal blend, opacity + group
+/// opacity + reveal mask, Move offset honored, clipping intentionally
+/// ignored — a cel stands alone).
+fn frame_pixel(doc: &Document, src: Option<(&Layer, f32)>, x: u32, y: u32) -> [u8; 4] {
+    let mut out = doc.background;
+    let Some((layer, op)) = src else {
+        return out;
+    };
+    // Buffer content sits at the layer offset (Move tool).
+    let (lx, ly) = (x as i32 - layer.ox, y as i32 - layer.oy);
+    if lx < 0 || ly < 0 || lx >= doc.w as i32 || ly >= doc.h as i32 {
+        return out;
+    }
+    let o = ((ly as u32 * doc.w + lx as u32) * 4) as usize;
+    if o + 3 >= layer.pixels.len() {
+        return out;
+    }
+    let mut a = layer.pixels[o + 3] as f32 / 255.0 * op;
+    if let Some(m) = layer.mask.as_deref() {
+        a *= m.get(o / 4).copied().unwrap_or(255) as f32 / 255.0;
+    }
+    if a <= 0.0 {
+        return out;
+    }
+    for (dst, src) in out[..3].iter_mut().zip(&layer.pixels[o..o + 3]) {
+        *dst = (*src as f32 * a + *dst as f32 * (1.0 - a)).round() as u8;
+    }
+    out[3] = 255;
+    out
+}
+
 /// Render one frame: the layer (Normal blend, opacity + group opacity +
 /// reveal mask applied, clipping intentionally ignored — a cel stands
 /// alone) over the page background. Opaque RGBA out. `index` out of range renders the bare
 /// background instead of failing, so playback never panics on a racing
 /// layer delete.
 pub fn rasterize_frame(doc: &Document, index: usize) -> Vec<u8> {
-    let n = (doc.w * doc.h) as usize;
-    let mut out = vec![0u8; n * 4];
-    for px in out.as_chunks_mut::<4>().0 {
-        px.copy_from_slice(&doc.background);
-    }
-    let Some(layer) = doc.layers.get(index) else {
-        return out;
-    };
-    let op = layer.opacity.clamp(0.0, 1.0) * doc.group_opacity(index);
-    let (ox, oy) = (layer.ox, layer.oy);
+    let layer = doc.layers.get(index);
+    let src = layer.map(|l| (l, l.opacity.clamp(0.0, 1.0) * doc.group_opacity(index)));
+    let mut out = vec![0u8; (doc.w * doc.h) as usize * 4];
     for y in 0..doc.h {
         for x in 0..doc.w {
-            // Buffer content sits at the layer offset (Move tool).
-            let (lx, ly) = (x as i32 - ox, y as i32 - oy);
-            if lx < 0 || ly < 0 || lx >= doc.w as i32 || ly >= doc.h as i32 {
-                continue;
-            }
-            let o = ((ly as u32 * doc.w + lx as u32) * 4) as usize;
-            if o + 3 >= layer.pixels.len() {
-                continue;
-            }
-            let mut a = layer.pixels[o + 3] as f32 / 255.0 * op;
-            if let Some(m) = layer.mask.as_deref() {
-                a *= m.get(o / 4).copied().unwrap_or(255) as f32 / 255.0;
-            }
-            if a <= 0.0 {
-                continue;
-            }
             let d = ((y * doc.w + x) * 4) as usize;
-            out[d] = (layer.pixels[o] as f32 * a + out[d] as f32 * (1.0 - a)).round() as u8;
-            out[d + 1] =
-                (layer.pixels[o + 1] as f32 * a + out[d + 1] as f32 * (1.0 - a)).round() as u8;
-            out[d + 2] =
-                (layer.pixels[o + 2] as f32 * a + out[d + 2] as f32 * (1.0 - a)).round() as u8;
-            out[d + 3] = 255;
+            out[d..d + 4].copy_from_slice(&frame_pixel(doc, src, x, y));
         }
     }
     out
@@ -207,7 +211,8 @@ pub fn rasterize_frame(doc: &Document, index: usize) -> Vec<u8> {
 
 /// Render an inclusive canvas region of one frame (clamped), row-major
 /// RGBA — the assist-mode equivalent of `flatten_region` for partial
-/// texture uploads while painting the current frame.
+/// texture uploads while painting the current frame. Only the requested
+/// pixels are rendered: painting ticks are O(region), never O(canvas).
 pub fn rasterize_frame_region(
     doc: &Document,
     index: usize,
@@ -219,16 +224,12 @@ pub fn rasterize_frame_region(
     let x1 = x1.min(doc.w.saturating_sub(1));
     let y1 = y1.min(doc.h.saturating_sub(1));
     let (x0, y0) = (x0.min(x1), y0.min(y1));
-    let full = rasterize_frame(doc, index);
+    let layer = doc.layers.get(index);
+    let src = layer.map(|l| (l, l.opacity.clamp(0.0, 1.0) * doc.group_opacity(index)));
     let mut out = Vec::with_capacity(((x1 - x0 + 1) * (y1 - y0 + 1) * 4) as usize);
     for y in y0..=y1 {
         for x in x0..=x1 {
-            let o = ((y * doc.w + x) * 4) as usize;
-            if o + 3 < full.len() {
-                out.extend_from_slice(&full[o..o + 4]);
-            } else {
-                out.extend_from_slice(&doc.background);
-            }
+            out.extend_from_slice(&frame_pixel(doc, src, x, y));
         }
     }
     out
@@ -482,6 +483,28 @@ mod tests {
                 assert_eq!(&reg[ro..ro + 4], &full[fo..fo + 4]);
             }
         }
+    }
+
+    #[test]
+    fn frame_region_matches_full_raster_with_offset_and_opacity() {
+        let mut doc = Document::new(24, 24);
+        doc.background = [10, 20, 30, 255];
+        paint_layer(&mut doc, 0, [200, 40, 40]);
+        doc.layers[0].opacity = 0.5;
+        doc.translate_layer(0, 3, -2);
+        let full = rasterize_frame(&doc, 0);
+        let reg = rasterize_frame_region(&doc, 0, 0, 0, 23, 23);
+        assert_eq!(reg, full);
+        // Out-of-range region edges clamp to the canvas.
+        let edge = rasterize_frame_region(&doc, 0, 20, 20, 40, 40);
+        assert_eq!(edge.len(), 4 * 4 * 4);
+        for (i, px) in edge.as_chunks::<4>().0.iter().enumerate() {
+            let o = ((i / 4 + 20) * 24 + i % 4 + 20) * 4;
+            assert_eq!(px.as_slice(), &full[o..o + 4]);
+        }
+        // Out-of-range frame index: bare background, matching full raster.
+        let bare = rasterize_frame_region(&doc, 99, 5, 5, 6, 6);
+        assert_eq!(bare, vec![10, 20, 30, 255].repeat(4));
     }
 
     #[test]

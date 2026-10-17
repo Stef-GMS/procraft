@@ -2470,7 +2470,7 @@ fn brush_ring_radius(size: f32, zoom: f32) -> f32 {
     (size * zoom * 0.5).max(2.0)
 }
 
-/// Top-bar width era. Below [`PHONE_BAR_W`] the zoom/rotate/theme/About
+/// Top-bar width era. Below [`WIDE_BAR_W`] the zoom/rotate/theme/About
 /// group folds into a View menu (phone portrait starves the inline
 /// stepper to a character-wide column); mobile at/above it is Tablet
 /// (same fold, finger-sized controls); desktop stays unchanged.
@@ -2481,10 +2481,10 @@ enum BarLayout {
     Tablet,
 }
 
-const PHONE_BAR_W: f32 = 600.0;
+const WIDE_BAR_W: f32 = 600.0;
 
 fn bar_layout(width: f32, mobile: bool) -> BarLayout {
-    if width < PHONE_BAR_W {
+    if width < WIDE_BAR_W {
         BarLayout::Narrow
     } else if mobile {
         BarLayout::Tablet

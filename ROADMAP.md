@@ -41,6 +41,35 @@ people touch daily. Ranked by user-visible value per effort.
   pushed bb5c777.
 - Batch 6 remainder: 8K canvas + lazy compositing perf epic.
 
+## Batch 7 — keybinds + settings (planned 2026-10-17)
+
+- [x] **M49 — Settings persistence + keybind remap.** Done 2026-10-17
+  (`998cbce`): cross-platform `settings.json` (seed-once from legacy
+  ui.json, corrupt-file quarantine + note), Shortcuts editor (rebind
+  tools + undo/redo, exact-chord dispatch fixes Ctrl+Shift+Z), drag
+  modifiers, Shift+drag = brush size. Defaults: B brush, E eraser, F
+  fill, Ctrl+Z/Ctrl+Shift+Z undo/redo. View-verification (restart
+  restore, corrupt recovery) pending user run.
+- [ ] **M50 — Editable text layers.** Text currently bakes as a bitmap
+  stamp on the current layer. Procreate-style: vector text layer that
+  stays editable, with a Rasterize action. Scope at brainstorm
+  (largest item in this batch).
+- [ ] **Candidate — animated UI transitions + timelapse card.**
+  Discord (MAN/FMHY, 2026-10-16): "like a card with frame inside… bring
+  some animation/transition for the ui" for showcasing timelapse-from-
+  scratch. Earlier ruling: declined (perf risk); logged per user.
+- [ ] **Issue #3 — phone UI report (jawbu, Pixel 8, v0.8.5).** Icon part
+  fixed: adaptive launcher icon built from icon.svg geometry (the legacy
+  PNG was launcher-wrapped in a padded white plate); CI asserts
+  mipmap-anydpi-v26. Remaining: status-bar overlap + unpressable top
+  buttons (unreleased phone-layout commits address — retest in next
+  APK); camera punch-hole in landscape; bigger/fewer Procreate-like
+  buttons (toolbar-minimalism theme); dark mode (exists, buried in the
+  theme selector — discoverability + should persist on mobile); portrait
+  spacing stretched.
+- Close-out: Windows + iOS sideload + Android builds → next GitHub
+  release (continue the existing release series).
+
 ## Batch 1: M23–M27 (done, awaiting PC check #1)
 
 - [x] **M23 — Layer groups + group ops.** Nested model with effective

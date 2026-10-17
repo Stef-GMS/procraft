@@ -532,7 +532,16 @@ impl Shortcuts {
         for (k, v) in &s.drag {
             match DragActionId::from_key(k) {
                 Some(d) => {
-                    out.drag.insert(d, *v);
+                    // An empty set matches every plain drag — never let a
+                    // hand-edited file hijack painting.
+                    if v.is_empty() {
+                        warns.push(format!(
+                            "Drag modifier for '{}' ignored: needs at least one modifier",
+                            k
+                        ));
+                    } else {
+                        out.drag.insert(d, *v);
+                    }
                 }
                 None => warns.push(format!(
                     "Drag modifier entry '{}' ignored: unknown action",
@@ -699,5 +708,24 @@ mod tests {
             KeyChord::new(ChordKey::Num0, true, false, false).format(),
             "Ctrl+0"
         );
+    }
+
+    #[test]
+    fn stored_empty_drag_modifier_is_ignored_with_warning() {
+        // Hand-edited file: a drag with no modifiers would hijack every
+        // plain drag (matches(false, false, false) is always true).
+        let mut stored = StoredShortcuts::default();
+        stored.drag.insert(
+            DragActionId::BrushSize.to_key().to_string(),
+            ModSet {
+                ctrl: false,
+                shift: false,
+                alt: false,
+            },
+        );
+        let (s, warns) = Shortcuts::from_stored(&stored);
+        assert_eq!(s.drag_get(DragActionId::BrushSize), ModSet::SHIFT);
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("modifier"));
     }
 }

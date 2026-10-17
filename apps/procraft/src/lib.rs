@@ -378,6 +378,9 @@ fn push_recent(recent: &mut Vec<String>, path: &str) {
     recent.truncate(MAX_RECENT);
 }
 
+/// M49: cooldown before retrying a failed settings write (seconds).
+const SAVE_RETRY_SECS: f64 = 2.0;
+
 /// M49: what makes two settings snapshots differ in the discrete sense.
 /// Zoom is excluded — it coalesces through `should_flush_zoom` and gets
 /// written by its own quiet-period path.
@@ -797,6 +800,10 @@ struct ProCraftApp {
     capture: Option<ActionId>,
     settings_note: Option<String>,
     size_drag: Option<SizeDrag>,
+    /// M49: a failed-save note (shown with the settings note) and the
+    /// time of the last failed write attempt (retry cooldown).
+    save_note: Option<String>,
+    save_failed_at: Option<f64>,
     /// M49: set when this run seeded settings.json; the marker is written
     /// on the first frame (eframe's CreationContext storage is read-only).
     seed_marker_pending: bool,
@@ -996,36 +1003,47 @@ impl ProCraftApp {
             capture: None,
             settings_note: None,
             size_drag: None,
+            save_note: None,
+            save_failed_at: None,
             seed_marker_pending: false,
         };
         // M49: settings.json is the source of truth. The legacy eframe
         // keys (theme/panels/zoom/recent) are read exactly once — the
         // first run after M49 — to seed the file; the marker then makes
         // a later missing file mean "fresh defaults", never a legacy
-        // resurrection. Platforms with no settings dir stay session-only.
-        if let Some(storage) = cc.storage {
-            if let Some(dir) = app.settings_dir.clone() {
-                let marker_set = storage.get_string(crate::settings::MARKER_KEY).is_some();
-                let file_exists = crate::settings::settings_path(&dir).is_file();
-                match crate::settings::init_action(file_exists, marker_set) {
-                    crate::settings::Inits::LoadFile => match crate::settings::read(&dir) {
-                        Ok(s) => app.apply_settings(&s),
-                        Err(err) => {
-                            let backup = crate::settings::quarantine(&dir);
-                            let note = match backup {
-                                Some(p) => format!(
-                                    "Settings were unreadable ({err}); backup kept as {}.",
-                                    p.display()
-                                ),
-                                None => {
-                                    format!("Settings were unreadable ({err}); defaults used.")
-                                }
-                            };
-                            app.status = note.clone();
-                            app.settings_note = Some(note);
-                        }
-                    },
-                    crate::settings::Inits::SeedLegacy => {
+        // resurrection. Platforms with no settings dir stay session-only;
+        // platforms without eframe storage (Android/iOS) skip only the
+        // legacy migration — the file itself still loads and saves.
+        if let Some(dir) = app.settings_dir.clone() {
+            let marker_set = cc
+                .storage
+                .as_ref()
+                .is_some_and(|s| s.get_string(crate::settings::MARKER_KEY).is_some());
+            let file_exists = crate::settings::settings_path(&dir).is_file();
+            match crate::settings::init_action(file_exists, marker_set) {
+                crate::settings::Inits::LoadFile => match crate::settings::read(&dir) {
+                    Ok(s) => app.apply_settings(&s),
+                    Err(err) => {
+                        let backup = crate::settings::quarantine(&dir);
+                        let note = match backup {
+                            Some(p) => format!(
+                                "Settings were unreadable ({err}); backup kept as {}.",
+                                p.display()
+                            ),
+                            None => {
+                                format!("Settings were unreadable ({err}); defaults used.")
+                            }
+                        };
+                        app.status = note.clone();
+                        app.settings_note = Some(note);
+                    }
+                },
+                crate::settings::Inits::SeedLegacy => {
+                    // Legacy values live in eframe storage, which mobile
+                    // never provides — nothing to migrate there; the
+                    // first change still creates the file, and later
+                    // launches take the LoadFile branch.
+                    if let Some(storage) = cc.storage {
                         if let Some(name) = storage.get_string("theme") {
                             if let Some(theme) = Theme::from_str(&name) {
                                 app.theme = theme;
@@ -1064,8 +1082,8 @@ impl ProCraftApp {
                             app.seed_marker_pending = true;
                         }
                     }
-                    crate::settings::Inits::UseDefaults => {}
                 }
+                crate::settings::Inits::UseDefaults => {}
             }
         }
         // The snapshot always mirrors what the app actually holds, so
@@ -1101,8 +1119,17 @@ impl ProCraftApp {
             self.zoom = s.zoom;
         }
         self.recent = s.recent.iter().take(MAX_RECENT).cloned().collect();
-        let (shortcuts, warns) = Shortcuts::from_stored(&s.shortcuts);
+        let (shortcuts, mut warns) = Shortcuts::from_stored(&s.shortcuts);
         self.shortcuts = shortcuts;
+        if s.version > SETTINGS_VERSION {
+            warns.insert(
+                0,
+                format!(
+                    "Settings file is newer (v{}); it will be saved as v{}.",
+                    s.version, SETTINGS_VERSION
+                ),
+            );
+        }
         if !warns.is_empty() {
             self.settings_note = Some(warns.join(" "));
         }
@@ -1119,6 +1146,9 @@ impl ProCraftApp {
     /// M49: once-per-frame settings sync. Discrete edits (theme, panels,
     /// recents, shortcuts) save immediately; zoom writes coalesce and
     /// only land once `should_flush_zoom` says the pointer went quiet.
+    /// A failed write leaves the snapshot un-advanced (the edit stays
+    /// pending) and is retried after a short cooldown, so a transient
+    /// disk error never silently drops a change.
     fn settings_sync(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
         let cur = self.settings_snapshot_from_fields();
@@ -1127,25 +1157,71 @@ impl ProCraftApp {
             self.zoom_changed_at = now;
             self.settings_snapshot.zoom = cur.zoom;
         }
+        let retry_ok = match self.save_failed_at {
+            None => true,
+            Some(t) => now - t >= SAVE_RETRY_SECS,
+        };
         if settings_differ(&cur, &self.settings_snapshot) {
-            self.settings_snapshot = cur.clone();
-            let _ = self.save_settings_file(&cur);
-            self.zoom_dirty = false; // snapshot refreshed wholesale
-        } else if crate::settings::should_flush_zoom(self.zoom_dirty, self.zoom_changed_at, now) {
-            let _ = self.save_settings_file(&cur);
-            self.settings_snapshot = cur;
-            self.zoom_dirty = false;
+            if retry_ok {
+                match self.save_settings_file(&cur) {
+                    Ok(()) => {
+                        self.settings_snapshot = cur.clone();
+                        self.zoom_dirty = false; // snapshot refreshed wholesale
+                        self.save_note = None;
+                        self.save_failed_at = None;
+                    }
+                    Err(err) => {
+                        self.save_failed_at = Some(now);
+                        self.note_save_failure(err);
+                    }
+                }
+            }
+        } else if crate::settings::should_flush_zoom(self.zoom_dirty, self.zoom_changed_at, now)
+            && retry_ok
+        {
+            match self.save_settings_file(&cur) {
+                Ok(()) => {
+                    self.settings_snapshot = cur;
+                    self.zoom_dirty = false;
+                    self.save_note = None;
+                    self.save_failed_at = None;
+                }
+                Err(err) => {
+                    self.save_failed_at = Some(now);
+                    self.note_save_failure(err);
+                }
+            }
         }
     }
 
+    /// M49: surface a failed settings write once via the status line and
+    /// the settings note; the edit stays pending and is retried.
+    fn note_save_failure(&mut self, err: String) {
+        let note = format!("Couldn't save settings ({err}); will retry.");
+        if self.save_note.is_none() {
+            self.status = note.clone();
+        }
+        self.save_note = Some(note);
+    }
+
     /// M49: flush immediately when anything is pending (clean exit and
-    /// iOS backgrounding — no timing gate here).
+    /// iOS backgrounding — no timing gate here). A failure keeps the
+    /// edit pending so the next frame re-attempts it.
     fn flush_settings_now(&mut self) {
         let cur = self.settings_snapshot_from_fields();
         if settings_differ(&cur, &self.settings_snapshot) || self.zoom_dirty {
-            self.zoom_dirty = false;
-            self.settings_snapshot = cur.clone();
-            let _ = self.save_settings_file(&cur);
+            match self.save_settings_file(&cur) {
+                Ok(()) => {
+                    self.settings_snapshot = cur;
+                    self.zoom_dirty = false;
+                    self.save_note = None;
+                    self.save_failed_at = None;
+                }
+                Err(err) => {
+                    self.save_failed_at = None; // retry promptly next frame
+                    self.note_save_failure(err);
+                }
+            }
         }
     }
 
@@ -1188,6 +1264,11 @@ impl ProCraftApp {
     /// the chord (or cancels / clears). Runs before the dispatcher so the
     /// editor never triggers the action it is editing.
     fn handle_capture(&mut self, ctx: &egui::Context) {
+        if self.capture.is_some() && !self.show_shortcuts {
+            // Closing the editor disarms capture — keys must never stay
+            // hijacked by an invisible window.
+            self.capture = None;
+        }
         let Some(action) = self.capture else {
             return;
         };
@@ -1259,8 +1340,10 @@ impl ProCraftApp {
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
-                if let Some(note) = &self.settings_note {
+                for note in [&self.save_note, &self.settings_note].into_iter().flatten() {
                     ui.colored_label(egui::Color32::from_rgb(200, 120, 40), note);
+                }
+                if self.save_note.is_some() || self.settings_note.is_some() {
                     ui.separator();
                 }
                 ui.label("Click a binding, then press the keys you want.");
@@ -3271,8 +3354,9 @@ impl eframe::App for ProCraftApp {
         }
         // M49: the seed marker lands here — eframe 0.36's
         // `CreationContext::storage` is read-only, `Frame::storage_mut`
-        // is the writable handle (None on mobile: markers are desktop-only
-        // and mobile re-reads the settings file every launch anyway).
+        // is the writable handle (None on mobile: the marker never
+        // exists there, but a file, once created, always takes the
+        // LoadFile branch, so mobile restore works regardless).
         if self.seed_marker_pending {
             if let Some(storage) = frame.storage_mut() {
                 storage.set_string(crate::settings::MARKER_KEY, "1".to_string());

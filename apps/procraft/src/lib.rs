@@ -2493,10 +2493,10 @@ fn bar_layout(width: f32, mobile: bool) -> BarLayout {
     }
 }
 
-/// Android status-bar padding: JNI px clamped so a wild value can never
-/// eat the screen. Only the Android call site uses it (host builds cover
-/// it through tests).
-#[cfg(any(target_os = "android", test))]
+/// Mobile edge padding (Android status-bar px / iOS safe-area points)
+/// clamped so a wild value can never eat the screen. Host builds cover it
+/// through tests.
+#[cfg(any(target_os = "android", target_os = "ios", test))]
 fn clamp_status_inset(px: u32) -> f32 {
     (px as f32).clamp(0.0, 200.0)
 }
@@ -3607,6 +3607,17 @@ impl eframe::App for ProCraftApp {
                 }
                 if self.android_inset_top > 0.0 {
                     ui.add_space(self.android_inset_top);
+                }
+            }
+            // Same edge-to-edge story on iOS: the wgpu surface draws under
+            // the status bar and notch, so pad by the window's safe-area
+            // top (read per frame; rotations change it).
+            #[cfg(target_os = "ios")]
+            {
+                let (top, _) = rfd::ios_safe_area_insets().unwrap_or((0, 0));
+                let pad = clamp_status_inset(top);
+                if pad > 0.0 {
+                    ui.add_space(pad);
                 }
             }
             let layout = bar_layout(
@@ -6425,6 +6436,15 @@ impl eframe::App for ProCraftApp {
 
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.label(&self.status);
+            // iOS: lift the label clear of the home indicator.
+            #[cfg(target_os = "ios")]
+            {
+                let (_, bottom) = rfd::ios_safe_area_insets().unwrap_or((0, 0));
+                let pad = clamp_status_inset(bottom);
+                if pad > 0.0 {
+                    ui.add_space(pad);
+                }
+            }
         });
 
         egui::CentralPanel::default().show(ui, |ui| {

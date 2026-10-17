@@ -134,6 +134,14 @@ pub fn android_status_bar_height() -> Result<u32, &'static str> {
     android_bridge::status_bar_height()
 }
 
+/// Window safe-area insets (top, bottom) in points (call per frame; a cheap
+/// property read, correct across rotation). iOS only; errors carry the
+/// reason, callers fall back to 0.
+#[cfg(target_os = "ios")]
+pub fn ios_safe_area_insets() -> Result<(u32, u32), &'static str> {
+    ios_bridge::safe_area_insets()
+}
+
 /// Timestamped stem so saves never silently overwrite.
 #[cfg(any(target_os = "ios", target_os = "android"))]
 fn unique_stem() -> String {

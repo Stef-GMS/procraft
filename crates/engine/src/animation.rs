@@ -504,7 +504,7 @@ mod tests {
         }
         // Out-of-range frame index: bare background, matching full raster.
         let bare = rasterize_frame_region(&doc, 99, 5, 5, 6, 6);
-        assert_eq!(bare, vec![10, 20, 30, 255].repeat(4));
+        assert_eq!(bare, [10, 20, 30, 255].repeat(4));
     }
 
     #[test]

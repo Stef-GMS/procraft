@@ -7463,7 +7463,7 @@ mod tests {
     #[test]
     fn xform_pull_quad_overlapping_pins_is_none() {
         let pins = [(4.0, 4.0); 4];
-        assert!(pull_quad(pins, &pins.to_vec(), 8.0, 8.0).is_none());
+        assert!(pull_quad(pins, &pins, 8.0, 8.0).is_none());
     }
 
     #[test]

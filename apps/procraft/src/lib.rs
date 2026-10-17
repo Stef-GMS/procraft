@@ -408,6 +408,9 @@ struct ProCraftApp {
     // on every stroke start so strokes never inherit the last line's tail.
     smooth_pt: Option<(f32, f32)>,
     smooth_pressure: f32,
+    // Midpoint-smoothed stroke path: rounds the corners between sparse
+    // input samples so fast strokes ink as curves, not chords.
+    stroke_curve: StrokeCurve,
     sel_anchor: Option<(f32, f32)>,
     sel_current: Option<(f32, f32)>,
     /// Drag-crop state: the live drag plus the committed rect (inclusive
@@ -504,6 +507,9 @@ struct ProCraftApp {
     sym_grab: bool,
     /// M48 transform handles: on-canvas corner pins / warp lattice.
     xform: XformState,
+    /// Transform-layer button session (Scale/rotate/flip without
+    /// compounding resampling).
+    tform_press: TformPress,
     assist: bool,
     assist_start: Option<(f32, f32)>,
     assist_lock: Option<AssistLine>,
@@ -630,6 +636,7 @@ impl ProCraftApp {
             leftover: 0.0,
             smooth_pt: None,
             smooth_pressure: 1.0,
+            stroke_curve: StrokeCurve::new(),
             sel_anchor: None,
             sel_current: None,
             crop_anchor: None,
@@ -703,6 +710,7 @@ impl ProCraftApp {
             sym_move: false,
             sym_grab: false,
             xform: XformState::off(),
+            tform_press: TformPress::new(),
             assist: false,
             assist_start: None,
             assist_lock: None,
@@ -1481,6 +1489,8 @@ impl ProCraftApp {
         // M48 pins are canvas-sized state: a new/resized canvas
         // invalidates them (they were seeded at the old dimensions).
         self.xform = XformState::off();
+        // Same for the Transform-layer button session base.
+        self.tform_press = TformPress::new();
         self.canvas_sync = (self.doc.w, self.doc.h);
         self.canvas_w = self.doc.w;
         self.canvas_h = self.doc.h;
@@ -2266,6 +2276,180 @@ impl XformState {
     }
 }
 
+/// One Transform-layer panel press.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TformOp {
+    Scale(f32),
+    /// Rotation in degrees (engine convention, matches `affine_layer`).
+    Rotate(f32),
+    FlipH,
+    FlipV,
+}
+
+/// Session base for the Transform-layer buttons: the layer's pixels and
+/// mask as they were when the session's first press happened. Presses
+/// compose here and re-apply from this base, so mashing Scale/rotate/flip
+/// never compounds resampling blur (each press stays one undo step).
+/// Re-captured whenever the document changes behind it (painting, undo,
+/// pin drags) so sessions never fight each other.
+struct TformBase {
+    pixels: Vec<u8>,
+    mask: Option<Vec<u8>>,
+    layer: usize,
+    rev: u64,
+    ox: i32,
+    oy: i32,
+}
+
+/// Transform-layer button session state (see [`TformBase`]).
+struct TformPress {
+    base: Option<TformBase>,
+    /// Cumulative uniform scale about the content center.
+    scale: f32,
+    /// Cumulative rotation in degrees.
+    degrees: f32,
+    flip_h: bool,
+    flip_v: bool,
+}
+
+impl TformPress {
+    fn new() -> Self {
+        Self {
+            base: None,
+            scale: 1.0,
+            degrees: 0.0,
+            flip_h: false,
+            flip_v: false,
+        }
+    }
+}
+
+/// Exact in-place horizontal mirror of a `w`x`h` buffer, `stride` bytes
+/// per cell (4 for RGBA pixels, 1 for masks), about the canvas center.
+fn flip_buf_h(buf: &mut [u8], w: usize, h: usize, stride: usize) {
+    if w == 0 || buf.len() != w * h * stride {
+        return;
+    }
+    for y in 0..h {
+        for x in 0..w / 2 {
+            for k in 0..stride {
+                buf.swap(
+                    y * w * stride + x * stride + k,
+                    y * w * stride + (w - 1 - x) * stride + k,
+                );
+            }
+        }
+    }
+}
+
+/// Exact in-place vertical mirror about the canvas center.
+fn flip_buf_v(buf: &mut [u8], w: usize, h: usize, stride: usize) {
+    let row = w * stride;
+    if w == 0 || buf.len() != row * h {
+        return;
+    }
+    for y in 0..h / 2 {
+        let a = y * row;
+        let b = (h - 1 - y) * row;
+        for k in 0..row {
+            buf.swap(a + k, b + k);
+        }
+    }
+}
+
+/// Apply one Transform-layer press: compose it onto the session and
+/// re-apply everything from the pristine base in a single pass. Flips
+/// are exact pixel permutations; scale/rotation reuse
+/// [`Document::affine_layer`], whose quarter turns stay lossless.
+fn tform_button(doc: &mut Document, t: &mut TformPress, op: TformOp) -> XformApply {
+    let active = doc.active;
+    let stale = match t.base.as_ref() {
+        None => true,
+        Some(b) => {
+            b.layer != active
+                || b.rev != doc.revision()
+                || b.pixels.len() != doc.layers[active].pixels.len()
+        }
+    };
+    if stale {
+        let layer = &doc.layers[active];
+        t.base = Some(TformBase {
+            pixels: layer.pixels.clone(),
+            mask: layer.mask.clone(),
+            layer: active,
+            rev: doc.revision(),
+            ox: layer.ox,
+            oy: layer.oy,
+        });
+        t.scale = 1.0;
+        t.degrees = 0.0;
+        t.flip_h = false;
+        t.flip_v = false;
+    }
+    // Compose the press onto the session transform (T' = op o T). Flips
+    // conjugate rotations (Fx R(a) Fx = R(-a)), hence the negations.
+    match op {
+        TformOp::Scale(f) => t.scale *= f,
+        TformOp::Rotate(deg) => t.degrees += deg,
+        TformOp::FlipH => {
+            t.degrees = -t.degrees;
+            t.flip_h = !t.flip_h;
+        }
+        TformOp::FlipV => {
+            t.degrees = -t.degrees;
+            t.flip_v = !t.flip_v;
+        }
+    }
+    if (t.scale - 1.0).abs() < 1e-4 && t.degrees.abs() < 1e-2 && !t.flip_h && !t.flip_v {
+        // Composed back to identity (e.g. plus 15 then minus 15): hand
+        // back the pristine pixels.
+        {
+            let b = t.base.as_ref().expect("base captured above");
+            let layer = &mut doc.layers[active];
+            layer.pixels.clone_from(&b.pixels);
+            layer.mask.clone_from(&b.mask);
+            layer.ox = b.ox;
+            layer.oy = b.oy;
+        }
+        doc.mark_full_dirty();
+        if let Some(b) = t.base.as_mut() {
+            b.rev = doc.revision();
+        }
+        return XformApply::Restored;
+    }
+    doc.checkpoint();
+    // Swap the pristine base in (offsets included), apply the flips as
+    // exact permutations, then the scale/rotation resample over it.
+    let (w, h) = (doc.w as usize, doc.h as usize);
+    {
+        let b = t.base.as_ref().expect("base captured above");
+        let layer = &mut doc.layers[active];
+        layer.pixels.clone_from(&b.pixels);
+        layer.mask.clone_from(&b.mask);
+        layer.ox = b.ox;
+        layer.oy = b.oy;
+        if t.flip_h {
+            flip_buf_h(&mut layer.pixels, w, h, 4);
+            if let Some(m) = layer.mask.as_mut() {
+                flip_buf_h(m, w, h, 1);
+            }
+            layer.ox = -layer.ox;
+        }
+        if t.flip_v {
+            flip_buf_v(&mut layer.pixels, w, h, 4);
+            if let Some(m) = layer.mask.as_mut() {
+                flip_buf_v(m, w, h, 1);
+            }
+            layer.oy = -layer.oy;
+        }
+    }
+    doc.affine_layer(active, t.scale, t.degrees);
+    if let Some(b) = t.base.as_mut() {
+        b.rev = doc.revision();
+    }
+    XformApply::Applied
+}
+
 /// Per-point stabilizer coefficient for an `n`-point input trail: applying
 /// it `n` times composes to the same per-frame convergence as one step of
 /// `a` (the single-step coefficient), so trail stamping never changes the
@@ -2275,6 +2459,74 @@ fn stabilizer_substep(a: f32, n: usize) -> f32 {
         return a;
     }
     1.0 - (1.0 - a).powf(1.0 / n as f32)
+}
+
+/// Quadratic piece to stamp: (start, control, end).
+type StrokePiece = ((f32, f32), (f32, f32), (f32, f32));
+
+/// Midpoint-smoothed stroke path (classic quadratic smoothing): stamps a
+/// curve through the midpoints of consecutive input samples, each sample
+/// as the control point, so sparse samples (60 Hz vsync cap, OS mouse
+/// coalescing) still ink as curves instead of chords. The pen trails the
+/// raw pointer by half a sample and never overshoots it.
+struct StrokeCurve {
+    /// Last emitted curve position; None until the stroke's first point.
+    e: Option<(f32, f32)>,
+    /// Last raw input point.
+    b: (f32, f32),
+}
+
+impl StrokeCurve {
+    fn new() -> Self {
+        Self {
+            e: None,
+            b: (0.0, 0.0),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.e = None;
+    }
+
+    /// Feed the next raw point; returns the quadratic piece (start,
+    /// control, end) to stamp. None for the first point of a stroke
+    /// (that one stamps a plain dab).
+    fn push(&mut self, c: (f32, f32)) -> Option<StrokePiece> {
+        let piece = self.e.map(|e| (e, self.b, stroke_mid(self.b, c)));
+        self.e = Some(match piece {
+            Some((_, _, m)) => m,
+            None => c,
+        });
+        self.b = c;
+        piece
+    }
+
+    /// Stroke end: the tail from the cursor to the last raw point (there
+    /// is no later sample to curve through). Resets the cursor so the
+    /// next stroke starts with a dab again.
+    fn finish(&mut self) -> Option<((f32, f32), (f32, f32))> {
+        let e = self.e.take()?;
+        Some((e, self.b))
+    }
+}
+
+fn stroke_mid(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
+    ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5)
+}
+
+/// Point on the quadratic Bezier `p0 -> c -> p1` at `t` in `0..=1`.
+fn stroke_quad_pt(p0: (f32, f32), c: (f32, f32), p1: (f32, f32), t: f32) -> (f32, f32) {
+    let u = 1.0 - t;
+    (
+        u * u * p0.0 + 2.0 * u * t * c.0 + t * t * p1.0,
+        u * u * p0.1 + 2.0 * u * t * c.1 + t * t * p1.1,
+    )
+}
+
+/// Linear sub-steps to stamp a curve piece of `len` px: one per ~4 px so
+/// each stamped sub-step is visually straight; capped for giant jumps.
+fn stroke_steps(len: f32) -> usize {
+    (len / 4.0).ceil().clamp(1.0, 64.0) as usize
 }
 
 /// Textured quad for a rotated canvas view: `corners` are TL, TR, BR, BL
@@ -4996,14 +5248,23 @@ impl eframe::App for ProCraftApp {
                     }
                     ui.separator();
                     ui.heading("Transform layer");
+                    // Buttons compose into one session that always
+                    // re-applies from the pristine base (see tform_button):
+                    // mashing them never compounds resampling blur.
                     ui.horizontal(|ui| {
                         if ui.button("Scale +").clicked() {
-                            self.doc.checkpoint();
-                            self.doc.affine_layer(self.doc.active, 1.25, 0.0);
+                            tform_button(
+                                &mut self.doc,
+                                &mut self.tform_press,
+                                TformOp::Scale(1.25),
+                            );
                         }
                         if ui.button("Scale −").clicked() {
-                            self.doc.checkpoint();
-                            self.doc.affine_layer(self.doc.active, 1.0 / 1.25, 0.0);
+                            tform_button(
+                                &mut self.doc,
+                                &mut self.tform_press,
+                                TformOp::Scale(1.0 / 1.25),
+                            );
                         }
                     });
                     ui.horizontal(|ui| {
@@ -5015,8 +5276,11 @@ impl eframe::App for ProCraftApp {
                             })
                             .clicked()
                         {
-                            self.doc.checkpoint();
-                            self.doc.affine_layer(self.doc.active, 1.0, -15.0);
+                            tform_button(
+                                &mut self.doc,
+                                &mut self.tform_press,
+                                TformOp::Rotate(-15.0),
+                            );
                         }
                         if ui
                             .button(if self.has_symbols {
@@ -5026,20 +5290,37 @@ impl eframe::App for ProCraftApp {
                             })
                             .clicked()
                         {
-                            self.doc.checkpoint();
-                            self.doc.affine_layer(self.doc.active, 1.0, 15.0);
+                            tform_button(
+                                &mut self.doc,
+                                &mut self.tform_press,
+                                TformOp::Rotate(15.0),
+                            );
                         }
                     });
                     ui.horizontal(|ui| {
                         if ui.button("Flip H").clicked() {
-                            self.doc.checkpoint();
-                            self.doc.flip_layer_horizontal(self.doc.active);
-                            self.status = "Layer flipped horizontally.".to_string();
+                            self.status = match tform_button(
+                                &mut self.doc,
+                                &mut self.tform_press,
+                                TformOp::FlipH,
+                            ) {
+                                XformApply::Restored => {
+                                    "Layer flip reset (back to the session start).".to_string()
+                                }
+                                _ => "Layer flipped horizontally.".to_string(),
+                            };
                         }
                         if ui.button("Flip V").clicked() {
-                            self.doc.checkpoint();
-                            self.doc.flip_layer_vertical(self.doc.active);
-                            self.status = "Layer flipped vertically.".to_string();
+                            self.status = match tform_button(
+                                &mut self.doc,
+                                &mut self.tform_press,
+                                TformOp::FlipV,
+                            ) {
+                                XformApply::Restored => {
+                                    "Layer flip reset (back to the session start).".to_string()
+                                }
+                                _ => "Layer flipped vertically.".to_string(),
+                            };
                         }
                     });
                     // M48 transform handles: arm corner pins or the warp
@@ -5572,6 +5853,7 @@ impl eframe::App for ProCraftApp {
                 self.painting = false;
                 self.last = None;
                 self.smooth_pt = None;
+                self.stroke_curve.reset();
                 self.assist_start = None;
                 self.assist_lock = None;
                 self.sel_anchor = None;
@@ -6752,6 +7034,40 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                     if resp.drag_stopped() {
+                        if self.painting {
+                            // Finish the smoothed path: its last tail (from
+                            // the curve cursor to the final sample) was
+                            // never stamped, there is no later point to
+                            // curve through.
+                            if let Some((from, to)) = self.stroke_curve.finish() {
+                                if self.last.is_some() {
+                                    let brush = self.base_brush();
+                                    let color = self.current_color();
+                                    let len =
+                                        ((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt();
+                                    let steps = stroke_steps(len);
+                                    for k in 1..=steps {
+                                        let t = k as f32 / steps as f32;
+                                        let p = (
+                                            from.0 + (to.0 - from.0) * t,
+                                            from.1 + (to.1 - from.1) * t,
+                                        );
+                                        let (last, leftover) = self.doc.stroke_to_dyn(
+                                            &brush,
+                                            color,
+                                            self.last,
+                                            self.last_dyn,
+                                            p,
+                                            self.last_dyn,
+                                            self.leftover,
+                                        );
+                                        self.last = last;
+                                        self.leftover = leftover;
+                                    }
+                                    self.stroke_painted = true;
+                                }
+                            }
+                        }
                         if self.stroke_painted {
                             self.stroke_painted = false;
                             self.capture_timelapse();
@@ -6776,6 +7092,7 @@ impl eframe::App for ProCraftApp {
                     self.last_dyn = DabDynamics::default();
                     self.leftover = 0.0;
                     self.smooth_pt = None;
+                    self.stroke_curve.reset();
                     self.smooth_pressure = 1.0;
                     self.last_t = ctx.input(|i| i.time);
                     // Drawing Assist: remember the stroke start; the lock
@@ -6893,18 +7210,46 @@ impl eframe::App for ProCraftApp {
                                 angle,
                             };
                             let color = self.current_color();
-                            let (last, leftover) = self.doc.stroke_to_dyn(
-                                &brush,
-                                color,
-                                self.last,
-                                from_dyn,
-                                (sx, sy),
-                                to_dyn,
-                                self.leftover,
-                            );
-                            self.last = last;
+                            // Ink the smoothed path (see StrokeCurve): the
+                            // stroke's first point lands a dab, every later
+                            // point stamps its curved piece in short linear
+                            // steps so sparse samples still draw curves.
+                            match self.stroke_curve.push((sx, sy)) {
+                                None => {
+                                    let (last, leftover) = self.doc.stroke_to_dyn(
+                                        &brush,
+                                        color,
+                                        self.last,
+                                        from_dyn,
+                                        (sx, sy),
+                                        to_dyn,
+                                        self.leftover,
+                                    );
+                                    self.last = last;
+                                    self.leftover = leftover;
+                                }
+                                Some((p0, ctrl, p1)) => {
+                                    let piece =
+                                        ((p1.0 - p0.0).powi(2) + (p1.1 - p0.1).powi(2)).sqrt();
+                                    let steps = stroke_steps(piece);
+                                    for k in 1..=steps {
+                                        let t = k as f32 / steps as f32;
+                                        let (px, py) = stroke_quad_pt(p0, ctrl, p1, t);
+                                        let (last, leftover) = self.doc.stroke_to_dyn(
+                                            &brush,
+                                            color,
+                                            self.last,
+                                            from_dyn,
+                                            (px, py),
+                                            to_dyn,
+                                            self.leftover,
+                                        );
+                                        self.last = last;
+                                        self.leftover = leftover;
+                                    }
+                                }
+                            }
                             self.last_dyn = to_dyn;
-                            self.leftover = leftover;
                             self.stroke_painted = true;
                         }
                     }
@@ -7372,5 +7717,158 @@ mod tests {
         );
         // The edit was baked into the re-captured base and survives.
         assert!(doc.layers[0].pixels.chunks(4).any(|p| p[1] >= 100));
+    }
+
+    // --- Midpoint-smoothed stroke path (chord corners -> curves) ---
+
+    #[test]
+    fn stroke_curve_starts_with_dab_then_curves() {
+        let mut c = StrokeCurve::new();
+        assert!(c.push((1.0, 2.0)).is_none()); // first point: dab only
+        let (p0, ctrl, p1) = c.push((5.0, 2.0)).unwrap();
+        assert_eq!(p0, (1.0, 2.0));
+        assert_eq!(ctrl, (1.0, 2.0)); // degenerate control -> line
+        assert_eq!(p1, (3.0, 2.0)); // midpoint of the first pair
+        let (p0, ctrl, p1) = c.push((5.0, 6.0)).unwrap();
+        assert_eq!(p0, (3.0, 2.0));
+        assert_eq!(ctrl, (5.0, 2.0));
+        assert_eq!(p1, (5.0, 4.0));
+    }
+
+    #[test]
+    fn stroke_curve_rounds_corners_without_overshoot() {
+        // A right-angle sample corner: the smoothed path must leave the
+        // corner (cut inside the bend), never bulge past the samples.
+        let mut c = StrokeCurve::new();
+        assert!(c.push((0.0, 0.0)).is_none());
+        assert!(c.push((10.0, 0.0)).is_some());
+        let (p0, ctrl, p1) = c.push((10.0, 10.0)).unwrap();
+        let m = stroke_quad_pt(p0, ctrl, p1, 0.5);
+        let d = ((m.0 - 10.0).powi(2) + m.1.powi(2)).sqrt();
+        assert!(d > 1.0, "curve should cut the corner (d={d})");
+        assert!(m.0 <= 10.0 && m.1 >= 0.0); // stays inside the samples
+    }
+
+    #[test]
+    fn stroke_curve_finish_flushes_the_tail_once() {
+        let mut c = StrokeCurve::new();
+        assert!(c.push((0.0, 0.0)).is_none());
+        assert!(c.push((8.0, 0.0)).is_some());
+        assert_eq!(c.finish(), Some(((4.0, 0.0), (8.0, 0.0))));
+        assert_eq!(c.finish(), None);
+        // A new stroke starts fresh with a dab again.
+        assert!(c.push((2.0, 2.0)).is_none());
+    }
+
+    #[test]
+    fn stroke_steps_densify_long_pieces() {
+        assert_eq!(stroke_steps(0.0), 1);
+        assert_eq!(stroke_steps(3.9), 1);
+        assert_eq!(stroke_steps(4.1), 2);
+        assert_eq!(stroke_steps(10.0), 3);
+        assert_eq!(stroke_steps(1.0e6), 64);
+    }
+
+    // --- Transform-layer button session (Scale/rotate/flip) ---
+
+    /// 8x8 layer with an off-center 3x3 red square plus a lone marker
+    /// pixel at (6,6): every flip/rotate/scale visibly moves something.
+    fn tform_doc() -> Document {
+        let mut doc = Document::new(8, 8);
+        let l = &mut doc.layers[0];
+        l.pixels = vec![0u8; 8 * 8 * 4];
+        for y in 2..5 {
+            for x in 2..5 {
+                let i = (y * 8 + x) * 4;
+                l.pixels[i] = 255;
+                l.pixels[i + 3] = 255;
+            }
+        }
+        let i = (6 * 8 + 6) * 4;
+        l.pixels[i] = 255;
+        l.pixels[i + 3] = 255;
+        doc
+    }
+
+    #[test]
+    fn tform_scale_presses_compose_without_compounding() {
+        // Two Scale(+25%) presses must equal one 1.25^2 press: every
+        // press re-applies from the base, never from the previous result.
+        let mut a = tform_doc();
+        let mut b = tform_doc();
+        let mut ta = TformPress::new();
+        let mut tb = TformPress::new();
+        assert_eq!(
+            tform_button(&mut a, &mut ta, TformOp::Scale(1.25)),
+            XformApply::Applied
+        );
+        assert_eq!(
+            tform_button(&mut a, &mut ta, TformOp::Scale(1.25)),
+            XformApply::Applied
+        );
+        assert_eq!(
+            tform_button(&mut b, &mut tb, TformOp::Scale(1.5625)),
+            XformApply::Applied
+        );
+        assert_eq!(a.layers[0].pixels, b.layers[0].pixels);
+    }
+
+    #[test]
+    fn tform_rotate_pair_restores_pristine() {
+        let mut doc = tform_doc();
+        let pristine = doc.layers[0].pixels.clone();
+        let mut t = TformPress::new();
+        assert_eq!(
+            tform_button(&mut doc, &mut t, TformOp::Rotate(-15.0)),
+            XformApply::Applied
+        );
+        assert_ne!(doc.layers[0].pixels, pristine);
+        assert_eq!(
+            tform_button(&mut doc, &mut t, TformOp::Rotate(15.0)),
+            XformApply::Restored
+        );
+        assert_eq!(doc.layers[0].pixels, pristine);
+    }
+
+    #[test]
+    fn tform_flip_pair_restores_pristine_and_permutes_exactly() {
+        let mut doc = tform_doc();
+        let pristine = doc.layers[0].pixels.clone();
+        let mut t = TformPress::new();
+        assert_eq!(
+            tform_button(&mut doc, &mut t, TformOp::FlipH),
+            XformApply::Applied
+        );
+        assert_ne!(doc.layers[0].pixels, pristine);
+        // Exact permutation about the canvas center: the marker at (6,6)
+        // lands on (1,6) with no resampling.
+        assert_eq!(xform_alpha(&doc, 1, 6), 255);
+        assert_eq!(xform_alpha(&doc, 6, 6), 0);
+        assert_eq!(
+            tform_button(&mut doc, &mut t, TformOp::FlipH),
+            XformApply::Restored
+        );
+        assert_eq!(doc.layers[0].pixels, pristine);
+    }
+
+    #[test]
+    fn tform_external_change_recaptures_base() {
+        let mut doc = tform_doc();
+        let mut t = TformPress::new();
+        assert_eq!(
+            tform_button(&mut doc, &mut t, TformOp::Scale(1.25)),
+            XformApply::Applied
+        );
+        // Something else edits the canvas behind the session's back.
+        let i = ((8 + 1) * 4) as usize; // (1,1)
+        doc.layers[0].pixels[i + 1] = 200;
+        doc.layers[0].pixels[i + 3] = 255;
+        doc.mark_full_dirty();
+        assert_eq!(
+            tform_button(&mut doc, &mut t, TformOp::Scale(1.25)),
+            XformApply::Applied
+        );
+        // The edit was baked into the re-captured base and survives.
+        assert!(doc.layers[0].pixels.chunks(4).any(|p| p[1] > 0));
     }
 }

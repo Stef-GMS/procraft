@@ -981,12 +981,15 @@ impl Document {
     }
 
     /// Re-seat the canvas: the old canvas lands at `(dx, dy)` in the new
-    /// `new_w` x `new_h` canvas. Buffers are reallocated and copied at
-    /// identical buffer coordinates while the layer offsets absorb the
-    /// shift, so every canvas pixel keeps reading its old buffer cell and
-    /// off-canvas tails survive wherever the new buffer still holds them.
-    /// New areas start transparent; anything outside the new canvas is
-    /// trimmed. Crop is this with `dx = -x0`, `dy = -y0`. Clears
+    /// `new_w` x `new_h` canvas. Buffers are reallocated and copied with
+    /// the shift baked in — each layer's buffer moves by the canvas shift
+    /// minus its own offset, and the offset re-bases to 0 — so every canvas
+    /// pixel keeps its old content and no visible pixel is lost. (Keeping
+    /// buffer cells at identical indices while shifting the offset used to
+    /// blank the trailing columns/rows of a leading-edge trim: the new
+    /// canvas reads a window shifted by the crop, which the copy never
+    /// touched.) New areas start transparent; anything outside the new
+    /// canvas is trimmed. Crop is this with `dx = -x0`, `dy = -y0`. Clears
     /// undo/redo: old pixel snapshots no longer match the buffer size
     /// (same precedent as [`Self::load_background`]).
     pub fn rehome_canvas(
@@ -1004,30 +1007,55 @@ impl Document {
         if new_w == self.w && new_h == self.h && dx == 0 && dy == 0 {
             return Ok(());
         }
-        // Top-left-aligned overlapping copy; short/corrupt sources read as
-        // transparent instead of panicking (the invariant is w*h*bpp, but a
-        // crop must never be the place that finds out otherwise).
-        fn carry(buf: &[u8], old_w: u32, old_h: u32, new_w: u32, new_h: u32, bpp: u32) -> Vec<u8> {
+        // Overlapping copy with a content shift: new cell `(x, y)` reads old
+        // cell `(x + sx, y + sy)`, so the pixels move by the canvas re-seat
+        // minus the layer's own offset (which then re-bases to 0). Cells the
+        // shifted window never covers stay transparent; short/corrupt
+        // sources read as transparent instead of panicking (the invariant is
+        // w*h*bpp, but a crop must never be the place that finds out
+        // otherwise).
+        #[allow(clippy::too_many_arguments)]
+        fn carry(
+            buf: &[u8],
+            old_w: u32,
+            old_h: u32,
+            new_w: u32,
+            new_h: u32,
+            bpp: u32,
+            sx: i32,
+            sy: i32,
+        ) -> Vec<u8> {
             let mut out = vec![0u8; (new_w * new_h * bpp) as usize];
-            let cw = old_w.min(new_w);
-            let ch = old_h.min(new_h);
-            for y in 0..ch {
-                let src = ((y * old_w) * bpp) as usize;
-                let dst = ((y * new_w) * bpp) as usize;
-                let n = (cw * bpp) as usize;
+            let x0 = (-sx).max(0) as u32;
+            let x1 = new_w.min((old_w as i32 - sx).max(0) as u32);
+            if x1 <= x0 {
+                return out;
+            }
+            let n = ((x1 - x0) * bpp) as usize;
+            let src_x = (x0 as i32 + sx) as u32;
+            for y in 0..new_h {
+                let src_y = y as i32 + sy;
+                if src_y < 0 || src_y as u32 >= old_h {
+                    continue;
+                }
+                let src = ((src_y as u32 * old_w + src_x) * bpp) as usize;
+                let dst = ((y * new_w + x0) * bpp) as usize;
                 let chunk = buf.get(src..src + n).unwrap_or(&[]);
-                out[dst..dst + chunk.len()].copy_from_slice(chunk);
+                if let Some(slot) = out.get_mut(dst..dst + chunk.len()) {
+                    slot.copy_from_slice(chunk);
+                }
             }
             out
         }
         let (old_w, old_h) = (self.w, self.h);
         for layer in self.layers.iter_mut() {
-            layer.pixels = carry(&layer.pixels, old_w, old_h, new_w, new_h, 4);
+            let (sx, sy) = (-dx - layer.ox, -dy - layer.oy);
+            layer.pixels = carry(&layer.pixels, old_w, old_h, new_w, new_h, 4, sx, sy);
             if let Some(m) = layer.mask.take() {
-                layer.mask = Some(carry(&m, old_w, old_h, new_w, new_h, 1));
+                layer.mask = Some(carry(&m, old_w, old_h, new_w, new_h, 1, sx, sy));
             }
-            layer.ox = (layer.ox + dx).clamp(-16384, 16384);
-            layer.oy = (layer.oy + dy).clamp(-16384, 16384);
+            layer.ox = 0;
+            layer.oy = 0;
             // A text block's anchor is in canvas pixels: it rides the same
             // shift (pixels need no rerender — the buffer cell and the
             // anchor both move by the same delta).
@@ -1037,7 +1065,7 @@ impl Document {
             }
         }
         if let Some(sm) = self.selection_mask.take() {
-            self.selection_mask = Some(carry(&sm, old_w, old_h, new_w, new_h, 1));
+            self.selection_mask = Some(carry(&sm, old_w, old_h, new_w, new_h, 1, -dx, -dy));
         }
         // Rect selection rides along; drops when fully outside.
         if let Some((x0, y0, x1, y1)) = self.selection {
@@ -1070,9 +1098,9 @@ impl Document {
     }
 
     /// Crop to the inclusive rect: content inside keeps its picture, only
-    /// re-based at the new top-left (offsets absorb the shift). Validates
-    /// before touching anything; clears undo/redo like
-    /// [`Self::rehome_canvas`].
+    /// re-based at the new top-left (offsets re-base to 0; no visible pixel
+    /// is dropped). Validates before touching anything; clears undo/redo
+    /// like [`Self::rehome_canvas`].
     pub fn crop(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) -> Result<(), String> {
         if x0 > x1 || y0 > y1 || x1 >= self.w || y1 >= self.h {
             return Err("crop rect is outside the canvas".to_string());
@@ -3954,9 +3982,10 @@ mod tests {
     }
 
     #[test]
-    fn crop_keeps_content_and_shifts_offsets() {
+    fn crop_keeps_content_and_rebases_offsets() {
         // 6x4 with a red block in buffer x=0..=1, layer shifted ox=2 so it
-        // shows at canvas x=2..=3. Crop x=1..=4: the block lands at x=1..=2.
+        // shows at canvas x=2..=3. Crop x=1..=4: the block lands at x=1..=2
+        // and the layer re-bases to ox=0 (buffer == canvas after a crop).
         let mut doc = Document::new(6, 4);
         let px = &mut doc.layers[0].pixels;
         for y in 0..4u32 {
@@ -3974,7 +4003,8 @@ mod tests {
         let flat = doc.flatten();
         assert_eq!(&flat[0..4], &[255, 255, 255, 255]);
         assert_eq!(&flat[4..8], &[255, 0, 0, 255]);
-        assert_eq!(doc.layers[0].ox, 1);
+        assert_eq!(&flat[8..12], &[255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].ox, 0);
         // The corner selection shifted fully outside, so it drops.
         assert!(doc.selection.is_none());
     }
@@ -3994,7 +4024,8 @@ mod tests {
         let flat = doc.flatten();
         assert_eq!(&flat[((3 * 8 + 3) * 4) as usize..][..4], &[0, 0, 255, 255]);
         assert_eq!(&flat[0..4], &[255, 255, 255, 255]);
-        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (2, 2));
+        // A re-home re-bases every layer: buffer == canvas, ox/oy back to 0.
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (0, 0));
         assert_eq!(doc.selection, Some((3, 3, 4, 4)));
         assert_eq!(doc.symmetry_center_px(), (3.0, 3.0));
         // Trim back: content returns home.
@@ -4003,6 +4034,68 @@ mod tests {
         assert_eq!(&flat[(5 * 4)..][..4], &[0, 0, 255, 255]);
         assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (0, 0));
         assert_eq!(doc.selection, Some((1, 1, 2, 2)));
+    }
+
+    #[test]
+    fn crop_leading_trim_keeps_trailing_corner_content() {
+        // A leading-edge trim used to blank the rightmost x0 cols / bottom
+        // y0 rows: the carry kept buffer cells [0,new) but the new canvas
+        // reads cells shifted by x0. The bottom-right corner must ride along.
+        let mut doc = Document::new(6, 4);
+        let at = |x: u32, y: u32| ((y * 6 + x) * 4) as usize;
+        doc.layers[0].pixels[at(5, 3)..at(5, 3) + 4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels[at(4, 2)..at(4, 2) + 4].copy_from_slice(&[0, 255, 0, 255]);
+        doc.crop(1, 1, 5, 3).unwrap();
+        assert_eq!((doc.w, doc.h), (5, 3));
+        let flat = doc.flatten();
+        let n_at = |x: u32, y: u32| ((y * 5 + x) * 4) as usize;
+        // Old (5,3) lands at (4,2); old (4,2) at (3,1); (0,0) is page.
+        assert_eq!(&flat[n_at(4, 2)..n_at(4, 2) + 4], &[255, 0, 0, 255]);
+        assert_eq!(&flat[n_at(3, 1)..n_at(3, 1) + 4], &[0, 255, 0, 255]);
+        assert_eq!(&flat[0..4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn resize_center_shrink_keeps_middle_content() {
+        // Center-anchor shrink 8->6 trims one column per side (dx=-1): old
+        // x=6 must land at new x=5, and old x=7 (trimmed) must be gone.
+        let mut doc = Document::new(8, 4);
+        let at = |x: u32, y: u32| ((y * 8 + x) * 4) as usize;
+        doc.layers[0].pixels[at(6, 1)..at(6, 1) + 4].copy_from_slice(&[0, 255, 0, 255]);
+        doc.layers[0].pixels[at(7, 1)..at(7, 1) + 4].copy_from_slice(&[0, 0, 255, 255]);
+        doc.rehome_canvas(6, 4, -1, 0).unwrap();
+        let flat = doc.flatten();
+        let n_at = |x: u32, y: u32| ((y * 6 + x) * 4) as usize;
+        assert_eq!(&flat[n_at(5, 1)..n_at(5, 1) + 4], &[0, 255, 0, 255]);
+        assert!(flat
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| p != &[0, 0, 255, 255]));
+    }
+
+    #[test]
+    fn crop_with_offset_layer_rebases_to_zero() {
+        // Layer shifted ox=1: buffer cell 1 shows at canvas 2, cell 4 at
+        // canvas 5, cell 0 at canvas 1 (trimmed away). Crop x=2..=5 -> 4x4:
+        // old canvas shifts by dx=-2 and the layer re-bases to ox=0.
+        let mut doc = Document::new(6, 4);
+        let at = |x: u32, y: u32| ((y * 6 + x) * 4) as usize;
+        doc.layers[0].pixels[at(0, 0)..at(0, 0) + 4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels[at(1, 0)..at(1, 0) + 4].copy_from_slice(&[0, 255, 0, 255]);
+        doc.layers[0].pixels[at(4, 0)..at(4, 0) + 4].copy_from_slice(&[0, 0, 255, 255]);
+        doc.layers[0].ox = 1;
+        doc.crop(2, 0, 5, 3).unwrap();
+        assert_eq!((doc.w, doc.h), (4, 4));
+        assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (0, 0));
+        let flat = doc.flatten();
+        assert_eq!(&flat[0..4], &[0, 255, 0, 255]);
+        assert_eq!(&flat[12..16], &[0, 0, 255, 255]);
+        assert!(flat
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| p != &[255, 0, 0, 255]));
     }
 
     #[test]

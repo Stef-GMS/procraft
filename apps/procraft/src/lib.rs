@@ -7947,7 +7947,11 @@ impl eframe::App for ProCraftApp {
                     // Text layers: tapping empty canvas anchors a new block
                     // and opens the dialog; tapping existing text opens it
                     // pre-loaded for in-place editing (Procreate-style).
-                    if resp.clicked() && !gesture {
+                    // drag_started counts as a tap too: touch jitter crosses
+                    // the click-distance threshold, so an iPad tap arrives
+                    // as a micro-drag and never fires `clicked` — without
+                    // this the dialog could never open on device.
+                    if (resp.clicked() || resp.drag_started()) && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
                             if self.text_open {
@@ -8001,7 +8005,11 @@ impl eframe::App for ProCraftApp {
                     // Finger-paint mixing: pick up color and push it along
                     // the path (mask layers steer here with a hint; the
                     // engine treats them as a no-op).
-                    if resp.drag_started() && !gesture && !self.text_paint_blocked() {
+                    // A motionless tap never reports a drag; its click is
+                    // stamped as a single dab below (see the Fill note).
+                    let click_dab = resp.clicked();
+                    if (resp.drag_started() || click_dab) && !gesture && !self.text_paint_blocked()
+                    {
                         self.doc.checkpoint();
                         self.painting = true;
                         self.stroke_painted = false;
@@ -8015,6 +8023,30 @@ impl eframe::App for ProCraftApp {
                         }
                         self.last = None;
                         self.leftover = 0.0;
+                        if click_dab {
+                            if let Some(pos) = resp.hover_pos() {
+                                let (x, y) = to_canvas(pos);
+                                let (x, y) = clamp_pt(x, y);
+                                let pressure = latest_touch_force(&ctx).unwrap_or(1.0);
+                                let (last, leftover) = self.doc.smudge_to(
+                                    &self.brush,
+                                    self.smudge_strength,
+                                    pressure,
+                                    self.last,
+                                    (x, y),
+                                    self.leftover,
+                                );
+                                self.last = last;
+                                self.leftover = leftover;
+                                self.stroke_painted = true;
+                            }
+                            if self.stroke_painted {
+                                self.stroke_painted = false;
+                                self.capture_timelapse();
+                            }
+                            self.painting = false;
+                            self.last = None;
+                        }
                     }
                     if self.painting && resp.dragged() {
                         if let Some(pos) = resp.hover_pos() {
@@ -8079,7 +8111,10 @@ impl eframe::App for ProCraftApp {
                     return;
                 }
 
-                if resp.drag_started() && !gesture && !self.text_paint_blocked() {
+                // A motionless tap never reports a drag; its click stamps a
+                // single dab below (see the Fill note).
+                let click_dab = resp.clicked();
+                if (resp.drag_started() || click_dab) && !gesture && !self.text_paint_blocked() {
                     self.doc.checkpoint();
                     self.painting = true;
                     self.stroke_painted = false;
@@ -8107,6 +8142,51 @@ impl eframe::App for ProCraftApp {
                         }
                         self.assist_lock = None;
                     } else {
+                        self.assist_start = None;
+                        self.assist_lock = None;
+                    }
+                    // Motionless click: no dragged() frame follows, so stamp
+                    // the single dab now, through the same single-point
+                    // pipeline the drag path uses for a first sample.
+                    if click_dab {
+                        if let Some(pos) = resp.hover_pos() {
+                            let (x, y) = to_canvas(pos);
+                            let (x, y) = clamp_pt(x, y);
+                            let (sx, sy) = self.guides.snap_point(w, h, x, y);
+                            let pressure = latest_touch_force(&ctx).unwrap_or(1.0);
+                            let brush = self.base_brush();
+                            let color = self.current_color();
+                            let from_dyn = if self.last.is_some() {
+                                self.last_dyn
+                            } else {
+                                DabDynamics::default()
+                            };
+                            let to_dyn = DabDynamics {
+                                pressure,
+                                speed_norm: 0.0,
+                                angle: self.last_dyn.angle,
+                            };
+                            let (last, leftover) = self.doc.stroke_to_dyn(
+                                &brush,
+                                color,
+                                self.last,
+                                from_dyn,
+                                (sx, sy),
+                                to_dyn,
+                                self.leftover,
+                            );
+                            self.last = last;
+                            self.leftover = leftover;
+                            self.last_dyn = to_dyn;
+                            self.stroke_painted = true;
+                        }
+                        if self.stroke_painted {
+                            self.stroke_painted = false;
+                            self.capture_timelapse();
+                        }
+                        self.painting = false;
+                        self.last = None;
+                        self.smooth_pt = None;
                         self.assist_start = None;
                         self.assist_lock = None;
                     }

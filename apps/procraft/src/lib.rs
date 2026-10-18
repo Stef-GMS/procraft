@@ -15,8 +15,8 @@ use procraft_engine::{
     size_drag_factor, starter_palette, step_playback_visible, triadic, zoom_drag_factor, ActionId,
     AssistLine, BlendMode, Brush, BrushPreset, ChordKey, Color, DabDynamics, Document,
     DragActionId, GuideKind, Guides, KeyChord, LoopMode, ModSet, PaintTarget, Palette, PaletteSet,
-    Settings, ShapePoly, Shortcuts, SymmetryMode, TapAction, TextStyle, ToolId, LAPSE_SIDE,
-    MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES,
+    Settings, ShapePoly, Shortcuts, SymmetryMode, TapAction, TextBlock, TextStyle, ToolId,
+    LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES,
     MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING,
     MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX, SETTINGS_VERSION,
 };
@@ -763,6 +763,13 @@ struct ProCraftApp {
     text_outline: bool,
     text_outline_w: u32,
     text_outline_rgb: [u8; 3],
+    /// Text-layer edit session: the layer index plus the block identity
+    /// (text + anchor) captured when the dialog opened. Done compares
+    /// against these so an edit landing on a layer that changed
+    /// underneath (deleted, reordered, undone) cancels instead of
+    /// corrupting; `None` means the dialog creates a new layer.
+    editing_text: Option<usize>,
+    editing_loaded: Option<(String, f32, f32)>,
     zoom: f32,
     status: String,
     /// M33 Gallery: recent project paths (newest first, max 10),
@@ -977,6 +984,8 @@ impl ProCraftApp {
             text_outline: false,
             text_outline_w: 3,
             text_outline_rgb: [0, 0, 0],
+            editing_text: None,
+            editing_loaded: None,
             zoom: 1.0,
             status:
                 "Drag on the canvas to paint. Ctrl+Z undoes, Ctrl+Y redoes, Esc clears selection."
@@ -4274,11 +4283,10 @@ impl eframe::App for ProCraftApp {
             self.shortcuts_window(ui.ctx());
         }
 
-        // Text dialog: type, size, then Render bakes the block to the
-        // active layer at the canvas anchor (one undo step).
+        // Text dialog: type, style, then Render creates a text layer (or
+        // Done re-renders the one being edited in place; one undo step).
         if self.text_open {
             let mut open = self.text_open;
-            let ink = Color::rgb(self.color[0], self.color[1], self.color[2]);
             egui::Window::new("Text")
                 .open(&mut open)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -4288,7 +4296,11 @@ impl eframe::App for ProCraftApp {
                     // Scrollable: on small screens (iPad keyboard up) the
                     // tall dialog clips Import/Render below the fold.
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.label("Click the canvas to move the anchor, then Render.");
+                        if self.editing_text.is_some() {
+                            ui.label("Tap the canvas to move the text; edit, then Done.");
+                        } else {
+                            ui.label("Click the canvas to move the anchor, then Render.");
+                        }
                         // Explicit focus like the layer rename: iOS shows no
                         // keyboard for an unfocused multiline field.
                         let field = ui.add(
@@ -4308,7 +4320,13 @@ impl eframe::App for ProCraftApp {
                         );
                         // M38 Typography: face + spacing + outline.
                         ui.horizontal_wrapped(|ui| {
-                            let face = self.text_font_name.as_deref().unwrap_or("Inter (bundled)");
+                            let face = self.text_font_name.as_deref().unwrap_or(
+                                if self.text_font_bytes.is_some() {
+                                    "Imported"
+                                } else {
+                                    "Inter (bundled)"
+                                },
+                            );
                             ui.label(format!("Face: {face}"));
                             if ui
                                 .add_sized([80.0, 28.0], egui::Button::new("Import…"))
@@ -4387,34 +4405,103 @@ impl eframe::App for ProCraftApp {
                             stepped_slider(ui, &mut self.text_outline_rgb[2], 0..=255, 1.0, "B");
                         }
                         ui.horizontal_wrapped(|ui| {
+                            let editing = self.editing_text.is_some();
                             if ui
-                                .add_sized([80.0, 28.0], egui::Button::new("Render"))
+                                .add_sized(
+                                    [80.0, 28.0],
+                                    egui::Button::new(if editing { "Done" } else { "Render" }),
+                                )
                                 .clicked()
                             {
-                                match self.text_anchor {
-                                    Some((ax, ay)) => {
-                                        let style = self.text_style();
-                                        self.doc.checkpoint();
-                                        match self.doc.draw_text_styled(
-                                            ink,
-                                            ax,
-                                            ay,
-                                            self.text_size,
-                                            &self.text_body,
-                                            &style,
-                                        ) {
-                                            Ok((w, h)) => {
-                                                self.status = format!("Text placed ({w}x{h}px).");
-                                                self.text_open = false;
-                                                self.capture_timelapse();
+                                let color = [self.color[0], self.color[1], self.color[2], 255];
+                                match self.editing_text {
+                                    Some(i) => {
+                                        // Identity check: Done against a layer
+                                        // that changed underneath (deleted,
+                                        // reordered, undone) cancels rather
+                                        // than corrupting.
+                                        let unchanged = self.editing_loaded.as_ref().is_some_and(
+                                            |(t, x, y)| {
+                                                self.doc.layers.get(i).is_some_and(|l| {
+                                                    l.text.as_ref().is_some_and(|b| {
+                                                        *t == b.text && *x == b.x && *y == b.y
+                                                    })
+                                                })
+                                            },
+                                        );
+                                        if !unchanged {
+                                            self.status =
+                                                "Text layer changed — edit cancelled.".to_string();
+                                            self.text_open = false;
+                                        } else {
+                                            let (ax, ay) = self.text_anchor.unwrap_or_else(|| {
+                                                self.editing_loaded
+                                                    .as_ref()
+                                                    .map_or((0.0, 0.0), |(_, x, y)| (*x, *y))
+                                            });
+                                            let prev = self.doc.layers[i].text.clone();
+                                            self.doc.checkpoint();
+                                            let style = self.text_style();
+                                            if let Some(b) = self.doc.layers[i].text.as_mut() {
+                                                b.text = self.text_body.clone();
+                                                b.size_px = self.text_size;
+                                                b.color = color;
+                                                b.style = style;
+                                                b.x = ax;
+                                                b.y = ay;
                                             }
-                                            Err(e) => self.status = format!("Text failed: {e}"),
+                                            match self.doc.rerender_text_layer(i) {
+                                                Ok((w, h)) => {
+                                                    self.status =
+                                                        format!("Text layer updated ({w}x{h}).");
+                                                    self.text_open = false;
+                                                    self.ghost_dirty = true;
+                                                    self.capture_timelapse();
+                                                }
+                                                Err(e) => {
+                                                    // The engine keeps the old
+                                                    // pixels on a failed re-layout;
+                                                    // restore the block too so a
+                                                    // retry's identity check still
+                                                    // matches.
+                                                    self.doc.layers[i].text = prev;
+                                                    self.status = format!("Text failed: {e}");
+                                                }
+                                            }
                                         }
                                     }
-                                    None => {
-                                        self.status =
-                                            "Click the canvas to anchor the text first.".to_string()
-                                    }
+                                    None => match self.text_anchor {
+                                        Some((ax, ay)) => {
+                                            let style = self.text_style();
+                                            let block = TextBlock {
+                                                text: self.text_body.clone(),
+                                                size_px: self.text_size,
+                                                color,
+                                                style,
+                                                x: ax,
+                                                y: ay,
+                                                w: 0,
+                                                h: 0,
+                                            };
+                                            let name =
+                                                format!("Text {}", self.doc.layers.len() + 1);
+                                            match self.doc.add_text_layer(&name, block) {
+                                                Ok((_, w, h)) => {
+                                                    self.status =
+                                                        format!("Text layer added ({w}x{h}).");
+                                                    self.text_open = false;
+                                                    self.ghost_dirty = true;
+                                                    self.capture_timelapse();
+                                                }
+                                                Err(e) => self.status = format!("Text failed: {e}"),
+                                            }
+                                        }
+                                        None => {
+                                            self.status =
+                                                "Click the canvas to anchor the text first."
+                                                    .to_string()
+                                        }
+                                    },
                                 }
                             }
                             if ui
@@ -4426,7 +4513,14 @@ impl eframe::App for ProCraftApp {
                         });
                     });
                 });
-            self.text_open = open;
+            // A button inside the dialog may have set `text_open = false`
+            // (Render/Done/Cancel); the window ✕ flips `open`. Honor both —
+            // and any close clears the edit session.
+            self.text_open = self.text_open && open;
+            if !self.text_open {
+                self.editing_text = None;
+                self.editing_loaded = None;
+            }
         }
 
         // Fresh id per width era ("tools" -> "tools-wide" -> here): panel
@@ -7785,13 +7879,52 @@ impl eframe::App for ProCraftApp {
                 }
 
                 if self.tool == Tool::Text {
-                    // Click anchors the text block and opens the dialog;
-                    // Render bakes it to the active layer (undoable).
+                    // Text layers: tapping empty canvas anchors a new block
+                    // and opens the dialog; tapping existing text opens it
+                    // pre-loaded for in-place editing (Procreate-style).
                     if resp.clicked() && !gesture {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
-                            self.text_anchor = Some(clamp_pt(x, y));
-                            self.text_open = true;
+                            if self.text_open {
+                                // Re-anchor the open dialog (new or edit mode).
+                                self.text_anchor = Some(clamp_pt(x, y));
+                            } else if self.doc.paint_target != PaintTarget::Color {
+                                self.status = "Switch to a color layer to edit text.".to_string();
+                            } else if let Some(i) = self.doc.text_layer_at(x, y) {
+                                if let Some(block) = self.doc.layers[i].text.clone() {
+                                    self.doc.active = i;
+                                    self.editing_text = Some(i);
+                                    self.editing_loaded =
+                                        Some((block.text.clone(), block.x, block.y));
+                                    self.text_anchor = Some((block.x, block.y));
+                                    self.text_body = block.text.clone();
+                                    self.text_size = block.size_px;
+                                    // A loaded face shows as "Imported" (no
+                                    // stored filename), never the wrong bundle.
+                                    self.text_font_name = None;
+                                    self.text_font_bytes = block.style.font_bytes.clone();
+                                    self.text_leading = block.style.leading;
+                                    self.text_tracking = block.style.tracking;
+                                    match block.style.outline {
+                                        Some((c, px)) => {
+                                            self.text_outline = true;
+                                            self.text_outline_w = px;
+                                            self.text_outline_rgb = [c.0[0], c.0[1], c.0[2]];
+                                        }
+                                        None => self.text_outline = false,
+                                    }
+                                    self.text_open = true;
+                                    self.status = format!(
+                                        "Editing text layer '{}'.",
+                                        self.doc.layers[i].name
+                                    );
+                                }
+                            } else {
+                                self.text_anchor = Some(clamp_pt(x, y));
+                                self.editing_text = None;
+                                self.editing_loaded = None;
+                                self.text_open = true;
+                            }
                         }
                     }
                     self.painting = false;

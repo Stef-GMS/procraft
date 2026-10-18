@@ -16,9 +16,9 @@ use procraft_engine::{
     AssistLine, BlendMode, Brush, BrushPreset, ChordKey, Color, DabDynamics, Document,
     DragActionId, GuideKind, Guides, KeyChord, LoopMode, ModSet, PaintTarget, Palette, PaletteSet,
     Settings, ShapePoly, Shortcuts, SymmetryMode, TapAction, TextBlock, TextStyle, ToolId,
-    LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES,
-    MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING,
-    MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX, SETTINGS_VERSION,
+    LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_FONT_BYTES, MAX_IMAGE_COLORS,
+    MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS,
+    MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX, SETTINGS_VERSION,
 };
 #[cfg(target_os = "android")]
 use procraft_engine::{ext_matches, file_size_label};
@@ -1924,6 +1924,9 @@ impl ProCraftApp {
     /// op, new/opened doc…) never restores its stale snapshot — that wipe
     /// is exactly "my paint disappeared" — it restarts on current pixels.
     fn filter_scrub(&mut self, kind: u8, apply: impl Fn(&mut Document, usize)) {
+        if self.text_paint_blocked() {
+            return;
+        }
         let layer = self.doc.active;
         // Stale-snapshot guard: the live layer must still match what our
         // last apply left behind (or the snapshot on a fresh preview).
@@ -1999,6 +2002,9 @@ impl ProCraftApp {
     /// preview is dropped and the values apply fresh on the active layer
     /// (new undo step) — the intervening work is always kept.
     fn restamp_preview(&mut self, apply: impl Fn(&mut Document, usize)) {
+        if self.text_paint_blocked() {
+            return;
+        }
         let expired = match &self.filter_preview {
             Some(fp) => match self.doc.layers.get(fp.layer) {
                 Some(l) => pixels_hash(&l.pixels) != fp.live_hash,
@@ -2270,6 +2276,9 @@ impl ProCraftApp {
     /// M38 Typography: validate imported TTF/OTF bytes and keep them as
     /// the session face (shared by desktop Import and the iOS resolve).
     fn absorb_font(&mut self, bytes: &[u8], name: &str) -> String {
+        if bytes.len() > MAX_FONT_BYTES {
+            return "Font too large (max 2 MB).".to_string();
+        }
         match check_font(bytes) {
             Ok(()) => {
                 self.text_font_name = Some(name.to_string());
@@ -2277,6 +2286,24 @@ impl ProCraftApp {
                 format!("Font {name} ready.")
             }
             Err(e) => format!("Font {name} failed: {e}"),
+        }
+    }
+
+    /// Shared guard for pixel-writing entry points: a live text layer's
+    /// pixels are engine-owned (repainted from the block on every edit), so
+    /// writers refuse and point at Rasterize instead of silently fighting
+    /// the next re-render (or losing the edit).
+    fn text_paint_blocked(&mut self) -> bool {
+        if self
+            .doc
+            .layers
+            .get(self.doc.active)
+            .is_some_and(|l| l.is_text())
+        {
+            self.status = "Text layer — tap Rasterize (Layers) to paint.".to_string();
+            true
+        } else {
+            false
         }
     }
 
@@ -3453,7 +3480,7 @@ impl eframe::App for ProCraftApp {
                 // the pixels follow (recomputed from its base).
                 let had_xform = self.xform.grab.is_some() || self.xform.base.is_some();
                 self.xform.cancel_grab();
-                if had_xform {
+                if had_xform && !self.text_paint_blocked() {
                     xform_preview(&mut self.doc, &mut self.xform);
                 }
             }
@@ -3927,7 +3954,7 @@ impl eframe::App for ProCraftApp {
                 if ui.button("Redo").clicked() && self.doc.redo() {
                     self.status = "Redone.".to_string();
                 }
-                if ui.button("Clear layer").clicked() {
+                if ui.button("Clear layer").clicked() && !self.text_paint_blocked() {
                     self.doc.checkpoint();
                     if let Some(layer) = self.doc.active_layer_mut() {
                         layer.clear();
@@ -4731,7 +4758,7 @@ impl eframe::App for ProCraftApp {
                     self.sel_edges_dirty = true;
                 }
                 stepped_slider(ui, &mut self.sel_stroke_w, 1..=16, 1.0, "Outline px");
-                if ui.button("Paint outline").clicked() {
+                if ui.button("Paint outline").clicked() && !self.text_paint_blocked() {
                     self.doc.checkpoint();
                     let brush = self.base_brush();
                     let color = self.current_color();
@@ -5423,6 +5450,22 @@ impl eframe::App for ProCraftApp {
                                 self.status = "Merged down.".to_string();
                             }
                         }
+                        let can_raster = self
+                            .doc
+                            .layers
+                            .get(self.doc.active)
+                            .is_some_and(|l| l.is_text());
+                        if ui
+                            .add_enabled(can_raster, egui::Button::new("Rasterize"))
+                            .clicked()
+                        {
+                            let active = self.doc.active;
+                            self.doc.checkpoint();
+                            if self.doc.rasterize_text_layer(active) {
+                                self.ghost_dirty = true;
+                                self.status = "Text rasterized.".to_string();
+                            }
+                        }
                     });
                     if ui.button("New group").clicked() {
                         let name = format!("Group {}", self.doc.groups.len() + 1);
@@ -5649,6 +5692,9 @@ impl eframe::App for ProCraftApp {
                                 .clicked()
                             {
                                 remove = Some(i);
+                            }
+                            if layer.is_text() {
+                                ui.label("T");
                             }
                             if layer.mask.is_some() {
                                 ui.label("M");
@@ -6074,14 +6120,14 @@ impl eframe::App for ProCraftApp {
                         // re-applies from the pristine base (see tform_button):
                         // mashing them never compounds resampling blur.
                         ui.horizontal(|ui| {
-                            if ui.button("Scale +").clicked() {
+                            if ui.button("Scale +").clicked() && !self.text_paint_blocked() {
                                 tform_button(
                                     &mut self.doc,
                                     &mut self.tform_press,
                                     TformOp::Scale(1.25),
                                 );
                             }
-                            if ui.button("Scale −").clicked() {
+                            if ui.button("Scale −").clicked() && !self.text_paint_blocked() {
                                 tform_button(
                                     &mut self.doc,
                                     &mut self.tform_press,
@@ -6097,6 +6143,7 @@ impl eframe::App for ProCraftApp {
                                     "−15°"
                                 })
                                 .clicked()
+                                && !self.text_paint_blocked()
                             {
                                 tform_button(
                                     &mut self.doc,
@@ -6111,6 +6158,7 @@ impl eframe::App for ProCraftApp {
                                     "+15°"
                                 })
                                 .clicked()
+                                && !self.text_paint_blocked()
                             {
                                 tform_button(
                                     &mut self.doc,
@@ -6120,7 +6168,7 @@ impl eframe::App for ProCraftApp {
                             }
                         });
                         ui.horizontal(|ui| {
-                            if ui.button("Flip H").clicked() {
+                            if ui.button("Flip H").clicked() && !self.text_paint_blocked() {
                                 self.status = match tform_button(
                                     &mut self.doc,
                                     &mut self.tform_press,
@@ -6132,7 +6180,7 @@ impl eframe::App for ProCraftApp {
                                     _ => "Layer flipped horizontally.".to_string(),
                                 };
                             }
-                            if ui.button("Flip V").clicked() {
+                            if ui.button("Flip V").clicked() && !self.text_paint_blocked() {
                                 self.status = match tform_button(
                                     &mut self.doc,
                                     &mut self.tform_press,
@@ -6251,7 +6299,7 @@ impl eframe::App for ProCraftApp {
                             });
                             self.status = "Previewing tone — Apply to keep.".to_string();
                         }
-                        if ui.button("Apply tone").clicked() {
+                        if ui.button("Apply tone").clicked() && !self.text_paint_blocked() {
                             if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 0) {
                                 let (b, c) = (self.filt_brightness, self.filt_contrast);
                                 self.doc.checkpoint();
@@ -6285,7 +6333,7 @@ impl eframe::App for ProCraftApp {
                             });
                             self.status = "Previewing blur — Apply to keep.".to_string();
                         }
-                        if ui.button("Apply blur").clicked() {
+                        if ui.button("Apply blur").clicked() && !self.text_paint_blocked() {
                             if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 1) {
                                 self.doc.checkpoint();
                                 self.doc
@@ -6315,7 +6363,7 @@ impl eframe::App for ProCraftApp {
                             });
                             self.status = "Previewing sharpen — Apply to keep.".to_string();
                         }
-                        if ui.button("Apply sharpen").clicked() {
+                        if ui.button("Apply sharpen").clicked() && !self.text_paint_blocked() {
                             if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 2) {
                                 self.doc.checkpoint();
                                 self.doc
@@ -6375,7 +6423,7 @@ impl eframe::App for ProCraftApp {
                             });
                             self.status = "Previewing levels — Apply to keep.".to_string();
                         }
-                        if ui.button("Apply levels").clicked() {
+                        if ui.button("Apply levels").clicked() && !self.text_paint_blocked() {
                             if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 3) {
                                 let lut = levels_lut(
                                     self.filt_levels_shadow,
@@ -6443,7 +6491,7 @@ impl eframe::App for ProCraftApp {
                             });
                             self.status = "Previewing curves — Apply to keep.".to_string();
                         }
-                        if ui.button("Apply curves").clicked() {
+                        if ui.button("Apply curves").clicked() && !self.text_paint_blocked() {
                             if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 4) {
                                 let lut = curves_lut(
                                     self.filt_curve_shadow,
@@ -6495,7 +6543,7 @@ impl eframe::App for ProCraftApp {
                             });
                             self.status = "Previewing HSL — Apply to keep.".to_string();
                         }
-                        if ui.button("Apply HSL").clicked() {
+                        if ui.button("Apply HSL").clicked() && !self.text_paint_blocked() {
                             if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 5) {
                                 self.doc.checkpoint();
                                 let active = self.doc.active;
@@ -6554,7 +6602,7 @@ impl eframe::App for ProCraftApp {
                             });
                             self.status = "Previewing balance — Apply to keep.".to_string();
                         }
-                        if ui.button("Apply balance").clicked() {
+                        if ui.button("Apply balance").clicked() && !self.text_paint_blocked() {
                             if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 6) {
                                 let (r, g, b) = (
                                     (self.filt_bal_r as f32 * 2.55).round() as i32,
@@ -6598,7 +6646,7 @@ impl eframe::App for ProCraftApp {
                             });
                             self.status = "Previewing recolor — Apply to keep.".to_string();
                         }
-                        if ui.button("Apply recolor").clicked() {
+                        if ui.button("Apply recolor").clicked() && !self.text_paint_blocked() {
                             if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 7) {
                                 self.doc.checkpoint();
                                 let active = self.doc.active;
@@ -6733,7 +6781,7 @@ impl eframe::App for ProCraftApp {
                 self.sym_grab = false;
                 let had_xform = self.xform.grab.is_some() || self.xform.base.is_some();
                 self.xform.cancel_grab();
-                if had_xform {
+                if had_xform && !self.text_paint_blocked() {
                     xform_preview(&mut self.doc, &mut self.xform);
                 }
             }
@@ -7170,7 +7218,7 @@ impl eframe::App for ProCraftApp {
                             }
                             // Generous 28px radius like the VP handles.
                             if let Some((i, d)) = best {
-                                if d <= 28.0 {
+                                if d <= 28.0 && !self.text_paint_blocked() {
                                     let at = to_canvas(pos);
                                     self.xform.begin_grab(i, at);
                                 }
@@ -7181,7 +7229,9 @@ impl eframe::App for ProCraftApp {
                             let (x, y) = to_canvas(pos);
                             let (dx, dy) = (x - self.xform.grab_at.0, y - self.xform.grab_at.1);
                             self.xform.drag_by(dx, dy);
-                            if xform_preview(&mut self.doc, &mut self.xform) == XformApply::Skipped
+                            if !self.text_paint_blocked()
+                                && xform_preview(&mut self.doc, &mut self.xform)
+                                    == XformApply::Skipped
                             {
                                 self.status = "Pins overlap — transform skipped.".to_string();
                             }
@@ -7194,17 +7244,19 @@ impl eframe::App for ProCraftApp {
                             // Re-run once with the release positions (the
                             // last render already showed this) and commit
                             // the status message.
-                            self.status = match xform_preview(&mut self.doc, &mut self.xform) {
-                                XformApply::Skipped => {
-                                    "Pins overlap — transform skipped.".to_string()
-                                }
-                                XformApply::Restored => "Transform reset.".to_string(),
-                                XformApply::Applied => match self.xform.mode {
-                                    XformMode::Mesh => "Mesh warp applied.".to_string(),
-                                    _ => "Distort applied.".to_string(),
-                                },
-                                XformApply::NoOp => self.status.clone(),
-                            };
+                            if !self.text_paint_blocked() {
+                                self.status = match xform_preview(&mut self.doc, &mut self.xform) {
+                                    XformApply::Skipped => {
+                                        "Pins overlap — transform skipped.".to_string()
+                                    }
+                                    XformApply::Restored => "Transform reset.".to_string(),
+                                    XformApply::Applied => match self.xform.mode {
+                                        XformMode::Mesh => "Mesh warp applied.".to_string(),
+                                        _ => "Distort applied.".to_string(),
+                                    },
+                                    XformApply::NoOp => self.status.clone(),
+                                };
+                            }
                         }
                     }
                     self.painting = false;
@@ -7423,7 +7475,10 @@ impl eframe::App for ProCraftApp {
                     // for the whole gesture). `clicked` covers motionless
                     // taps: a click-and-drag widget only reports a drag once
                     // the pointer moves.
-                    if (resp.drag_started() || resp.clicked()) && !gesture {
+                    if (resp.drag_started() || resp.clicked())
+                        && !gesture
+                        && !self.text_paint_blocked()
+                    {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
                             let (cx, cy) = clamp_pt(x, y);
@@ -7570,7 +7625,7 @@ impl eframe::App for ProCraftApp {
 
                 if self.tool == Tool::Move {
                     // Drag the active layer around (integer steps).
-                    if resp.drag_started() && !gesture {
+                    if resp.drag_started() && !gesture && !self.text_paint_blocked() {
                         if let Some(pos) = resp.hover_pos() {
                             self.doc.checkpoint();
                             self.move_from = Some(to_canvas(pos));
@@ -7593,7 +7648,9 @@ impl eframe::App for ProCraftApp {
                     }
                     if resp.drag_stopped() {
                         self.move_from = None;
-                        self.status = "Layer moved.".to_string();
+                        if !self.text_paint_blocked() {
+                            self.status = "Layer moved.".to_string();
+                        }
                     }
                     self.painting = false;
                     self.last = None;
@@ -7603,7 +7660,7 @@ impl eframe::App for ProCraftApp {
                 if self.tool == Tool::Liquify {
                     // M40 push: warp the active layer along each drag
                     // segment (one checkpoint per stroke, like paint).
-                    if resp.drag_started() && !gesture {
+                    if resp.drag_started() && !gesture && !self.text_paint_blocked() {
                         if let Some(pos) = resp.hover_pos() {
                             self.doc.checkpoint();
                             self.liquify_from = Some(to_canvas(pos));
@@ -7625,8 +7682,10 @@ impl eframe::App for ProCraftApp {
                     }
                     if resp.drag_stopped() {
                         self.liquify_from = None;
-                        self.capture_timelapse();
-                        self.status = "Liquified.".to_string();
+                        if !self.text_paint_blocked() {
+                            self.capture_timelapse();
+                            self.status = "Liquified.".to_string();
+                        }
                     }
                     self.painting = false;
                     self.last = None;
@@ -7706,7 +7765,7 @@ impl eframe::App for ProCraftApp {
 
                 if self.tool == Tool::Shapes {
                     // Drag a preview, rasterize on release.
-                    if resp.drag_started() && !gesture {
+                    if resp.drag_started() && !gesture && !self.text_paint_blocked() {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
                             self.shape_anchor = Some(clamp_pt(x, y));
@@ -7936,7 +7995,7 @@ impl eframe::App for ProCraftApp {
                     // Finger-paint mixing: pick up color and push it along
                     // the path (mask layers steer here with a hint; the
                     // engine treats them as a no-op).
-                    if resp.drag_started() && !gesture {
+                    if resp.drag_started() && !gesture && !self.text_paint_blocked() {
                         self.doc.checkpoint();
                         self.painting = true;
                         self.stroke_painted = false;
@@ -8014,7 +8073,7 @@ impl eframe::App for ProCraftApp {
                     return;
                 }
 
-                if resp.drag_started() && !gesture {
+                if resp.drag_started() && !gesture && !self.text_paint_blocked() {
                     self.doc.checkpoint();
                     self.painting = true;
                     self.stroke_painted = false;

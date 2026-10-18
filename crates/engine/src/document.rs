@@ -234,6 +234,10 @@ pub struct Layer {
     /// Owning layer group (id into [`Document::groups`); `None` lives at
     /// the top level. Saved to v8 project files (older versions read none).
     pub group: Option<u32>,
+    /// Vector text source for text layers: `Some` makes this layer editable
+    /// as text, with `pixels` always holding its rendered result. Saved to
+    /// v11 project files (older versions read none).
+    pub text: Option<crate::text::TextBlock>,
 }
 
 /// A named layer container: visibility (and collapse) apply to the whole
@@ -268,6 +272,7 @@ impl Layer {
             oy: 0,
             hold: 1,
             group: None,
+            text: None,
         }
     }
 
@@ -284,6 +289,12 @@ impl Layer {
 
     pub fn clear(&mut self) {
         self.pixels.fill(0);
+    }
+
+    /// Is this layer an editable text layer? Its rendered `pixels` are the
+    /// text; only [`Document::rerender_text_layer`] rewrites them.
+    pub fn is_text(&self) -> bool {
+        self.text.is_some()
     }
 }
 
@@ -3097,6 +3108,7 @@ impl Document {
                 oy,
                 hold,
                 group,
+                text: None,
             });
         }
         if !cur.is_empty() {

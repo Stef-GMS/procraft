@@ -471,6 +471,7 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
             oy: 0,
             hold: 1,
             group: None,
+            text: None,
         });
     } else {
         // The crate lists bottom-first, matching our order. Section
@@ -501,6 +502,7 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
                 oy: 0,
                 hold: 1,
                 group: None,
+                text: None,
             });
             if layers.len() >= 256 {
                 break;

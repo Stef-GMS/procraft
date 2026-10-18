@@ -342,6 +342,7 @@ pub fn import_gif_document(bytes: &[u8]) -> Result<(Document, u32), String> {
             oy: 0,
             hold: hold.clamp(MIN_ANIM_HOLD, MAX_ANIM_HOLD),
             group: None,
+            text: None,
         });
     }
     Ok((Document::from_layers(w, h, layers, 0), fps))

@@ -49,7 +49,7 @@ pub fn check_font(bytes: &[u8]) -> Result<(), String> {
 
 /// M38 Text style: custom typeface + spacing + outline. `Default` is the
 /// old behavior exactly (bundled Inter, no extra spacing, no outline).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TextStyle {
     /// TTF/OTF bytes; None = bundled Inter.
     pub font_bytes: Option<Vec<u8>>,
@@ -59,6 +59,23 @@ pub struct TextStyle {
     pub tracking: f32,
     /// Outline color + width px (1..=32), painted under the fill.
     pub outline: Option<(Color, u32)>,
+}
+
+/// A vector text definition owned by a layer ([`crate::Layer::text`]): the
+/// editable source behind the layer's rendered `pixels`. `x`/`y` anchor the
+/// block's top-left in canvas pixels; `w`/`h` are the laid-out block size,
+/// filled in when the layer renders (0 = not yet laid out).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextBlock {
+    pub text: String,
+    pub size_px: f32,
+    /// Fill color (RGBA), applied at render time.
+    pub color: [u8; 4],
+    pub style: TextStyle,
+    pub x: f32,
+    pub y: f32,
+    pub w: u32,
+    pub h: u32,
 }
 
 /// Spacing clamp range in px (about a 256px line either way).
@@ -274,7 +291,24 @@ impl Document {
         style: &TextStyle,
     ) -> Result<(u32, u32), String> {
         let layout = layout_text_styled(text, size_px, style)?;
-        if let Some((o_color, o_w)) = style.outline {
+        self.stamp_text(self.active, true, &layout, style.outline, (x, y), color)?;
+        Ok((layout.w, layout.h))
+    }
+
+    /// Stamp `layout` onto layer `index` at canvas pixel `at`: outline ring
+    /// first (when asked), then the fill. Shared by
+    /// [`Document::draw_text_styled`] and [`Document::add_text_layer`].
+    fn stamp_text(
+        &mut self,
+        index: usize,
+        respect_selection: bool,
+        layout: &TextLayout,
+        outline: Option<(Color, u32)>,
+        at: (f32, f32),
+        color: Color,
+    ) -> Result<(), String> {
+        let (x, y) = at;
+        if let Some((o_color, o_w)) = outline {
             let ow = o_w.min(MAX_OUTLINE_PX);
             if ow > 0 {
                 let ring = dilate_ring(&layout.mask, layout.w, layout.h, ow);
@@ -283,25 +317,27 @@ impl Document {
                     h: layout.h,
                     mask: ring,
                 };
-                self.stamp_layout(&ring_layout, x, y, o_color)?;
+                self.stamp_layout_at(index, respect_selection, &ring_layout, x, y, o_color)?;
             }
         }
-        self.stamp_layout(&layout, x, y, color)?;
-        Ok((layout.w, layout.h))
+        self.stamp_layout_at(index, respect_selection, layout, x, y, color)
     }
 
-    /// Source-over stamp of a coverage layout at canvas pixel `(x, y)`.
-    /// Shared by the fill and outline passes. Fully-outside stamps are a
-    /// no-op (mirrors the dab contract).
-    fn stamp_layout(
+    /// Source-over stamp of a coverage layout at canvas pixel `(x, y)` onto
+    /// layer `index`, honoring the active selection only when
+    /// `respect_selection` is set. Shared by the fill and outline passes.
+    /// Fully-outside stamps are a no-op (mirrors the dab contract).
+    fn stamp_layout_at(
         &mut self,
+        index: usize,
+        respect_selection: bool,
         layout: &TextLayout,
         x: f32,
         y: f32,
         color: Color,
     ) -> Result<(), String> {
         let (w_u32, h_u32) = (self.w, self.h);
-        if self.layers.get(self.active).is_none() {
+        if self.layers.get(index).is_none() {
             return Err("no active layer".to_string());
         }
         let ox = x.floor() as i32;
@@ -319,9 +355,17 @@ impl Document {
         let x1 = (ox + layout.w as i32 - 1).min(w_u32 as i32 - 1).max(0) as u32;
         let y1 = (oy + layout.h as i32 - 1).min(h_u32 as i32 - 1).max(0) as u32;
         self.mark_dirty(x0, y0, x1, y1);
-        let selection = self.selection;
-        let active = self.active;
-        let sel_mask = self.selection_mask.as_deref();
+        let selection = if respect_selection {
+            self.selection
+        } else {
+            None
+        };
+        let active = index;
+        let sel_mask = if respect_selection {
+            self.selection_mask.as_deref()
+        } else {
+            None
+        };
         // Layer offset (Move tool): canvas pixel -> buffer slot.
         let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
         let layer = &mut self.layers[active];
@@ -373,6 +417,34 @@ impl Document {
             }
         }
         Ok(())
+    }
+
+    /// Create a new layer rendering `block` and make it active. `w`/`h` are
+    /// filled from the layout and stored on the layer. Invalid blocks (bad
+    /// size, empty text, oversized style) error before any layer is added.
+    /// Creation is not undoable (matches [`Document::add_layer`]). The
+    /// stamp ignores the active selection — a text layer renders whole.
+    /// Returns the new layer index and the block size in pixels.
+    pub fn add_text_layer(
+        &mut self,
+        name: &str,
+        block: TextBlock,
+    ) -> Result<(usize, u32, u32), String> {
+        let layout = layout_text_styled(&block.text, block.size_px, &block.style)?;
+        let (x, y) = (block.x, block.y);
+        let color = Color(block.color);
+        let outline = block.style.outline;
+        let idx = self.layers.len();
+        let mut layer = crate::Layer::blank(name.to_string(), self.w, self.h);
+        layer.text = Some(TextBlock {
+            w: layout.w,
+            h: layout.h,
+            ..block
+        });
+        self.layers.push(layer);
+        self.active = idx;
+        self.stamp_text(idx, false, &layout, outline, (x, y), color)?;
+        Ok((idx, layout.w, layout.h))
     }
 }
 
@@ -587,5 +659,77 @@ mod tests {
         .unwrap();
         let count = |d: &Document| d.layers[0].pixels.chunks(4).filter(|p| p[3] != 0).count();
         assert!(count(&b) > count(&a));
+    }
+
+    #[test]
+    fn add_text_layer_creates_renders_and_stores_block() {
+        let mut doc = Document::new(200, 120);
+        let before = doc.layers.len();
+        let block = TextBlock {
+            text: "Hi".into(),
+            size_px: 48.0,
+            color: [255, 0, 0, 255],
+            style: TextStyle::default(),
+            x: 10.0,
+            y: 10.0,
+            w: 0,
+            h: 0,
+        };
+        let (idx, w, h) = doc.add_text_layer("Text", block).unwrap();
+        assert_eq!(idx, before);
+        assert!(w > 0 && h > 0);
+        // Pixels were rendered from the block.
+        let px = |x: u32, y: u32| doc.layers[idx].pixels[((y * 200 + x) * 4) as usize + 3];
+        assert!((0..64).any(|x| (0..64).any(|y| px(x, y) > 0)));
+        // Layer is active and stores the block (with block size filled in).
+        assert_eq!(doc.active, idx);
+        let t = doc.layers[idx].text.as_ref().unwrap();
+        assert_eq!(t.text, "Hi");
+        assert_eq!((w, h), (t.w, t.h));
+    }
+
+    #[test]
+    fn add_text_layer_invalid_block_adds_no_layer() {
+        let mut doc = Document::new(64, 64);
+        let mut block = TextBlock {
+            text: "Bad".into(),
+            size_px: 4.0, // below MIN_TEXT_PX
+            color: [0, 0, 0, 255],
+            style: TextStyle::default(),
+            x: 0.0,
+            y: 0.0,
+            w: 0,
+            h: 0,
+        };
+        assert!(doc.add_text_layer("T", block.clone()).is_err());
+        block.size_px = 48.0;
+        block.text = "   ".into();
+        assert!(doc.add_text_layer("T", block).is_err());
+        assert_eq!(doc.layers.len(), 1);
+    }
+
+    #[test]
+    fn undo_after_add_text_layer_does_not_corrupt() {
+        let mut doc = Document::new(200, 120);
+        let block = TextBlock {
+            text: "Hi".into(),
+            size_px: 48.0,
+            color: [255, 0, 0, 255],
+            style: TextStyle::default(),
+            x: 10.0,
+            y: 10.0,
+            w: 0,
+            h: 0,
+        };
+        let (idx, w, h) = doc.add_text_layer("Text", block).unwrap();
+        let snap = doc.layers[idx].pixels.clone();
+        // Creation is not undoable (matches add_layer): undo reports nothing.
+        assert!(!doc.undo());
+        // And crucially the fresh text layer is untouched.
+        assert_eq!(doc.layers[idx].pixels, snap);
+        assert!((0..64)
+            .any(|x| (0..64)
+                .any(|y| { doc.layers[idx].pixels[((y * 200 + x) * 4) as usize + 3] > 0 })));
+        assert!(w > 0 && h > 0);
     }
 }

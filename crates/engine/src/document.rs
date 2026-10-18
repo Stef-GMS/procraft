@@ -1421,6 +1421,10 @@ impl Document {
             0.0
         };
         let (w, h) = (self.w, self.h);
+        // The composite bakes the destination's rendered text: the result is
+        // a plain pixel layer, never editable text (a text source above
+        // vanishes with `src`). Pixels already match, so only the block drops.
+        self.layers[index - 1].text = None;
         let dst = &mut self.layers[index - 1];
         let (dox, doy) = (dst.ox, dst.oy);
         for y in 0..h {
@@ -1478,6 +1482,20 @@ impl Document {
         self.active = index - 1;
         self.mark_full_dirty();
         true
+    }
+
+    /// Drop text layer `index`'s vector source, leaving its rendered pixels
+    /// as an ordinary layer ("rasterize"). Pixels are untouched, so the
+    /// composite is unchanged; returns false when the layer is not text.
+    /// Undoable like any pixel edit (snapshots carry the block).
+    pub fn rasterize_text_layer(&mut self, index: usize) -> bool {
+        match self.layers.get_mut(index) {
+            Some(layer) if layer.text.is_some() => {
+                layer.text = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Composited RGB at `(x, y)` for the eyedropper, if inside the canvas.
@@ -5418,5 +5436,55 @@ mod tests {
         // And pre-move content survived the slide (moved, not wiped).
         assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (0, 0));
         let _ = at;
+    }
+
+    #[test]
+    fn rasterize_keeps_pixels_drops_block_and_undoes() {
+        use crate::text::{TextBlock, TextStyle};
+        let mut doc = Document::new(200, 120);
+        let block = TextBlock {
+            text: "Hi".into(),
+            size_px: 32.0,
+            color: [0, 0, 0, 255],
+            style: TextStyle::default(),
+            x: 10.0,
+            y: 10.0,
+            w: 0,
+            h: 0,
+        };
+        let (idx, ..) = doc.add_text_layer("T", block).unwrap();
+        let pixels = doc.layers[idx].pixels.clone();
+        doc.checkpoint();
+        assert!(doc.rasterize_text_layer(idx));
+        assert!(!doc.layers[idx].is_text());
+        assert_eq!(
+            doc.layers[idx].pixels, pixels,
+            "rasterize must not touch pixels"
+        );
+        assert!(!doc.rasterize_text_layer(idx)); // idempotent
+        assert!(doc.undo()); // rasterize is undoable
+        assert!(doc.layers[idx].is_text());
+        assert_eq!(doc.layers[idx].pixels, pixels);
+    }
+
+    #[test]
+    fn merge_down_onto_text_layer_rasterizes_target() {
+        use crate::text::{TextBlock, TextStyle};
+        let mut doc = Document::new(64, 64);
+        let block = TextBlock {
+            text: "Hi".into(),
+            size_px: 24.0,
+            color: [0, 0, 0, 255],
+            style: TextStyle::default(),
+            x: 2.0,
+            y: 2.0,
+            w: 0,
+            h: 0,
+        };
+        let (idx, ..) = doc.add_text_layer("T", block).unwrap();
+        doc.add_layer("Layer over".into()); // becomes index idx+1
+        assert!(doc.merge_down(idx + 1));
+        // The baked result must not pretend to still be editable text.
+        assert!(!doc.layers[idx].is_text());
     }
 }

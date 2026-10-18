@@ -3192,20 +3192,53 @@ fn paint_textured_quad(
     painter.add(mesh);
 }
 
-/// Marching-ants quad (a rectangle in an unrotated view): dark base line
-/// plus moving light dashes along the four corners in order.
-fn paint_selection(painter: &egui::Painter, corners: [egui::Pos2; 4], time: f64) {
+/// Preview polyline for the shape tool drag, in canvas coordinates:
+/// closed families repeat their first point, line/arrow stay open. Traces
+/// the same geometry the commit draws (engine vertex builders).
+fn shape_preview_points(
+    kind: ShapeKind,
+    ax: f32,
+    ay: f32,
+    bx: f32,
+    by: f32,
+    sides: u8,
+) -> Vec<(f32, f32)> {
+    match kind {
+        ShapeKind::Line => vec![(ax, ay), (bx, by)],
+        ShapeKind::Rect => {
+            let (lo_x, hi_x) = (ax.min(bx), ax.max(bx));
+            let (lo_y, hi_y) = (ay.min(by), ay.max(by));
+            vec![
+                (lo_x, lo_y),
+                (hi_x, lo_y),
+                (hi_x, hi_y),
+                (lo_x, hi_y),
+                (lo_x, lo_y),
+            ]
+        }
+        ShapeKind::Ellipse => Document::ellipse_vertices(ax, ay, bx, by),
+        ShapeKind::Triangle => Document::poly_vertices(ShapePoly::Triangle, ax, ay, bx, by, sides),
+        ShapeKind::Diamond => Document::poly_vertices(ShapePoly::Diamond, ax, ay, bx, by, sides),
+        ShapeKind::Star => Document::poly_vertices(ShapePoly::Star, ax, ay, bx, by, sides),
+        ShapeKind::Arrow => Document::arrow_path(ax, ay, bx, by),
+        ShapeKind::Polygon => Document::poly_vertices(ShapePoly::Polygon, ax, ay, bx, by, sides),
+    }
+}
+
+/// Marching-ants path: dark base polyline plus moving light dashes along
+/// consecutive points, dash phase carried across segments.
+fn paint_ants_path(painter: &egui::Painter, pts: &[egui::Pos2], time: f64) {
     let dark = Color32::BLACK;
     let light = Color32::WHITE;
-    for w in corners.windows(2) {
+    for w in pts.windows(2) {
         painter.line_segment([w[0], w[1]], (1.5, dark));
     }
-    painter.line_segment([corners[3], corners[0]], (1.5, dark));
     let dash = 7.0;
     let gap = 5.0;
     let period = dash + gap;
     let mut offset = (time * 28.0) as f32 % period;
-    let mut draw_dashed = |a: egui::Pos2, b: egui::Pos2| {
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
         let len = (b - a).length();
         let mut t = -offset;
         while t < len {
@@ -3218,11 +3251,14 @@ fn paint_selection(painter: &egui::Painter, corners: [egui::Pos2; 4], time: f64)
             t += period;
         }
         offset = (offset + len) % period;
-    };
-    for w in corners.windows(2) {
-        draw_dashed(w[0], w[1]);
     }
-    draw_dashed(corners[3], corners[0]);
+}
+
+/// Marching-ants quad (a rectangle in an unrotated view): dark base line
+/// plus moving light dashes along the four corners in order.
+fn paint_selection(painter: &egui::Painter, corners: [egui::Pos2; 4], time: f64) {
+    let loop_pts = [corners[0], corners[1], corners[2], corners[3], corners[0]];
+    paint_ants_path(painter, &loop_pts, time);
 }
 
 /// Eyedropper loupe cells: an odd-sided square of composited colors
@@ -7602,16 +7638,12 @@ impl eframe::App for ProCraftApp {
                     if let (Some((ax, ay)), Some((bx, by))) =
                         (self.shape_anchor, self.shape_current)
                     {
-                        paint_selection(
-                            ui.painter(),
-                            [
-                                to_screen(ax.min(bx), ay.min(by)),
-                                to_screen(ax.max(bx), ay.min(by)),
-                                to_screen(ax.max(bx), ay.max(by)),
-                                to_screen(ax.min(bx), ay.max(by)),
-                            ],
-                            ctx.input(|i| i.time),
-                        );
+                        let pts: Vec<egui::Pos2> =
+                            shape_preview_points(self.shape_kind, ax, ay, bx, by, self.shape_sides)
+                                .into_iter()
+                                .map(|(x, y)| to_screen(x, y))
+                                .collect();
+                        paint_ants_path(ui.painter(), &pts, ctx.input(|i| i.time));
                     }
                     if resp.drag_stopped() {
                         if let (Some((ax, ay)), Some((bx, by))) =
@@ -8141,6 +8173,48 @@ mod tests {
         assert_eq!(f5, KeyChord::new(ChordKey::F5, false, false, false));
         assert!(chord_from_event(&key_ev(egui::Key::Escape, egui::Modifiers::NONE)).is_none());
         assert!(chord_from_event(&key_ev(egui::Key::Enter, egui::Modifiers::NONE)).is_none());
+    }
+
+    #[test]
+    fn shape_preview_matches_kind() {
+        // Line: the bare drag segment.
+        assert_eq!(
+            shape_preview_points(ShapeKind::Line, 1.0, 2.0, 30.0, 40.0, 6),
+            vec![(1.0, 2.0), (30.0, 40.0)]
+        );
+        // Rect: closed loop between the normalized corners.
+        let rect = shape_preview_points(ShapeKind::Rect, 30.0, 40.0, 10.0, 5.0, 6);
+        assert_eq!(rect.len(), 5);
+        assert_eq!(rect.first(), rect.last());
+        assert_eq!(rect[0], (10.0, 5.0));
+        assert_eq!(rect[2], (30.0, 40.0));
+        // Closed families trace one loop per kind (star 10 vertices, n-gon
+        // sides + 1), each closing on its first point.
+        for (kind, n) in [
+            (ShapeKind::Triangle, 4),
+            (ShapeKind::Diamond, 5),
+            (ShapeKind::Star, 11),
+            (ShapeKind::Polygon, 7),
+        ] {
+            let pts = shape_preview_points(kind, 0.0, 0.0, 20.0, 20.0, 6);
+            assert_eq!(pts.len(), n, "{}", kind.name());
+            assert_eq!(pts.first(), pts.last(), "{} closes", kind.name());
+        }
+        // Sides clamp mirrors the engine (1 behaves like a triangle).
+        assert_eq!(
+            shape_preview_points(ShapeKind::Polygon, 0.0, 0.0, 20.0, 20.0, 1).len(),
+            4
+        );
+        // Ellipse: sampled loop whose endpoints coincide to sub-pixel.
+        let ell = shape_preview_points(ShapeKind::Ellipse, 0.0, 0.0, 20.0, 20.0, 6);
+        assert!(ell.len() >= 25);
+        let (ef, el) = (ell.first().unwrap(), ell.last().unwrap());
+        assert!((ef.0 - el.0).abs() < 1e-3 && (ef.1 - el.1).abs() < 1e-3);
+        // Arrow: open shaft + wings rooted at the drag start.
+        let arrow = shape_preview_points(ShapeKind::Arrow, 5.0, 5.0, 45.0, 5.0, 6);
+        assert_eq!(arrow.len(), 5);
+        assert_eq!(arrow[0], (5.0, 5.0));
+        assert_eq!(arrow[1], (45.0, 5.0));
     }
 
     #[test]

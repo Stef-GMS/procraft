@@ -1524,6 +1524,24 @@ impl Document {
         }
     }
 
+    /// Vertex loop for an ellipse inscribed in the box (closed: the last
+    /// sample lands on the first). Empty for degenerate boxes (< 2px on
+    /// either axis), mirroring [`Self::shape_ellipse`].
+    pub fn ellipse_vertices(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<(f32, f32)> {
+        let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+        let (rx, ry) = ((x1 - x0).abs() * 0.5, (y1 - y0).abs() * 0.5);
+        if rx < 1.0 || ry < 1.0 {
+            return Vec::new();
+        }
+        let n = (((rx + ry) * std::f32::consts::PI * 0.5).round() as usize).clamp(24, 720);
+        let mut v = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            let t = i as f32 / n as f32 * std::f32::consts::TAU;
+            v.push((cx + rx * t.cos(), cy + ry * t.sin()));
+        }
+        v
+    }
+
     /// Ellipse outline inside the box. Caller checkpoints first.
     pub fn shape_ellipse(
         &mut self,
@@ -1534,17 +1552,10 @@ impl Document {
         x1: f32,
         y1: f32,
     ) {
-        let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
-        let (rx, ry) = ((x1 - x0).abs() * 0.5, (y1 - y0).abs() * 0.5);
-        if rx < 1.0 || ry < 1.0 {
-            return;
-        }
-        let n = (((rx + ry) * std::f32::consts::PI * 0.5).round() as usize).clamp(24, 720);
+        let pts = Self::ellipse_vertices(x0, y0, x1, y1);
         let mut last = None;
         let mut left = 0.0;
-        for i in 0..=n {
-            let t = i as f32 / n as f32 * std::f32::consts::TAU;
-            let p = (cx + rx * t.cos(), cy + ry * t.sin());
+        for &p in &pts {
             let r = self.stroke_to(brush, color, last, p, left);
             last = r.0;
             left = r.1;
@@ -1601,8 +1612,9 @@ impl Document {
 
     /// Closed vertex loop (last == first) for a polygonal shape in the box.
     /// Triangle/diamond/star are fixed; `polygon` is the regular N-gon
-    /// (`sides` clamped 3..=12, first vertex on top).
-    fn poly_vertices(
+    /// (`sides` clamped 3..=12, first vertex on top). Shared with the
+    /// app's drag preview so it traces exactly what a commit draws.
+    pub fn poly_vertices(
         kind: ShapePoly,
         x0: f32,
         y0: f32,
@@ -1648,7 +1660,8 @@ impl Document {
 
     /// Open stroke path for an arrow along the drag direction: shaft plus
     /// two head wings (backtracked, like a hand stroke). Caller checkpoints.
-    fn arrow_path(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<(f32, f32)> {
+    /// Shared with the app's drag preview.
+    pub fn arrow_path(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<(f32, f32)> {
         let (dx, dy) = (x1 - x0, y1 - y0);
         let len = (dx * dx + dy * dy).sqrt();
         if len < 2.0 {
@@ -2170,6 +2183,27 @@ mod tests {
             doc.layers[0].pixels[tip + 3] > 0,
             "arrowhead lands at the tip"
         );
+    }
+
+    #[test]
+    fn ellipse_vertices_closed_on_curve() {
+        let pts = Document::ellipse_vertices(4.0, 6.0, 28.0, 22.0);
+        assert!(pts.len() >= 25, "sampled loop, got {}", pts.len());
+        let (first, last) = (pts.first().unwrap(), pts.last().unwrap());
+        assert!(
+            (first.0 - last.0).abs() < 1e-3 && (first.1 - last.1).abs() < 1e-3,
+            "loop closes: {first:?} vs {last:?}"
+        );
+        for &(x, y) in &pts {
+            let e = ((x - 16.0) / 12.0).powi(2) + ((y - 14.0) / 8.0).powi(2);
+            assert!((e - 1.0).abs() < 1e-3, "on-curve: {e}");
+        }
+    }
+
+    #[test]
+    fn ellipse_vertices_degenerate_empty() {
+        assert!(Document::ellipse_vertices(10.0, 10.0, 11.5, 30.0).is_empty());
+        assert!(Document::ellipse_vertices(10.0, 10.0, 30.0, 11.5).is_empty());
     }
 
     #[test]

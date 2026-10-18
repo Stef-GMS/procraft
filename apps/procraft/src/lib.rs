@@ -2636,6 +2636,31 @@ fn brush_ring_radius(size: f32, zoom: f32) -> f32 {
     (size * zoom * 0.5).max(2.0)
 }
 
+/// Size for the cursor ring, from the size the tool actually uses.
+/// `None` for tools without a size ring.
+fn tool_ring_size(tool: Tool, brush_size: f32, liquify_size: f32) -> Option<f32> {
+    match tool {
+        Tool::Brush | Tool::Eraser | Tool::Smudge => Some(brush_size),
+        Tool::Liquify => Some(liquify_size),
+        _ => None,
+    }
+}
+
+/// One liquify frame step: move the warp anchor from `from` toward `to`
+/// at most `max_step` px. Returns the new anchor and the push applied
+/// this frame; the remainder arrives next frame (trailing glide, no
+/// jumpy mega-pushes).
+fn liquify_step(from: (f32, f32), to: (f32, f32), max_step: f32) -> ((f32, f32), (f32, f32)) {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len <= max_step || len == 0.0 {
+        return (to, (dx, dy));
+    }
+    let s = max_step / len;
+    let (mx, my) = (dx * s, dy * s);
+    ((from.0 + mx, from.1 + my), (mx, my))
+}
+
 /// Top-bar width era. Below [`WIDE_BAR_W`] the zoom/rotate/theme/About
 /// group folds into a View menu (phone portrait starves the inline
 /// stepper to a character-wide column); mobile at/above it is Tablet
@@ -7019,10 +7044,10 @@ impl eframe::App for ProCraftApp {
                     }
                 }
                 // Brush cursor ring: nominal dab diameter at the hover point
-                // (brush tools only). Dark + white strokes stay visible on
-                // any paper color; hover has no pressure so this is the
+                // (brush tools + liquify). Dark + white strokes stay visible
+                // on any paper color; hover has no pressure so this is the
                 // base size, dynamics spread real dabs around it.
-                if matches!(self.tool, Tool::Brush | Tool::Eraser | Tool::Smudge) {
+                if let Some(size) = tool_ring_size(self.tool, self.brush.size, self.liquify_size) {
                     // While a size drag runs the ring stays pinned at the
                     // gesture's start point (the size, not the pointer,
                     // is what's moving).
@@ -7032,7 +7057,7 @@ impl eframe::App for ProCraftApp {
                         .map(|sd| sd.anchor)
                         .or_else(|| resp.hover_pos());
                     if let Some(pos) = ring_at {
-                        let r = brush_ring_radius(self.brush.size, z);
+                        let r = brush_ring_radius(size, z);
                         ui.painter()
                             .circle_stroke(pos, r, (2.0, Color32::from_gray(30)));
                         ui.painter().circle_stroke(pos, r, (1.0, Color32::WHITE));
@@ -7797,17 +7822,24 @@ impl eframe::App for ProCraftApp {
                 if self.tool == Tool::Liquify {
                     // M40 push: warp the active layer along each drag
                     // segment (one checkpoint per stroke, like paint).
+                    // Touch-safe position: `hover_pos` is None on
+                    // touch-tap/release frames (PointerGone).
+                    let pos = resp.interact_pointer_pos().or_else(|| resp.hover_pos());
                     if resp.drag_started() && !gesture && !self.text_paint_blocked() {
-                        if let Some(pos) = resp.hover_pos() {
+                        if let Some(pos) = pos {
                             self.doc.checkpoint();
                             self.liquify_from = Some(to_canvas(pos));
                         }
                     }
-                    if self.liquify_from.is_some() && resp.dragged() {
-                        if let Some(pos) = resp.hover_pos() {
-                            let (x, y) = to_canvas(pos);
-                            let (fx, fy) = self.liquify_from.unwrap();
-                            let (dx, dy) = (x - fx, y - fy);
+                    if resp.dragged() {
+                        if let (Some(from), Some(pos)) = (self.liquify_from, pos) {
+                            let to = to_canvas(pos);
+                            // Cap the per-frame push at a quarter of the
+                            // liquify radius: a laggy pointer must not
+                            // drag whole slabs sideways, which tears
+                            // transparent gaps into the layer.
+                            let max_step = (self.liquify_size * 0.125).max(2.0);
+                            let ((x, y), (dx, dy)) = liquify_step(from, to, max_step);
                             if dx != 0.0 || dy != 0.0 {
                                 let active = self.doc.active;
                                 let (size, strength) = (self.liquify_size, self.liquify_strength);
@@ -8736,6 +8768,40 @@ mod tests {
         assert_eq!(brush_ring_radius(20.0, 2.0), 20.0);
         // Tiny brushes stay visible (2px floor).
         assert_eq!(brush_ring_radius(1.0, 0.5), 2.0);
+    }
+
+    #[test]
+    fn liquify_step_caps_move_and_carries_the_rest() {
+        // Within the cap: exact move, full delta.
+        assert_eq!(
+            liquify_step((0.0, 0.0), (3.0, 4.0), 10.0),
+            ((3.0, 4.0), (3.0, 4.0))
+        );
+        // Beyond the cap: the anchor advances max_step along the segment
+        // and the push matches the advance (remainder arrives next frame).
+        let (pos, d) = liquify_step((0.0, 0.0), (30.0, 40.0), 5.0);
+        assert!(
+            (pos.0 - 3.0).abs() < 1e-4 && (pos.1 - 4.0).abs() < 1e-4,
+            "{pos:?}"
+        );
+        assert!(
+            (d.0 - 3.0).abs() < 1e-4 && (d.1 - 4.0).abs() < 1e-4,
+            "{d:?}"
+        );
+        // Idle hand: no move, zero push.
+        assert_eq!(
+            liquify_step((7.0, 8.0), (7.0, 8.0), 5.0),
+            ((7.0, 8.0), (0.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn tool_ring_size_uses_the_tools_own_size() {
+        assert_eq!(tool_ring_size(Tool::Brush, 20.0, 128.0), Some(20.0));
+        assert_eq!(tool_ring_size(Tool::Eraser, 20.0, 128.0), Some(20.0));
+        assert_eq!(tool_ring_size(Tool::Smudge, 20.0, 128.0), Some(20.0));
+        assert_eq!(tool_ring_size(Tool::Liquify, 20.0, 128.0), Some(128.0));
+        assert_eq!(tool_ring_size(Tool::Fill, 20.0, 128.0), None);
     }
 
     #[test]

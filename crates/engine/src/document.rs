@@ -150,6 +150,57 @@ impl SymmetryMode {
         }
     }
 
+    /// Like `mirrored_points`, but carries a push vector (vx, vy) along:
+    /// mirrors negate the mirrored component, kaleidoscope rotates both.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mirrored_pushes(
+        self,
+        segments: u8,
+        cx: f32,
+        cy: f32,
+        x: f32,
+        y: f32,
+        vx: f32,
+        vy: f32,
+    ) -> Vec<(f32, f32, f32, f32)> {
+        let (mx, mvx) = (2.0 * cx - x, -vx);
+        let (my, mvy) = (2.0 * cy - y, -vy);
+        match self {
+            SymmetryMode::Off => vec![(x, y, vx, vy)],
+            SymmetryMode::Horizontal => vec![(x, y, vx, vy), (mx, y, mvx, vy)],
+            SymmetryMode::Vertical => vec![(x, y, vx, vy), (x, my, vx, mvy)],
+            SymmetryMode::Both => vec![
+                (x, y, vx, vy),
+                (mx, y, mvx, vy),
+                (x, my, vx, mvy),
+                (mx, my, mvx, mvy),
+            ],
+            SymmetryMode::Kaleidoscope => {
+                // Dihedral symmetry: rotate by k*step, mirroring on odd k.
+                let n = segments.clamp(2, 16) as usize;
+                let (dx, dy) = (x - cx, y - cy);
+                let step = std::f32::consts::TAU / n as f32;
+                (0..n)
+                    .map(|k| {
+                        let (px, mut py) = (dx, dy);
+                        let (ux, mut uy) = (vx, vy);
+                        if k % 2 == 1 {
+                            py = -py;
+                            uy = -uy;
+                        }
+                        let (s, c) = (k as f32 * step).sin_cos();
+                        (
+                            cx + px * c - py * s,
+                            cy + px * s + py * c,
+                            ux * c - uy * s,
+                            ux * s + uy * c,
+                        )
+                    })
+                    .collect()
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn mirrored_pixels(
         self,
@@ -2554,10 +2605,47 @@ impl Document {
         if dx == 0.0 && dy == 0.0 {
             return;
         }
-        let (w, h) = (self.w, self.h);
-        if w == 0 || h == 0 {
+        if self.w == 0 || self.h == 0 {
             return;
         }
+        // One push per symmetry mirror, deduped when a mirror lands on an
+        // identical (point, vector) pair (e.g. kaleidoscope center).
+        let (ccx, ccy) = self.symmetry_center_px();
+        let pushes = self
+            .symmetry
+            .mirrored_pushes(self.symmetry_segments, ccx, ccy, x, y, dx, dy);
+        let mut done: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(pushes.len());
+        for (px, py, pdx, pdy) in pushes {
+            if done.iter().any(|&(a, b, c, d)| {
+                (a - px).abs() < 0.001
+                    && (b - py).abs() < 0.001
+                    && (c - pdx).abs() < 0.001
+                    && (d - pdy).abs() < 0.001
+            }) {
+                continue;
+            }
+            done.push((px, py, pdx, pdy));
+            self.liquify_push(index, px, py, pdx, pdy, size, strength);
+        }
+    }
+
+    /// One warp centered at (x, y) pushing pixels by (dx, dy). Reads from
+    /// a bounded region copy (disc plus sample reach), not the full layer.
+    #[allow(clippy::too_many_arguments)]
+    fn liquify_push(
+        &mut self,
+        index: usize,
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+        size: f32,
+        strength: f32,
+    ) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
         let radius = size * 0.5;
         let bx0 = ((x - radius).floor().max(0.0)) as u32;
         let by0 = ((y - radius).floor().max(0.0)) as u32;
@@ -2566,14 +2654,27 @@ impl Document {
         if bx0 > bx1 || by0 > by1 {
             return;
         }
-        let src = self.layers[index].pixels.clone();
+        // Reverse samples reach up to |d| * strength px back along the
+        // push; copy that hull so the whole warp reads from the region.
+        let reach = (dx.hypot(dy) * strength).ceil() as u32 + 1;
+        let rx0 = bx0.saturating_sub(reach);
+        let ry0 = by0.saturating_sub(reach);
+        let rx1 = (bx1 + reach).min(w - 1);
+        let ry1 = (by1 + reach).min(h - 1);
+        let rw = rx1 - rx0 + 1;
+        let src_pixels = &self.layers[index].pixels;
+        let mut src = Vec::with_capacity((rw * (ry1 - ry0 + 1) * 4) as usize);
+        for ry in ry0..=ry1 {
+            let s = ((ry * w + rx0) * 4) as usize;
+            src.extend_from_slice(&src_pixels[s..s + (rw * 4) as usize]);
+        }
         let sample = |sx: f32, sy: f32, ch: usize| -> f32 {
             let sx = sx.clamp(0.0, w as f32 - 1.0);
             let sy = sy.clamp(0.0, h as f32 - 1.0);
             let (x0, y0) = (sx.floor() as u32, sy.floor() as u32);
             let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
             let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
-            let at = |x: u32, y: u32| src[((y * w + x) as usize * 4) + ch] as f32;
+            let at = |x: u32, y: u32| src[(((y - ry0) * rw + (x - rx0)) * 4) as usize + ch] as f32;
             at(x0, y0) * (1.0 - fx) * (1.0 - fy)
                 + at(x1, y0) * fx * (1.0 - fy)
                 + at(x0, y1) * (1.0 - fx) * fy
@@ -5789,6 +5890,132 @@ mod tests {
         doc.liquify(0, 8.5, 8.5, 6.0, 0.0, 12.0, 1.0);
         let o = ((25 * 32 + 25) * 4) as usize;
         assert_eq!(doc.layers[0].pixels[o], before[o]);
+    }
+
+    #[test]
+    fn liquify_matches_naive_reference_with_long_reach() {
+        // Characterization: the region-bounded copy must reproduce the
+        // original whole-buffer warp bit-for-bit, including long pushes
+        // whose reverse samples read far outside the disc (and off-canvas).
+        #[allow(clippy::too_many_arguments)]
+        fn naive_liquify(
+            src: &[u8],
+            w: u32,
+            h: u32,
+            x: f32,
+            y: f32,
+            dx: f32,
+            dy: f32,
+            size: f32,
+            strength: f32,
+        ) -> Vec<u8> {
+            let radius = size * 0.5;
+            let bx0 = ((x - radius).floor().max(0.0)) as u32;
+            let by0 = ((y - radius).floor().max(0.0)) as u32;
+            let bx1 = ((x + radius).ceil().min(w as f32 - 1.0).max(0.0)) as u32;
+            let by1 = ((y + radius).ceil().min(h as f32 - 1.0).max(0.0)) as u32;
+            let sample = |sx: f32, sy: f32, ch: usize| -> f32 {
+                let sx = sx.clamp(0.0, w as f32 - 1.0);
+                let sy = sy.clamp(0.0, h as f32 - 1.0);
+                let (x0, y0) = (sx.floor() as u32, sy.floor() as u32);
+                let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+                let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+                let at = |x: u32, y: u32| src[((y * w + x) as usize * 4) + ch] as f32;
+                at(x0, y0) * (1.0 - fx) * (1.0 - fy)
+                    + at(x1, y0) * fx * (1.0 - fy)
+                    + at(x0, y1) * (1.0 - fx) * fy
+                    + at(x1, y1) * fx * fy
+            };
+            let mut pixels = src.to_vec();
+            for py in by0..=by1 {
+                for px in bx0..=bx1 {
+                    let dist = (((px as f32 + 0.5 - x).powi(2) + (py as f32 + 0.5 - y).powi(2))
+                        .sqrt()
+                        / radius)
+                        .min(1.0);
+                    let f = 0.5 + 0.5 * (std::f32::consts::PI * dist).cos();
+                    let (ox, oy) = (px as f32 - dx * strength * f, py as f32 - dy * strength * f);
+                    if (ox - px as f32).abs() < f32::EPSILON
+                        && (oy - py as f32).abs() < f32::EPSILON
+                    {
+                        continue;
+                    }
+                    let o = ((py * w + px) * 4) as usize;
+                    for ch in 0..4 {
+                        // No selection: k = 1, write the sampled value.
+                        pixels[o + ch] = sample(ox, oy, ch).round() as u8;
+                    }
+                }
+            }
+            pixels
+        }
+        let mut doc = Document::new(32, 32);
+        // Deterministic pseudo-random paint so any region-copy slip shows.
+        for (i, b) in doc.layers[0].pixels.iter_mut().enumerate() {
+            *b = ((i * 37 + 11) % 256) as u8;
+        }
+        // Reach (|d| = 11.4) far beyond the disc: samples come from the
+        // ring outside the write bbox.
+        let src = doc.layers[0].pixels.clone();
+        doc.liquify(0, 20.0, 12.0, 9.0, -7.0, 14.0, 1.0);
+        assert_eq!(
+            doc.layers[0].pixels,
+            naive_liquify(&src, 32, 32, 20.0, 12.0, 9.0, -7.0, 14.0, 1.0)
+        );
+        // Corner warp: reads clamp against the canvas edge.
+        let src = doc.layers[0].pixels.clone();
+        doc.liquify(0, 2.0, 2.0, 5.0, 4.0, 14.0, 0.7);
+        assert_eq!(
+            doc.layers[0].pixels,
+            naive_liquify(&src, 32, 32, 2.0, 2.0, 5.0, 4.0, 14.0, 0.7)
+        );
+    }
+
+    #[test]
+    fn liquify_mirrors_with_symmetry() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(32, 32);
+        let brush = Brush {
+            size: 30.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        // Two bars mirrored about the canvas middle: [3,7] and [24,28].
+        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 3, 8, 7, 24);
+        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 24, 8, 28, 24);
+        doc.symmetry = SymmetryMode::Horizontal;
+        // Push right at the left bar's rim: the mirrored push runs left
+        // at the mirrored point with a mirrored direction.
+        doc.liquify(0, 7.5, 15.5, 6.0, 0.0, 16.0, 1.0);
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 32 + x) * 4) as usize];
+        assert!(at(&doc, 10, 15) > 200, "primary rim advanced");
+        assert!(at(&doc, 21, 15) > 200, "mirrored rim advanced");
+        assert_eq!(at(&doc, 15, 15), 0, "between the discs untouched");
+    }
+
+    #[test]
+    fn liquify_mirrors_kaleidoscope_push_vectors() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(32, 32);
+        let brush = Brush {
+            size: 30.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        // East bar and its k=1 (90 deg) image, origin at the middle.
+        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 21, 13, 23, 19);
+        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 13, 21, 19, 23);
+        doc.set_symmetry_center(16.0, 16.0);
+        doc.symmetry = SymmetryMode::Kaleidoscope;
+        doc.symmetry_segments = 4;
+        // Push up at the east bar's middle: k=1 mirrors the point 90
+        // degrees CCW (south) and rotates the push vector to point west.
+        doc.liquify(0, 23.0, 16.0, 0.0, -6.0, 16.0, 1.0);
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 32 + x) * 4) as usize];
+        assert!(at(&doc, 23, 13) > 200, "primary push advanced the east rim");
+        assert!(at(&doc, 12, 23) > 200, "k=1 push pulled the south bar west");
     }
 
     #[test]

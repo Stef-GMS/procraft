@@ -4,7 +4,7 @@ members = ["crates/engine", "apps/procraft"]
 exclude = ["crates/rfd-shim"]
 
 [workspace.package]
-version = "0.8.5"
+version = "0.9.0"
 edition = "2021"
 license = "MIT"
 authors = ["surfrpt1"]

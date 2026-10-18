@@ -47,6 +47,6 @@ pub use shortcuts::{
 pub use tap::{classify_touch_tap, TapAction};
 pub use text::{
     check_font, layout_text, layout_text_styled, TextBlock, TextLayout, TextStyle, FONT_BYTES,
-    MAX_LAYOUT_SIDE, MAX_OUTLINE_PX, MAX_TEXT_CHARS, MAX_TEXT_LINES, MAX_TEXT_PX, MAX_TEXT_SPACING,
-    MIN_TEXT_PX,
+    MAX_FONT_BYTES, MAX_LAYOUT_SIDE, MAX_OUTLINE_PX, MAX_TEXT_BYTES, MAX_TEXT_CHARS,
+    MAX_TEXT_LINES, MAX_TEXT_PX, MAX_TEXT_SPACING, MIN_TEXT_PX,
 };

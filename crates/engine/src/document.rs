@@ -2682,13 +2682,13 @@ impl Document {
 
     /// Save the full project (layers, opacity, blend, background, symmetry)
     /// to a `.procraft` file: magic + little-endian records, zlib-compressed
-    /// pixels. Version 10 adds per-layer frame holds (v1-v9 files still open,
-    /// with every frame held once; old app versions cleanly refuse v10 files
-    /// at the magic).
+    /// pixels. Version 11 adds per-layer text blocks (v10 and older files
+    /// still open text-less; old app versions cleanly refuse v11 files at
+    /// the magic).
     pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        f.write_all(b"PCRAFT10").map_err(|e| e.to_string())?;
+        f.write_all(b"PCRAFT11").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes())
             .map_err(|e| e.to_string())?;
         f.write_all(&self.h.to_le_bytes())
@@ -2818,6 +2818,52 @@ impl Document {
             // records end at the mask.
             f.write_all(&layer.hold.to_le_bytes())
                 .map_err(|e| e.to_string())?;
+            // v11 appends the text-layer definition; pixel-only layers
+            // write a zero flag so every record stays self-describing.
+            match &layer.text {
+                Some(t) => {
+                    f.write_all(&[1u8]).map_err(|e| e.to_string())?;
+                    f.write_all(&t.x.to_le_bytes()).map_err(|e| e.to_string())?;
+                    f.write_all(&t.y.to_le_bytes()).map_err(|e| e.to_string())?;
+                    f.write_all(&t.size_px.to_le_bytes())
+                        .map_err(|e| e.to_string())?;
+                    f.write_all(&t.color).map_err(|e| e.to_string())?;
+                    f.write_all(&t.w.to_le_bytes()).map_err(|e| e.to_string())?;
+                    f.write_all(&t.h.to_le_bytes()).map_err(|e| e.to_string())?;
+                    f.write_all(&t.style.leading.to_le_bytes())
+                        .map_err(|e| e.to_string())?;
+                    f.write_all(&t.style.tracking.to_le_bytes())
+                        .map_err(|e| e.to_string())?;
+                    match t.style.outline {
+                        Some((c, px)) => {
+                            f.write_all(&[1u8]).map_err(|e| e.to_string())?;
+                            f.write_all(&c.0).map_err(|e| e.to_string())?;
+                            f.write_all(&px.to_le_bytes()).map_err(|e| e.to_string())?;
+                        }
+                        None => {
+                            f.write_all(&[0u8]).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    match &t.style.font_bytes {
+                        Some(font) => {
+                            f.write_all(&[1u8]).map_err(|e| e.to_string())?;
+                            f.write_all(&(font.len() as u32).to_le_bytes())
+                                .map_err(|e| e.to_string())?;
+                            f.write_all(font).map_err(|e| e.to_string())?;
+                        }
+                        None => {
+                            f.write_all(&[0u8]).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    let text = t.text.as_bytes();
+                    f.write_all(&(text.len() as u32).to_le_bytes())
+                        .map_err(|e| e.to_string())?;
+                    f.write_all(text).map_err(|e| e.to_string())?;
+                }
+                None => {
+                    f.write_all(&[0u8]).map_err(|e| e.to_string())?;
+                }
+            }
         }
         Ok(())
     }
@@ -2846,7 +2892,8 @@ impl Document {
             Ok(head)
         };
         let magic = take(8)?.to_vec();
-        let v10 = magic == b"PCRAFT10";
+        let v11 = magic == b"PCRAFT11";
+        let v10 = v11 || magic == b"PCRAFT10";
         let v9 = v10 || magic == b"PCRAFT09";
         let v8 = v9 || magic == b"PCRAFT08";
         let v7 = v8 || magic == b"PCRAFT07";
@@ -3146,6 +3193,95 @@ impl Document {
             } else {
                 1
             };
+            // v11 appends the text-layer definition; older files end the
+            // layer record at the hold. Hostile values fail closed (caps
+            // and finite floats), in-range extremes clamp to editor limits.
+            let text = if v11 {
+                use crate::text::{
+                    check_font, TextBlock, TextStyle, MAX_FONT_BYTES, MAX_LAYOUT_SIDE,
+                    MAX_OUTLINE_PX, MAX_TEXT_BYTES, MAX_TEXT_PX, MAX_TEXT_SPACING, MIN_TEXT_PX,
+                };
+                if take(1)?[0] == 0 {
+                    None
+                } else {
+                    let f32_at = |b: Result<&[u8], String>| -> Result<f32, String> {
+                        let b = b?;
+                        Ok(f32::from_le_bytes(
+                            b[..4]
+                                .try_into()
+                                .map_err(|_| "bad text value".to_string())?,
+                        ))
+                    };
+                    let u32_at = |b: Result<&[u8], String>| -> Result<u32, String> {
+                        let b = b?;
+                        Ok(u32::from_le_bytes(
+                            b[..4]
+                                .try_into()
+                                .map_err(|_| "bad text value".to_string())?,
+                        ))
+                    };
+                    let x = f32_at(take(4))?;
+                    let y = f32_at(take(4))?;
+                    let size_px = f32_at(take(4))?;
+                    let color: [u8; 4] = take(4)?
+                        .try_into()
+                        .map_err(|_| "bad text color".to_string())?;
+                    let w = u32_at(take(4))?;
+                    let h = u32_at(take(4))?;
+                    let leading = f32_at(take(4))?;
+                    let tracking = f32_at(take(4))?;
+                    if ![x, y, size_px, leading, tracking]
+                        .iter()
+                        .all(|v| v.is_finite())
+                    {
+                        return Err("project has non-finite text values".to_string());
+                    }
+                    let outline = if take(1)?[0] == 0 {
+                        None
+                    } else {
+                        let c: [u8; 4] = take(4)?
+                            .try_into()
+                            .map_err(|_| "bad text outline".to_string())?;
+                        let px = u32_at(take(4))?;
+                        Some((crate::brush::Color(c), px.clamp(1, MAX_OUTLINE_PX)))
+                    };
+                    let font_bytes = if take(1)?[0] == 0 {
+                        None
+                    } else {
+                        let len = u32_at(take(4))? as usize;
+                        if len > MAX_FONT_BYTES {
+                            return Err("project text font is too large".to_string());
+                        }
+                        let bytes = take(len)?.to_vec();
+                        check_font(&bytes)
+                            .map_err(|e| format!("project text font is invalid: {e}"))?;
+                        Some(bytes)
+                    };
+                    let len = u32_at(take(4))? as usize;
+                    if len > MAX_TEXT_BYTES {
+                        return Err("project text is too large".to_string());
+                    }
+                    let text = String::from_utf8(take(len)?.to_vec())
+                        .map_err(|_| "project text is not utf-8".to_string())?;
+                    Some(TextBlock {
+                        text,
+                        size_px: size_px.clamp(MIN_TEXT_PX, MAX_TEXT_PX),
+                        color,
+                        style: TextStyle {
+                            font_bytes,
+                            leading: leading.clamp(-MAX_TEXT_SPACING, MAX_TEXT_SPACING),
+                            tracking: tracking.clamp(-MAX_TEXT_SPACING, MAX_TEXT_SPACING),
+                            outline,
+                        },
+                        x,
+                        y,
+                        w: w.min(MAX_LAYOUT_SIDE),
+                        h: h.min(MAX_LAYOUT_SIDE),
+                    })
+                }
+            } else {
+                None
+            };
             layers.push(Layer {
                 name,
                 visible,
@@ -3158,7 +3294,7 @@ impl Document {
                 oy,
                 hold,
                 group,
-                text: None,
+                text,
             });
         }
         if !cur.is_empty() {
@@ -3424,7 +3560,7 @@ mod tests {
         let path = dir.join("procraft-v8.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT10");
+        assert_eq!(&head[..8], b"PCRAFT11");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.groups.len(), 1);
@@ -3475,7 +3611,7 @@ mod tests {
         let path = dir.join("procraft-v9.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT10");
+        assert_eq!(&head[..8], b"PCRAFT11");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.groups.len(), 1);
@@ -3543,7 +3679,7 @@ mod tests {
         let path = dir.join("procraft-v10.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT10");
+        assert_eq!(&head[..8], b"PCRAFT11");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].hold, 3);
@@ -3597,6 +3733,141 @@ mod tests {
         assert_eq!(back.layers[0].hold, 1);
         assert_eq!(back.groups[0].opacity, 0.5);
         assert_eq!(back.layers[0].group, Some(7));
+    }
+
+    #[test]
+    fn v10_project_opens_text_less() {
+        // Hand-build a minimal version-10 file (frame hold tail, no v11
+        // text record).
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v10-compat.pcraft");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT10");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // Symmetry off.
+        buf.extend_from_slice(&[6]);
+        buf.extend_from_slice(&[0]); // No mirror center.
+        buf.extend_from_slice(&0u32.to_le_bytes()); // No groups.
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // Blend: Normal.
+        buf.extend_from_slice(&[0]); // Clip: off.
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // No group.
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&[9u8; 2 * 4]).unwrap();
+        let packed = enc.finish().unwrap();
+        buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&packed);
+        buf.extend_from_slice(&[0]); // No mask.
+        buf.extend_from_slice(&1u32.to_le_bytes()); // Frame hold.
+        std::fs::write(&path, &buf).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!back.layers[0].is_text());
+    }
+
+    #[test]
+    fn save_emits_v11_magic() {
+        let doc = Document::new(2, 1);
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v11-magic.pcraft");
+        doc.save_project(&path).unwrap();
+        let head = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(&head[..8], b"PCRAFT11");
+    }
+
+    #[test]
+    fn v11_load_rejects_hostile_text_records() {
+        use crate::text::{MAX_FONT_BYTES, MAX_TEXT_BYTES};
+        use std::io::Write;
+        let build = |font: Option<(u32, Vec<u8>)>, x: f32, text: &str| -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"PCRAFT11");
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&[255, 255, 255, 255]);
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&[0]); // Symmetry off.
+            buf.extend_from_slice(&[6]);
+            buf.extend_from_slice(&[0]); // No mirror center.
+            buf.extend_from_slice(&0u32.to_le_bytes()); // No groups.
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(b"L");
+            buf.extend_from_slice(&[1]);
+            buf.extend_from_slice(&1.0f32.to_le_bytes());
+            buf.extend_from_slice(&[0]); // Blend: Normal.
+            buf.extend_from_slice(&[0]); // Clip: off.
+            buf.extend_from_slice(&0i32.to_le_bytes());
+            buf.extend_from_slice(&0i32.to_le_bytes());
+            buf.extend_from_slice(&[0]); // No group.
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(&[9u8; 2 * 4]).unwrap();
+            let packed = enc.finish().unwrap();
+            buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&packed);
+            buf.extend_from_slice(&[0]); // No mask.
+            buf.extend_from_slice(&1u32.to_le_bytes()); // Frame hold.
+                                                        // v11 text record.
+            buf.extend_from_slice(&[1]); // Has text.
+            buf.extend_from_slice(&x.to_le_bytes());
+            buf.extend_from_slice(&8.0f32.to_le_bytes());
+            buf.extend_from_slice(&24.0f32.to_le_bytes());
+            buf.extend_from_slice(&[0, 0, 0, 255]);
+            buf.extend_from_slice(&5u32.to_le_bytes());
+            buf.extend_from_slice(&7u32.to_le_bytes());
+            buf.extend_from_slice(&0.0f32.to_le_bytes());
+            buf.extend_from_slice(&0.0f32.to_le_bytes());
+            buf.extend_from_slice(&[0]); // No outline.
+            match &font {
+                Some((len, bytes)) => {
+                    buf.extend_from_slice(&[1]);
+                    buf.extend_from_slice(&len.to_le_bytes());
+                    buf.extend_from_slice(bytes);
+                }
+                None => buf.extend_from_slice(&[0]),
+            }
+            let t = text.as_bytes();
+            buf.extend_from_slice(&(t.len() as u32).to_le_bytes());
+            buf.extend_from_slice(t);
+            buf
+        };
+        let dir = std::env::temp_dir();
+        // Font declared over the 2 MiB cap.
+        let path = dir.join("procraft-v11-hostile-font.pcraft");
+        std::fs::write(
+            &path,
+            build(Some((MAX_FONT_BYTES as u32 + 1, Vec::new())), 4.0, "hi"),
+        )
+        .unwrap();
+        assert!(Document::open_project(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+        // Non-finite anchor.
+        let path = dir.join("procraft-v11-hostile-nan.pcraft");
+        std::fs::write(&path, build(None, f32::NAN, "hi")).unwrap();
+        assert!(Document::open_project(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+        // Text over the 16 KiB cap.
+        let path = dir.join("procraft-v11-hostile-text.pcraft");
+        std::fs::write(&path, build(None, 4.0, &"x".repeat(MAX_TEXT_BYTES + 1))).unwrap();
+        assert!(Document::open_project(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+        // Structurally valid record but unparseable font bytes.
+        let path = dir.join("procraft-v11-hostile-badfont.pcraft");
+        std::fs::write(&path, build(Some((100, vec![0xAA; 100])), 4.0, "hi")).unwrap();
+        assert!(Document::open_project(&path).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -3901,7 +4172,7 @@ mod tests {
         let path = dir.join("procraft-v6.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT10");
+        assert_eq!(&head[..8], b"PCRAFT11");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].blend, BlendMode::Difference);
@@ -4797,7 +5068,7 @@ mod tests {
             meta.len()
         );
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT10");
+        assert_eq!(&head[..8], b"PCRAFT11");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].pixels, doc.layers[0].pixels);

@@ -20,6 +20,10 @@ pub const MAX_TEXT_PX: f32 = 256.0;
 /// Input caps (bound layout memory; the layout itself is capped below too).
 pub const MAX_TEXT_CHARS: usize = 1024;
 pub const MAX_TEXT_LINES: usize = 64;
+/// Text payload cap for one block (project format v11).
+pub const MAX_TEXT_BYTES: usize = 16 * 1024;
+/// Imported font bytes cap per face (project loads and imports).
+pub const MAX_FONT_BYTES: usize = 2 * 1024 * 1024;
 /// Layout bitmap cap per side (canvases are far smaller in practice).
 pub const MAX_LAYOUT_SIDE: u32 = 2048;
 
@@ -837,5 +841,42 @@ mod tests {
         );
         // A non-text layer is a clean error, not a panic.
         assert!(doc.rerender_text_layer(0).is_err());
+    }
+
+    #[test]
+    fn v11_project_roundtrip_keeps_text_block() {
+        let mut doc = Document::new(160, 120);
+        let block = TextBlock {
+            text: "Hi\nthere".into(),
+            size_px: 32.0,
+            color: [200, 30, 40, 255],
+            style: TextStyle {
+                font_bytes: Some(FONT_BYTES.to_vec()),
+                leading: 4.0,
+                tracking: 1.5,
+                outline: Some((Color([10, 20, 30, 255]), 3)),
+            },
+            x: 40.0,
+            y: 30.0,
+            w: 0,
+            h: 0,
+        };
+        let (idx, ..) = doc.add_text_layer("T", block).unwrap();
+        let expected = doc.layers[idx].text.clone().unwrap();
+        let pixels = doc.layers[idx].pixels.clone();
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v11-text.pcraft");
+        doc.save_project(&path).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let got = back.layers[idx]
+            .text
+            .as_ref()
+            .expect("text block must survive save/open");
+        assert_eq!(got, &expected);
+        let font = got.style.font_bytes.as_ref().expect("custom font survives");
+        assert_eq!(font.len(), FONT_BYTES.len());
+        assert_eq!(&font[..8], &FONT_BYTES[..8]);
+        assert_eq!(back.layers[idx].pixels, pixels);
     }
 }

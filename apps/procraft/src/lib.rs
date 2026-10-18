@@ -4467,6 +4467,12 @@ impl eframe::App for ProCraftApp {
                                                     .map_or((0.0, 0.0), |(_, x, y)| (*x, *y))
                                             });
                                             let prev = self.doc.layers[i].text.clone();
+                                            // The checkpoint snapshots the ACTIVE
+                                            // layer, and the dialog is floating —
+                                            // active can drift (layer row, playback)
+                                            // while it is open. Pin the edited layer
+                                            // so undo restores the right one.
+                                            self.doc.active = i;
                                             self.doc.checkpoint();
                                             let style = self.text_style();
                                             if let Some(b) = self.doc.layers[i].text.as_mut() {

@@ -3199,7 +3199,8 @@ impl Document {
             let text = if v11 {
                 use crate::text::{
                     check_font, TextBlock, TextStyle, MAX_FONT_BYTES, MAX_LAYOUT_SIDE,
-                    MAX_OUTLINE_PX, MAX_TEXT_BYTES, MAX_TEXT_PX, MAX_TEXT_SPACING, MIN_TEXT_PX,
+                    MAX_OUTLINE_PX, MAX_TEXT_BYTES, MAX_TEXT_CHARS, MAX_TEXT_LINES, MAX_TEXT_PX,
+                    MAX_TEXT_SPACING, MIN_TEXT_PX,
                 };
                 if take(1)?[0] == 0 {
                     None
@@ -3263,6 +3264,15 @@ impl Document {
                     }
                     let text = String::from_utf8(take(len)?.to_vec())
                         .map_err(|_| "project text is not utf-8".to_string())?;
+                    // Re-validate the editor's caps so a loaded file can
+                    // always be re-rendered by the dialog (the layout
+                    // rejects over-cap text, which would strand it).
+                    if text.chars().count() > MAX_TEXT_CHARS {
+                        return Err("project text has too many characters".to_string());
+                    }
+                    if text.lines().count() > MAX_TEXT_LINES {
+                        return Err("project text has too many lines".to_string());
+                    }
                     Some(TextBlock {
                         text,
                         size_px: size_px.clamp(MIN_TEXT_PX, MAX_TEXT_PX),
@@ -3788,7 +3798,7 @@ mod tests {
 
     #[test]
     fn v11_load_rejects_hostile_text_records() {
-        use crate::text::{MAX_FONT_BYTES, MAX_TEXT_BYTES};
+        use crate::text::{MAX_FONT_BYTES, MAX_TEXT_BYTES, MAX_TEXT_CHARS, MAX_TEXT_LINES};
         use std::io::Write;
         let build = |font: Option<(u32, Vec<u8>)>, x: f32, text: &str| -> Vec<u8> {
             let mut buf = Vec::new();
@@ -3861,6 +3871,16 @@ mod tests {
         // Text over the 16 KiB cap.
         let path = dir.join("procraft-v11-hostile-text.pcraft");
         std::fs::write(&path, build(None, 4.0, &"x".repeat(MAX_TEXT_BYTES + 1))).unwrap();
+        assert!(Document::open_project(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+        // Within the byte cap but past the editor's char cap.
+        let path = dir.join("procraft-v11-hostile-chars.pcraft");
+        std::fs::write(&path, build(None, 4.0, &"x".repeat(MAX_TEXT_CHARS + 1))).unwrap();
+        assert!(Document::open_project(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+        // Within both byte and char caps but past the line cap.
+        let path = dir.join("procraft-v11-hostile-lines.pcraft");
+        std::fs::write(&path, build(None, 4.0, &"x\n".repeat(MAX_TEXT_LINES + 1))).unwrap();
         assert!(Document::open_project(&path).is_err());
         let _ = std::fs::remove_file(&path);
         // Structurally valid record but unparseable font bytes.

@@ -3205,17 +3205,7 @@ fn shape_preview_points(
 ) -> Vec<(f32, f32)> {
     match kind {
         ShapeKind::Line => vec![(ax, ay), (bx, by)],
-        ShapeKind::Rect => {
-            let (lo_x, hi_x) = (ax.min(bx), ax.max(bx));
-            let (lo_y, hi_y) = (ay.min(by), ay.max(by));
-            vec![
-                (lo_x, lo_y),
-                (hi_x, lo_y),
-                (hi_x, hi_y),
-                (lo_x, hi_y),
-                (lo_x, lo_y),
-            ]
-        }
+        ShapeKind::Rect => Document::rect_vertices(ax, ay, bx, by),
         ShapeKind::Ellipse => Document::ellipse_vertices(ax, ay, bx, by),
         ShapeKind::Triangle => Document::poly_vertices(ShapePoly::Triangle, ax, ay, bx, by, sides),
         ShapeKind::Diamond => Document::poly_vertices(ShapePoly::Diamond, ax, ay, bx, by, sides),
@@ -8182,12 +8172,13 @@ mod tests {
             shape_preview_points(ShapeKind::Line, 1.0, 2.0, 30.0, 40.0, 6),
             vec![(1.0, 2.0), (30.0, 40.0)]
         );
-        // Rect: closed loop between the normalized corners.
+        // Rect: closed loop through the drag corners (either drag
+        // direction traces the same box).
         let rect = shape_preview_points(ShapeKind::Rect, 30.0, 40.0, 10.0, 5.0, 6);
         assert_eq!(rect.len(), 5);
         assert_eq!(rect.first(), rect.last());
-        assert_eq!(rect[0], (10.0, 5.0));
-        assert_eq!(rect[2], (30.0, 40.0));
+        assert_eq!(rect[0], (30.0, 40.0));
+        assert_eq!(rect[2], (10.0, 5.0));
         // Closed families trace one loop per kind (star 10 vertices, n-gon
         // sides + 1), each closing on its first point.
         for (kind, n) in [
@@ -8210,7 +8201,7 @@ mod tests {
         assert!(ell.len() >= 25);
         let (ef, el) = (ell.first().unwrap(), ell.last().unwrap());
         assert!((ef.0 - el.0).abs() < 1e-3 && (ef.1 - el.1).abs() < 1e-3);
-        // Arrow: open shaft + wings rooted at the drag start.
+        // Arrow: open shaft from the drag start, head wings backtracked.
         let arrow = shape_preview_points(ShapeKind::Arrow, 5.0, 5.0, 45.0, 5.0, 6);
         assert_eq!(arrow.len(), 5);
         assert_eq!(arrow[0], (5.0, 5.0));

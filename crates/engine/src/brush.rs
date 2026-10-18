@@ -1512,12 +1512,18 @@ impl Document {
         self.stroke_to(brush, color, from, to, leftover)
     }
 
+    /// Closed corner loop (last == first) for a rectangle outline, in the
+    /// drag order supplied. Shared with the app's drag preview.
+    pub fn rect_vertices(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<(f32, f32)> {
+        vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+    }
+
     /// Rectangle outline through dab segments. Caller checkpoints first.
     pub fn shape_rect(&mut self, brush: &Brush, color: Color, x0: f32, y0: f32, x1: f32, y1: f32) {
-        let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)];
+        let pts = Self::rect_vertices(x0, y0, x1, y1);
         let mut last = None;
         let mut left = 0.0;
-        for &p in &corners {
+        for &p in &pts {
             let r = self.stroke_to(brush, color, last, p, left);
             last = r.0;
             left = r.1;
@@ -2204,6 +2210,21 @@ mod tests {
     fn ellipse_vertices_degenerate_empty() {
         assert!(Document::ellipse_vertices(10.0, 10.0, 11.5, 30.0).is_empty());
         assert!(Document::ellipse_vertices(10.0, 10.0, 30.0, 11.5).is_empty());
+    }
+
+    #[test]
+    fn rect_vertices_closed_loop() {
+        let pts = Document::rect_vertices(4.0, 8.0, 20.0, 26.0);
+        assert_eq!(
+            pts,
+            vec![
+                (4.0, 8.0),
+                (20.0, 8.0),
+                (20.0, 26.0),
+                (4.0, 26.0),
+                (4.0, 8.0)
+            ]
+        );
     }
 
     #[test]

@@ -50,10 +50,11 @@ people touch daily. Ranked by user-visible value per effort.
   modifiers, Shift+drag = brush size. Defaults: B brush, E eraser, F
   fill, Ctrl+Z/Ctrl+Shift+Z undo/redo. View-verification (restart
   restore, corrupt recovery) pending user run.
-- [ ] **M50 — Editable text layers.** Text currently bakes as a bitmap
-  stamp on the current layer. Procreate-style: vector text layer that
-  stays editable, with a Rasterize action. Scope at brainstorm
-  (largest item in this batch).
+- [x] **M50 — Editable text layers.** Done 2026-10-18 (`c0495fd`,
+  review fixes `ea4b91d` + `3e240a3`, input fixes `f904b04` +
+  `98afdf9`): Procreate-style re-editable text layers (tap to
+  select/re-edit/move, Rasterize bakes to pixels), v11 project format
+  (PCRAFT11), device-verified. Ships in v0.9.0.
 - [ ] **Candidate — animated UI transitions + timelapse card.**
   Discord (MAN/FMHY, 2026-10-16): "like a card with frame inside… bring
   some animation/transition for the ui" for showcasing timelapse-from-

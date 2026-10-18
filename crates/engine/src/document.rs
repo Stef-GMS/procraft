@@ -377,11 +377,18 @@ struct UndoEntry {
     mask: Option<Vec<u8>>,
     ox: i32,
     oy: i32,
+    /// Text-layer vector source at snapshot time, so undo/redo restore the
+    /// block and its pixels together.
+    text: Option<crate::text::TextBlock>,
 }
 
 impl UndoEntry {
     fn byte_size(&self) -> usize {
-        self.pixels.len() + self.mask.as_ref().map_or(0, Vec::len)
+        self.pixels.len()
+            + self.mask.as_ref().map_or(0, Vec::len)
+            + self.text.as_ref().map_or(0, |t| {
+                t.text.len() + t.style.font_bytes.as_ref().map_or(0, Vec::len)
+            })
     }
 }
 
@@ -738,6 +745,7 @@ impl Document {
             mask: layer.mask.clone(),
             ox: layer.ox,
             oy: layer.oy,
+            text: layer.text.clone(),
         })
     }
 
@@ -752,6 +760,7 @@ impl Document {
                     layer.mask = entry.mask;
                     layer.ox = entry.ox;
                     layer.oy = entry.oy;
+                    layer.text = entry.text;
                     self.active = entry.layer.min(self.layers.len().saturating_sub(1));
                     self.mark_full_dirty();
                     return true;
@@ -772,6 +781,7 @@ impl Document {
                     layer.mask = entry.mask;
                     layer.ox = entry.ox;
                     layer.oy = entry.oy;
+                    layer.text = entry.text;
                     self.active = entry.layer.min(self.layers.len().saturating_sub(1));
                     self.mark_full_dirty();
                     return true;

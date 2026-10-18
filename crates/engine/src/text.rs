@@ -446,6 +446,38 @@ impl Document {
         self.stamp_text(idx, false, &layout, outline, (x, y), color)?;
         Ok((idx, layout.w, layout.h))
     }
+
+    /// Re-render text layer `index` from its stored block: clears the layer
+    /// and stamps the block's current text/position/color fresh, ignoring
+    /// the active selection. Layout is validated first, so an invalid block
+    /// errors leaving the previous pixels untouched. Returns the block size.
+    /// Caller checkpoints first for undo.
+    pub fn rerender_text_layer(&mut self, index: usize) -> Result<(u32, u32), String> {
+        let block = match self.layers.get(index).map(|l| &l.text) {
+            Some(Some(t)) => t.clone(),
+            Some(None) => return Err("not a text layer".to_string()),
+            None => return Err("no such layer".to_string()),
+        };
+        let layout = layout_text_styled(&block.text, block.size_px, &block.style)?;
+        {
+            let layer = &mut self.layers[index];
+            layer.pixels.fill(0);
+            if let Some(t) = layer.text.as_mut() {
+                t.w = layout.w;
+                t.h = layout.h;
+            }
+        }
+        self.mark_full_dirty();
+        self.stamp_text(
+            index,
+            false,
+            &layout,
+            block.style.outline,
+            (block.x, block.y),
+            Color(block.color),
+        )?;
+        Ok((layout.w, layout.h))
+    }
 }
 
 #[cfg(test)]
@@ -731,5 +763,79 @@ mod tests {
             .any(|x| (0..64)
                 .any(|y| { doc.layers[idx].pixels[((y * 200 + x) * 4) as usize + 3] > 0 })));
         assert!(w > 0 && h > 0);
+    }
+
+    fn block_at(text: &str, x: f32) -> TextBlock {
+        TextBlock {
+            text: text.into(),
+            size_px: 48.0,
+            color: [255, 0, 0, 255],
+            style: TextStyle::default(),
+            x,
+            y: 10.0,
+            w: 0,
+            h: 0,
+        }
+    }
+
+    #[test]
+    fn rerender_text_layer_moves_text_and_clears_old_pixels() {
+        let mut doc = Document::new(200, 120);
+        let (idx, _, _) = doc.add_text_layer("Text", block_at("Hi", 10.0)).unwrap();
+        {
+            let t = doc.layers[idx].text.as_mut().unwrap();
+            t.text = "Bye".into();
+            t.x = 90.0;
+        }
+        let (w, h) = doc.rerender_text_layer(idx).unwrap();
+        let t = doc.layers[idx].text.as_ref().unwrap();
+        assert_eq!((w, h), (t.w, t.h));
+        // The old location is cleared (whole layer repaints from scratch).
+        let px =
+            |d: &Document, x: u32, y: u32| d.layers[idx].pixels[((y * 200 + x) * 4) as usize + 3];
+        assert!((0..50).all(|x| (0..50).all(|y| px(&doc, x, y) == 0)));
+        // The new location paints.
+        assert!((88..140).any(|x| (8..70).any(|y| px(&doc, x, y) > 0)));
+    }
+
+    #[test]
+    fn edit_text_layer_undo_restores_previous_text_pixels() {
+        let mut doc = Document::new(200, 120);
+        let (idx, _, _) = doc.add_text_layer("Text", block_at("Hi", 10.0)).unwrap();
+        doc.checkpoint();
+        {
+            let t = doc.layers[idx].text.as_mut().unwrap();
+            t.text = "Yo".into();
+            t.x = 90.0;
+        }
+        doc.rerender_text_layer(idx).unwrap();
+        let px =
+            |d: &Document, x: u32, y: u32| d.layers[idx].pixels[((y * 200 + x) * 4) as usize + 3];
+        assert!((90..140).any(|x| (8..70).any(|y| px(&doc, x, y) > 0)));
+        assert!(doc.undo());
+        // Pixels AND the block revert together.
+        let t = doc.layers[idx].text.as_ref().unwrap();
+        assert_eq!(t.text, "Hi");
+        assert_eq!(t.x, 10.0);
+        assert!((10..62).any(|x| (8..70).any(|y| px(&doc, x, y) > 0)));
+        assert!((90..200).all(|x| (0..120).all(|y| px(&doc, x, y) == 0)));
+        assert!(doc.redo());
+        assert_eq!(doc.layers[idx].text.as_ref().unwrap().text, "Yo");
+        assert!((90..140).any(|x| (8..70).any(|y| px(&doc, x, y) > 0)));
+    }
+
+    #[test]
+    fn rerender_invalid_block_keeps_old_pixels() {
+        let mut doc = Document::new(200, 120);
+        let (idx, _, _) = doc.add_text_layer("Text", block_at("Hi", 10.0)).unwrap();
+        let snap = doc.layers[idx].pixels.clone();
+        doc.layers[idx].text.as_mut().unwrap().size_px = 0.0;
+        assert!(doc.rerender_text_layer(idx).is_err());
+        assert_eq!(
+            doc.layers[idx].pixels, snap,
+            "failed rerender must not clear"
+        );
+        // A non-text layer is a clean error, not a panic.
+        assert!(doc.rerender_text_layer(0).is_err());
     }
 }

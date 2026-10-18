@@ -1028,6 +1028,13 @@ impl Document {
             }
             layer.ox = (layer.ox + dx).clamp(-16384, 16384);
             layer.oy = (layer.oy + dy).clamp(-16384, 16384);
+            // A text block's anchor is in canvas pixels: it rides the same
+            // shift (pixels need no rerender — the buffer cell and the
+            // anchor both move by the same delta).
+            if let Some(b) = &mut layer.text {
+                b.x += dx as f32;
+                b.y += dy as f32;
+            }
         }
         if let Some(sm) = self.selection_mask.take() {
             self.selection_mask = Some(carry(&sm, old_w, old_h, new_w, new_h, 1));
@@ -1496,6 +1503,21 @@ impl Document {
             }
             _ => false,
         }
+    }
+
+    /// Topmost visible text layer whose block bounds contain canvas point
+    /// `(x, y)` — bounds are `[x, x+w) x [y, y+h)` in canvas pixels. Used by
+    /// the text tool to load an existing layer for editing.
+    pub fn text_layer_at(&self, x: f32, y: f32) -> Option<usize> {
+        (0..self.layers.len()).rev().find(|&i| {
+            if !self.is_layer_shown(i) {
+                return false;
+            }
+            match &self.layers[i].text {
+                Some(b) => x >= b.x && y >= b.y && x < b.x + b.w as f32 && y < b.y + b.h as f32,
+                None => false,
+            }
+        })
     }
 
     /// Composited RGB at `(x, y)` for the eyedropper, if inside the canvas.
@@ -5486,5 +5508,91 @@ mod tests {
         assert!(doc.merge_down(idx + 1));
         // The baked result must not pretend to still be editable text.
         assert!(!doc.layers[idx].is_text());
+    }
+
+    #[test]
+    fn text_layer_at_hits_bounds_topmost_visible() {
+        use crate::text::{TextBlock, TextStyle};
+        let mut doc = Document::new(200, 120);
+        let a = TextBlock {
+            text: "A".into(),
+            size_px: 32.0,
+            color: [0, 0, 0, 255],
+            style: TextStyle::default(),
+            x: 10.0,
+            y: 10.0,
+            w: 0,
+            h: 0,
+        };
+        let (i, w, h) = doc.add_text_layer("A", a).unwrap();
+        assert_eq!(doc.text_layer_at(10.0, 10.0), Some(i));
+        // Inside near-edge (block bounds are [x, x+w) x [y, y+h)).
+        assert_eq!(doc.text_layer_at(w as f32 + 9.9, h as f32 + 9.9), Some(i));
+        assert_eq!(doc.text_layer_at(w as f32 + 10.1, 10.0), None);
+        assert_eq!(doc.text_layer_at(-1.0, -1.0), None);
+        doc.layers[i].visible = false;
+        assert_eq!(doc.text_layer_at(10.0, 10.0), None);
+        doc.layers[i].visible = true;
+        // Topmost visible text layer wins.
+        let b = TextBlock {
+            text: "B".into(),
+            size_px: 32.0,
+            color: [0, 0, 0, 255],
+            style: TextStyle::default(),
+            x: 10.0,
+            y: 10.0,
+            w: 0,
+            h: 0,
+        };
+        let (j, ..) = doc.add_text_layer("B", b).unwrap();
+        assert_eq!(doc.text_layer_at(12.0, 12.0), Some(j));
+    }
+
+    #[test]
+    fn crop_shifts_text_block_anchor_with_content() {
+        use crate::text::{TextBlock, TextStyle};
+        let mut doc = Document::new(240, 160);
+        let block = TextBlock {
+            text: "Hi".into(),
+            size_px: 32.0,
+            color: [255, 0, 0, 255],
+            style: TextStyle::default(),
+            x: 60.0,
+            y: 40.0,
+            w: 0,
+            h: 0,
+        };
+        let (idx, w, h) = doc.add_text_layer("T", block).unwrap();
+        let sample = |d: &Document, x0: u32, y0: u32| {
+            let l = &d.layers[idx];
+            let mut out = Vec::new();
+            for y in y0..y0 + h {
+                for x in x0..x0 + w {
+                    let bx = x as i32 - l.ox;
+                    let by = y as i32 - l.oy;
+                    if bx < 0 || by < 0 || bx as u32 >= d.w || by as u32 >= d.h {
+                        out.extend_from_slice(&[0, 0, 0, 0]);
+                        continue;
+                    }
+                    let o = ((by as u32 * d.w + bx as u32) * 4) as usize;
+                    out.extend_from_slice(&l.pixels[o..o + 4]);
+                }
+            }
+            out
+        };
+        let before = sample(&doc, 60, 40);
+        assert!(before.iter().any(|&b| b != 0), "text must render pixels");
+        doc.crop(10, 10, 149, 149).unwrap(); // dx=-10, dy=-10
+                                             // The anchor moved with its content.
+        let t = doc.layers[idx].text.as_ref().unwrap();
+        assert_eq!((t.x, t.y), (50.0, 30.0));
+        // Pixels read back identically at the shifted canvas coords, and a
+        // rerender at the new anchor reproduces them exactly.
+        assert_eq!(sample(&doc, 50, 30), before);
+        doc.rerender_text_layer(idx).unwrap();
+        assert_eq!(sample(&doc, 50, 30), before);
+        // One hit, at the new location; the old one is gone.
+        assert_eq!(doc.text_layer_at(51.0, 31.0), Some(idx));
+        assert_eq!(doc.text_layer_at(40.0, 20.0), None);
     }
 }

@@ -179,8 +179,8 @@ fn find_root() -> Result<Retained<UIViewController>, &'static str> {
 /// iPadOS 26 regression family: `safeAreaInsets` can go stale after a
 /// rotation, leaving the top bar under the status bar. The status bar
 /// manager's frame stays fresh, so while the bar is visible the top inset
-/// is the larger of the two — in portrait they agree, so the max can only
-/// restore a stale value, never inflate a correct one.
+/// is the larger of the two — in a fullscreen portrait window they agree,
+/// so the max can only restore a stale value, never inflate a correct one.
 pub(super) fn safe_area_insets() -> Result<(u32, u32), &'static str> {
     let window = find_window()?;
     let insets = window.safeAreaInsets();

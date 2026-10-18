@@ -7118,7 +7118,7 @@ impl eframe::App for ProCraftApp {
                 // into the brush on any tool (Alt held blocks painting).
                 if ctx.input(|i| i.modifiers.alt) {
                     if resp.drag_started() || resp.clicked() {
-                        if let Some(pos) = resp.hover_pos() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
                             let (x, y) = to_canvas(pos);
                             let (cx, cy) = clamp_pt(x, y);
                             if let Some(rgb) = self.doc.sample(cx as u32, cy as u32) {
@@ -7480,12 +7480,16 @@ impl eframe::App for ProCraftApp {
                     // sweep the tolerance with a live preview (one undo step
                     // for the whole gesture). `clicked` covers motionless
                     // taps: a click-and-drag widget only reports a drag once
-                    // the pointer moves.
+                    // the pointer moves. Tap positions come from
+                    // `interact_pointer_pos`, never `hover_pos`: a touch tap
+                    // has no hover (egui-winit emits PointerGone with the
+                    // release, clearing the pointer's latest position), and
+                    // the tap frame must still see its point.
                     if (resp.drag_started() || resp.clicked())
                         && !gesture
                         && !self.text_paint_blocked()
                     {
-                        if let Some(pos) = resp.hover_pos() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
                             let (x, y) = to_canvas(pos);
                             let (cx, cy) = clamp_pt(x, y);
                             let layer = self.doc.active;
@@ -7575,7 +7579,7 @@ impl eframe::App for ProCraftApp {
                     // never covers the target (touch-first, iPad-visible).
                     // `clicked` covers motionless taps (see the Fill note).
                     if (resp.drag_started() || resp.dragged() || resp.clicked()) && !gesture {
-                        if let Some(pos) = resp.hover_pos() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
                             let (x, y) = to_canvas(pos);
                             let (cx, cy) = clamp_pt(x, y);
                             if let Some(rgb) = self.doc.sample(cx as u32, cy as u32) {
@@ -7952,7 +7956,7 @@ impl eframe::App for ProCraftApp {
                     // as a micro-drag and never fires `clicked` — without
                     // this the dialog could never open on device.
                     if (resp.clicked() || resp.drag_started()) && !gesture {
-                        if let Some(pos) = resp.hover_pos() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
                             let (x, y) = to_canvas(pos);
                             if self.text_open {
                                 // Re-anchor the open dialog (new or edit mode).
@@ -8024,7 +8028,7 @@ impl eframe::App for ProCraftApp {
                         self.last = None;
                         self.leftover = 0.0;
                         if click_dab {
-                            if let Some(pos) = resp.hover_pos() {
+                            if let Some(pos) = resp.interact_pointer_pos() {
                                 let (x, y) = to_canvas(pos);
                                 let (x, y) = clamp_pt(x, y);
                                 let pressure = latest_touch_force(&ctx).unwrap_or(1.0);
@@ -8049,7 +8053,7 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                     if self.painting && resp.dragged() {
-                        if let Some(pos) = resp.hover_pos() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
                             let (x, y) = to_canvas(pos);
                             let (x, y) = clamp_pt(x, y);
                             let pressure = latest_touch_force(&ctx).unwrap_or(1.0);
@@ -8149,7 +8153,7 @@ impl eframe::App for ProCraftApp {
                     // the single dab now, through the same single-point
                     // pipeline the drag path uses for a first sample.
                     if click_dab {
-                        if let Some(pos) = resp.hover_pos() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
                             let (x, y) = to_canvas(pos);
                             let (x, y) = clamp_pt(x, y);
                             let (sx, sy) = self.guides.snap_point(w, h, x, y);
@@ -8192,7 +8196,7 @@ impl eframe::App for ProCraftApp {
                     }
                 }
                 if self.painting && resp.dragged() {
-                    if let Some(pos) = resp.hover_pos() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
                         // Stamp through every pointer position the backend
                         // recorded this frame (device rate), not just the
                         // frame-end hover point: fast strokes stop turning

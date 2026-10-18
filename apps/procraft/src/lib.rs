@@ -1757,10 +1757,12 @@ fn load_brush_file(path: &std::path::Path) -> Result<Vec<BrushPreset>, String> {
 
 impl ProCraftApp {
     /// Zoom/rotate/theme/About cluster shared by the wide bar (inline) and
-    /// the narrow bar (inside a View menu). `in_menu` dismisses the popup
-    /// after momentary actions, matching the File menu convention; inline
-    /// clicks must not close anything.
-    fn view_controls(&mut self, ui: &mut egui::Ui, in_menu: bool) {
+    /// the narrow/tablet bar (inside a View menu). `in_menu` dismisses the
+    /// popup after momentary actions, matching the File menu convention;
+    /// inline clicks must not close anything. `include_theme` is false on
+    /// the tablet bar, where the theme picker lives in its own dropdown
+    /// beside the View menu instead.
+    fn view_controls(&mut self, ui: &mut egui::Ui, in_menu: bool, include_theme: bool) {
         ui.horizontal_wrapped(|ui| {
             if ui.button("−").clicked() {
                 self.zoom = (self.zoom / 1.25).clamp(0.1, 8.0);
@@ -1787,14 +1789,10 @@ impl ProCraftApp {
             }
             self.view_angle = 0.0;
         }
-        ui.separator();
-        egui::ComboBox::from_id_salt("theme")
-            .selected_text(self.theme.name())
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.theme, Theme::Dark, "Dark");
-                ui.selectable_value(&mut self.theme, Theme::Light, "Light");
-                ui.selectable_value(&mut self.theme, Theme::Paper, "Paper");
-            });
+        if include_theme {
+            ui.separator();
+            self.theme_control(ui, false);
+        }
         let about = if self.has_symbols {
             "ⓘ About"
         } else {
@@ -1817,6 +1815,25 @@ impl ProCraftApp {
             }
             self.show_shortcuts = !self.show_shortcuts;
         }
+    }
+
+    /// Theme picker: a dropdown showing the current theme's name. On touch
+    /// layouts the popup rows get finger-sized height — popups resolve
+    /// their style from the context, not the parent bar, so the spacing is
+    /// set inside the popup closure. (ComboBox popups close on a row tap by
+    /// design: selection applies immediately, so a persistent popup would
+    /// just hide the result.)
+    fn theme_control(&mut self, ui: &mut egui::Ui, touch: bool) {
+        egui::ComboBox::from_id_salt("theme")
+            .selected_text(self.theme.name())
+            .show_ui(ui, |ui| {
+                if touch {
+                    ui.spacing_mut().interact_size.y = 40.0;
+                }
+                ui.selectable_value(&mut self.theme, Theme::Dark, "Dark");
+                ui.selectable_value(&mut self.theme, Theme::Light, "Light");
+                ui.selectable_value(&mut self.theme, Theme::Paper, "Paper");
+            });
     }
 
     /// Unique display name for a new custom brush: "Foo", "Foo (2)", ...
@@ -3628,6 +3645,19 @@ impl eframe::App for ProCraftApp {
                 ui.spacing_mut().interact_size.y = 40.0;
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
             }
+            // Device pass 1: on touch layouts, tapping a stepper/slider inside
+            // a menu closed it before the tap could land. CloseOnClickOutside
+            // keeps inside taps alive while an outside tap still dismisses;
+            // momentary action buttons call ui.close() themselves. Desktop
+            // keeps egui's default CloseOnClick.
+            let menu_config = || {
+                let close = if layout == BarLayout::Wide {
+                    egui::PopupCloseBehavior::CloseOnClick
+                } else {
+                    egui::PopupCloseBehavior::CloseOnClickOutside
+                };
+                egui::containers::menu::MenuConfig::new().close_behavior(close)
+            };
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Gallery").clicked() {
                     self.gallery_open = !self.gallery_open;
@@ -3635,222 +3665,227 @@ impl eframe::App for ProCraftApp {
                 if ui.button("Reference").clicked() {
                     self.ref_open = !self.ref_open;
                 }
-                ui.menu_button("File", |ui| {
-                    if layout == BarLayout::Tablet {
-                        ui.spacing_mut().interact_size.y = 40.0;
-                    }
-                    if ui.button("Save PNG").clicked() {
-                        ui.close();
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("PNG", &["png"])
-                            .save_file()
-                        {
-                            // The dialog may return an extensionless path (always
-                            // on iOS); the encoder needs the suffix to pick PNG.
-                            let path = ensure_extension(path, "png");
-                            match self.doc.save_png(&path) {
-                                Ok(()) => {
-                                    self.status = format!("Saved {}", path.display());
-                                    #[cfg(target_os = "ios")]
-                                    rfd::ios_share_file(&path);
-                                    #[cfg(target_os = "android")]
-                                    rfd::android_scan_file(&path);
+                egui::containers::menu::MenuButton::new("File")
+                    .config(menu_config())
+                    .ui(ui, |ui| {
+                        if layout == BarLayout::Tablet {
+                            ui.spacing_mut().interact_size.y = 40.0;
+                        }
+                        if ui.button("Save PNG").clicked() {
+                            ui.close();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("PNG", &["png"])
+                                .save_file()
+                            {
+                                // The dialog may return an extensionless path (always
+                                // on iOS); the encoder needs the suffix to pick PNG.
+                                let path = ensure_extension(path, "png");
+                                match self.doc.save_png(&path) {
+                                    Ok(()) => {
+                                        self.status = format!("Saved {}", path.display());
+                                        #[cfg(target_os = "ios")]
+                                        rfd::ios_share_file(&path);
+                                        #[cfg(target_os = "android")]
+                                        rfd::android_scan_file(&path);
+                                    }
+                                    Err(e) => self.status = format!("Save failed: {e}"),
                                 }
-                                Err(e) => self.status = format!("Save failed: {e}"),
                             }
                         }
-                    }
-                    stepped_slider(ui, &mut self.jpeg_quality, 1..=100, 1.0, "JPEG q");
-                    if ui.button("Save JPEG").clicked() {
-                        ui.close();
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("JPEG", &["jpg", "jpeg"])
-                            .save_file()
-                        {
-                            let path = ensure_extension(path, "jpg");
-                            match self.doc.save_jpeg(&path, self.jpeg_quality) {
-                                Ok(()) => {
-                                    self.status = format!(
-                                        "Saved {} (quality {})",
-                                        path.display(),
-                                        self.jpeg_quality
-                                    );
-                                    #[cfg(target_os = "ios")]
-                                    rfd::ios_share_file(&path);
-                                    #[cfg(target_os = "android")]
-                                    rfd::android_scan_file(&path);
+                        stepped_slider(ui, &mut self.jpeg_quality, 1..=100, 1.0, "JPEG q");
+                        if ui.button("Save JPEG").clicked() {
+                            ui.close();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("JPEG", &["jpg", "jpeg"])
+                                .save_file()
+                            {
+                                let path = ensure_extension(path, "jpg");
+                                match self.doc.save_jpeg(&path, self.jpeg_quality) {
+                                    Ok(()) => {
+                                        self.status = format!(
+                                            "Saved {} (quality {})",
+                                            path.display(),
+                                            self.jpeg_quality
+                                        );
+                                        #[cfg(target_os = "ios")]
+                                        rfd::ios_share_file(&path);
+                                        #[cfg(target_os = "android")]
+                                        rfd::android_scan_file(&path);
+                                    }
+                                    Err(e) => self.status = format!("Save failed: {e}"),
                                 }
-                                Err(e) => self.status = format!("Save failed: {e}"),
                             }
                         }
-                    }
-                    if ui.button("Save TIFF").clicked() {
-                        ui.close();
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("TIFF", &["tif", "tiff"])
-                            .save_file()
-                        {
-                            let path = ensure_extension(path, "tiff");
-                            match self.doc.save_tiff(&path) {
-                                Ok(()) => {
-                                    self.status = format!("Saved {}", path.display());
-                                    #[cfg(target_os = "ios")]
-                                    rfd::ios_share_file(&path);
-                                    #[cfg(target_os = "android")]
-                                    rfd::android_scan_file(&path);
+                        if ui.button("Save TIFF").clicked() {
+                            ui.close();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("TIFF", &["tif", "tiff"])
+                                .save_file()
+                            {
+                                let path = ensure_extension(path, "tiff");
+                                match self.doc.save_tiff(&path) {
+                                    Ok(()) => {
+                                        self.status = format!("Saved {}", path.display());
+                                        #[cfg(target_os = "ios")]
+                                        rfd::ios_share_file(&path);
+                                        #[cfg(target_os = "android")]
+                                        rfd::android_scan_file(&path);
+                                    }
+                                    Err(e) => self.status = format!("Save failed: {e}"),
                                 }
-                                Err(e) => self.status = format!("Save failed: {e}"),
                             }
                         }
-                    }
-                    if ui.button("Open image").clicked() {
-                        ui.close();
-                        #[cfg(not(target_os = "ios"))]
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter(
-                                "Images",
-                                &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
-                            )
-                            .pick_file()
-                        {
-                            match self.doc.load_background(&path) {
-                                Ok(()) => {
-                                    self.texture = None;
-                                    self.lasso_points.clear();
-                                    self.lasso_poly.clear();
-                                    self.status = format!("Opened {}", path.display());
-                                }
-                                Err(e) => self.status = format!("Open failed: {e}"),
-                            }
-                        }
-                        // iOS: presents the picker; open_picked() loads on resolve.
-                        #[cfg(target_os = "ios")]
-                        {
-                            let _ = rfd::FileDialog::new()
+                        if ui.button("Open image").clicked() {
+                            ui.close();
+                            #[cfg(not(target_os = "ios"))]
+                            if let Some(path) = rfd::FileDialog::new()
                                 .add_filter(
                                     "Images",
                                     &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
                                 )
-                                .pick_file();
-                            self.pending_open = Some(PendingOpen::Image);
-                            self.status = "Pick an image…".to_string();
-                        }
-                        #[cfg(target_os = "android")]
-                        {
-                            self.android_browse = Some(PendingOpen::Image);
-                        }
-                    }
-                    ui.separator();
-                    if ui.button("Save project").clicked() {
-                        ui.close();
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("ProCraft project", &["procraft"])
-                            .save_file()
-                        {
-                            let path = ensure_extension(path, "procraft");
-                            match self.doc.save_project(&path) {
-                                Ok(()) => {
-                                    let s = path.to_string_lossy().to_string();
-                                    push_recent(&mut self.recent, &s);
-                                    self.gallery_keys.clear();
-                                    self.status = format!("Project saved {}", path.display());
-                                    self.clear_recovery();
-                                    #[cfg(target_os = "ios")]
-                                    rfd::ios_share_file(&path);
-                                    #[cfg(target_os = "android")]
-                                    rfd::android_scan_file(&path);
+                                .pick_file()
+                            {
+                                match self.doc.load_background(&path) {
+                                    Ok(()) => {
+                                        self.texture = None;
+                                        self.lasso_points.clear();
+                                        self.lasso_poly.clear();
+                                        self.status = format!("Opened {}", path.display());
+                                    }
+                                    Err(e) => self.status = format!("Open failed: {e}"),
                                 }
-                                Err(e) => self.status = format!("Project save failed: {e}"),
+                            }
+                            // iOS: presents the picker; open_picked() loads on resolve.
+                            #[cfg(target_os = "ios")]
+                            {
+                                let _ = rfd::FileDialog::new()
+                                    .add_filter(
+                                        "Images",
+                                        &[
+                                            "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif",
+                                            "tiff",
+                                        ],
+                                    )
+                                    .pick_file();
+                                self.pending_open = Some(PendingOpen::Image);
+                                self.status = "Pick an image…".to_string();
+                            }
+                            #[cfg(target_os = "android")]
+                            {
+                                self.android_browse = Some(PendingOpen::Image);
                             }
                         }
-                    }
-                    if ui.button("Open project").clicked() {
-                        ui.close();
-                        #[cfg(not(target_os = "ios"))]
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("ProCraft project", &["procraft"])
-                            .pick_file()
-                        {
-                            match Document::open_project(&path) {
-                                Ok(doc) => {
-                                    let s = path.to_string_lossy().to_string();
-                                    self.adopt_project(doc, &s, "Project opened");
-                                }
-                                Err(e) => self.status = format!("Project open failed: {e}"),
-                            }
-                        }
-                        #[cfg(target_os = "ios")]
-                        {
-                            let _ = rfd::FileDialog::new()
+                        ui.separator();
+                        if ui.button("Save project").clicked() {
+                            ui.close();
+                            if let Some(path) = rfd::FileDialog::new()
                                 .add_filter("ProCraft project", &["procraft"])
-                                .pick_file();
-                            self.pending_open = Some(PendingOpen::Project);
-                            self.status = "Pick a project…".to_string();
-                        }
-                        #[cfg(target_os = "android")]
-                        {
-                            self.android_browse = Some(PendingOpen::Project);
-                        }
-                    }
-                    ui.separator();
-                    if ui.button("PSD export").clicked() {
-                        ui.close();
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Photoshop document", &["psd"])
-                            .save_file()
-                        {
-                            let path = ensure_extension(path, "psd");
-                            match save_psd(&path, &self.doc) {
-                                Ok(()) => {
-                                    self.status = format!(
-                                        "PSD saved {} (masks do not round-trip)",
-                                        path.display()
-                                    );
-                                    #[cfg(target_os = "ios")]
-                                    rfd::ios_share_file(&path);
-                                    #[cfg(target_os = "android")]
-                                    rfd::android_scan_file(&path);
+                                .save_file()
+                            {
+                                let path = ensure_extension(path, "procraft");
+                                match self.doc.save_project(&path) {
+                                    Ok(()) => {
+                                        let s = path.to_string_lossy().to_string();
+                                        push_recent(&mut self.recent, &s);
+                                        self.gallery_keys.clear();
+                                        self.status = format!("Project saved {}", path.display());
+                                        self.clear_recovery();
+                                        #[cfg(target_os = "ios")]
+                                        rfd::ios_share_file(&path);
+                                        #[cfg(target_os = "android")]
+                                        rfd::android_scan_file(&path);
+                                    }
+                                    Err(e) => self.status = format!("Project save failed: {e}"),
                                 }
-                                Err(e) => self.status = format!("PSD save failed: {e}"),
                             }
                         }
-                    }
-                    if ui.button("Open PSD").clicked() {
-                        ui.close();
-                        #[cfg(not(target_os = "ios"))]
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Photoshop document", &["psd"])
-                            .pick_file()
-                        {
-                            match open_psd(&path) {
-                                Ok(doc) => {
-                                    self.doc = doc;
-                                    self.clear_recovery();
-                                    self.texture = None;
-                                    self.lasso_points.clear();
-                                    self.lasso_poly.clear();
-                                    self.status = format!(
-                                        "PSD opened {} (masks do not import)",
-                                        path.display()
-                                    );
+                        if ui.button("Open project").clicked() {
+                            ui.close();
+                            #[cfg(not(target_os = "ios"))]
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("ProCraft project", &["procraft"])
+                                .pick_file()
+                            {
+                                match Document::open_project(&path) {
+                                    Ok(doc) => {
+                                        let s = path.to_string_lossy().to_string();
+                                        self.adopt_project(doc, &s, "Project opened");
+                                    }
+                                    Err(e) => self.status = format!("Project open failed: {e}"),
                                 }
-                                Err(e) => self.status = format!("PSD open failed: {e}"),
+                            }
+                            #[cfg(target_os = "ios")]
+                            {
+                                let _ = rfd::FileDialog::new()
+                                    .add_filter("ProCraft project", &["procraft"])
+                                    .pick_file();
+                                self.pending_open = Some(PendingOpen::Project);
+                                self.status = "Pick a project…".to_string();
+                            }
+                            #[cfg(target_os = "android")]
+                            {
+                                self.android_browse = Some(PendingOpen::Project);
                             }
                         }
-                        #[cfg(target_os = "ios")]
-                        {
-                            let _ = rfd::FileDialog::new()
+                        ui.separator();
+                        if ui.button("PSD export").clicked() {
+                            ui.close();
+                            if let Some(path) = rfd::FileDialog::new()
                                 .add_filter("Photoshop document", &["psd"])
-                                .pick_file();
-                            self.pending_open = Some(PendingOpen::Psd);
-                            self.status = "Pick a PSD…".to_string();
+                                .save_file()
+                            {
+                                let path = ensure_extension(path, "psd");
+                                match save_psd(&path, &self.doc) {
+                                    Ok(()) => {
+                                        self.status = format!(
+                                            "PSD saved {} (masks do not round-trip)",
+                                            path.display()
+                                        );
+                                        #[cfg(target_os = "ios")]
+                                        rfd::ios_share_file(&path);
+                                        #[cfg(target_os = "android")]
+                                        rfd::android_scan_file(&path);
+                                    }
+                                    Err(e) => self.status = format!("PSD save failed: {e}"),
+                                }
+                            }
                         }
-                        #[cfg(target_os = "android")]
-                        {
-                            self.android_browse = Some(PendingOpen::Psd);
+                        if ui.button("Open PSD").clicked() {
+                            ui.close();
+                            #[cfg(not(target_os = "ios"))]
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Photoshop document", &["psd"])
+                                .pick_file()
+                            {
+                                match open_psd(&path) {
+                                    Ok(doc) => {
+                                        self.doc = doc;
+                                        self.clear_recovery();
+                                        self.texture = None;
+                                        self.lasso_points.clear();
+                                        self.lasso_poly.clear();
+                                        self.status = format!(
+                                            "PSD opened {} (masks do not import)",
+                                            path.display()
+                                        );
+                                    }
+                                    Err(e) => self.status = format!("PSD open failed: {e}"),
+                                }
+                            }
+                            #[cfg(target_os = "ios")]
+                            {
+                                let _ = rfd::FileDialog::new()
+                                    .add_filter("Photoshop document", &["psd"])
+                                    .pick_file();
+                                self.pending_open = Some(PendingOpen::Psd);
+                                self.status = "Pick a PSD…".to_string();
+                            }
+                            #[cfg(target_os = "android")]
+                            {
+                                self.android_browse = Some(PendingOpen::Psd);
+                            }
                         }
-                    }
-                });
+                    });
                 if ui.button("Undo").clicked() && self.doc.undo() {
                     self.status = "Undone.".to_string();
                 }
@@ -3868,14 +3903,21 @@ impl eframe::App for ProCraftApp {
                 // inline stepper starves to a character-wide column below
                 // ~600px); desktop keeps the exact inline layout.
                 if matches!(layout, BarLayout::Narrow | BarLayout::Tablet) {
-                    ui.menu_button("View", |ui| {
-                        if layout == BarLayout::Tablet {
-                            ui.spacing_mut().interact_size.y = 40.0;
-                        }
-                        self.view_controls(ui, true);
-                    });
+                    egui::containers::menu::MenuButton::new("View")
+                        .config(menu_config())
+                        .ui(ui, |ui| {
+                            if layout == BarLayout::Tablet {
+                                ui.spacing_mut().interact_size.y = 40.0;
+                            }
+                            // Tablet pulls the theme picker out of the menu
+                            // into its own dropdown beside it.
+                            self.view_controls(ui, true, layout == BarLayout::Narrow);
+                        });
+                    if layout == BarLayout::Tablet {
+                        self.theme_control(ui, true);
+                    }
                 } else {
-                    self.view_controls(ui, false);
+                    self.view_controls(ui, false, true);
                 }
             });
         });

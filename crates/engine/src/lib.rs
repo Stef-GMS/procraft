@@ -42,7 +42,8 @@ pub use probrush::{export_tip_png, import_brush_file, ImportedBrush};
 pub use psd::{open_psd, save_psd};
 pub use settings::{Settings, SETTINGS_VERSION};
 pub use shortcuts::{
-    ActionId, ChordKey, DragActionId, KeyChord, ModSet, Shortcuts, StoredShortcuts, ToolId,
+    ActionId, ChordKey, DragActionId, KeyChord, ModSet, Shortcuts, SizeDragMode, StoredShortcuts,
+    ToolId,
 };
 pub use tap::{classify_touch_tap, TapAction};
 pub use text::{

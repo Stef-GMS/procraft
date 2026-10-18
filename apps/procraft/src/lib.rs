@@ -15,10 +15,11 @@ use procraft_engine::{
     size_drag_factor, starter_palette, step_playback_visible, triadic, zoom_drag_factor, ActionId,
     AssistLine, BlendMode, Brush, BrushPreset, ChordKey, Color, DabDynamics, Document,
     DragActionId, GuideKind, Guides, KeyChord, LoopMode, ModSet, PaintTarget, Palette, PaletteSet,
-    Settings, ShapePoly, Shortcuts, SymmetryMode, TapAction, TextBlock, TextStyle, ToolId,
-    LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_FONT_BYTES, MAX_IMAGE_COLORS,
-    MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS,
-    MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX, SETTINGS_VERSION,
+    Settings, ShapePoly, Shortcuts, SizeDragMode, SymmetryMode, TapAction, TextBlock, TextStyle,
+    ToolId, LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_FONT_BYTES,
+    MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES,
+    MAX_PALETTE_COLORS, MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
+    SETTINGS_VERSION,
 };
 #[cfg(target_os = "android")]
 use procraft_engine::{ext_matches, file_size_label};
@@ -559,10 +560,52 @@ fn resolve_capture_event(ev: &egui::Event) -> CaptureOutcome {
     }
 }
 
-/// M49: brush size after a horizontal size-drag of `dx` px, clamped to
-/// the size slider's range (1..=200).
-fn drag_size(cur: f32, dx: f32) -> f32 {
-    (cur * size_drag_factor(dx)).clamp(1.0, 200.0)
+/// M49: brush size after a size-drag of `travel` px along the configured
+/// direction, applied to the gesture's base size (never per-frame
+/// deltas, so the value can't drift), clamped to the size slider's range
+/// (1..=200).
+fn drag_size(base: f32, travel: f32) -> f32 {
+    (base * size_drag_factor(travel)).clamp(1.0, 200.0)
+}
+
+/// M49: the brush-size drag's travel in px for `mode`, measured from the
+/// gesture's start point `anchor` to the current pointer `pos`.
+/// Horizontal and vertical are signed (right/up grows); distance is the
+/// straight-line length, so any move grows the brush.
+fn size_drag_travel(mode: SizeDragMode, anchor: egui::Pos2, pos: egui::Pos2) -> f32 {
+    match mode {
+        SizeDragMode::Horizontal => pos.x - anchor.x,
+        SizeDragMode::Vertical => anchor.y - pos.y,
+        SizeDragMode::Distance => (pos - anchor).length(),
+    }
+}
+
+/// M49: human label for the size-drag direction picker.
+fn size_drag_mode_label(mode: SizeDragMode) -> &'static str {
+    match mode {
+        SizeDragMode::Horizontal => "Left–right",
+        SizeDragMode::Vertical => "Up–down",
+        SizeDragMode::Distance => "Distance from start",
+    }
+}
+
+/// Space-held transient-Hand transition. `cur` is the active tool,
+/// `state` the held hand's stored tool (None = not engaged); `pressed` a
+/// fresh Space press this frame, `down` Space held, `pointer_down` any
+/// pointer button down, `usable` = no typing/capture context. Returns
+/// the next state: Some(prev) while engaged, None otherwise.
+fn space_hand_step(
+    cur: Tool,
+    state: Option<Tool>,
+    pressed: bool,
+    down: bool,
+    pointer_down: bool,
+    usable: bool,
+) -> Option<Tool> {
+    match state {
+        Some(prev) => (down && usable).then_some(prev),
+        None => (pressed && usable && !pointer_down).then_some(cur),
+    }
 }
 
 fn page_presets() -> Vec<(&'static str, [u8; 3])> {
@@ -575,11 +618,13 @@ fn page_presets() -> Vec<(&'static str, [u8; 3])> {
     ]
 }
 
-/// M49: Shift+drag brush-size gesture state — the size at press plus the
-/// pointer's last x; total travel drives the size, not per-frame deltas.
+/// M49: brush-size drag gesture state — the size at press plus the press
+/// point; travel from `anchor` along the configured direction (see
+/// [`SizeDragMode`]) drives the size from `base`, and the cursor ring
+/// stays pinned at the anchor while the gesture runs.
 struct SizeDrag {
     base: f32,
-    last_x: f32,
+    anchor: egui::Pos2,
 }
 
 struct ProCraftApp {
@@ -807,6 +852,8 @@ struct ProCraftApp {
     capture: Option<ActionId>,
     settings_note: Option<String>,
     size_drag: Option<SizeDrag>,
+    /// Space held = transient Hand: the tool to restore on release.
+    space_hand: Option<Tool>,
     /// M49: a failed-save note (shown with the settings note) and the
     /// time of the last failed write attempt (retry cooldown).
     save_note: Option<String>,
@@ -1012,6 +1059,7 @@ impl ProCraftApp {
             capture: None,
             settings_note: None,
             size_drag: None,
+            space_hand: None,
             save_note: None,
             save_failed_at: None,
             seed_marker_pending: false,
@@ -1249,6 +1297,52 @@ impl ProCraftApp {
         }
     }
 
+    /// Space held = the Hand tool (pan), release returns to the tool that
+    /// was active on press. Runs after the shortcut table (an explicit
+    /// Space binding wins), and is blocked while typing, while capture is
+    /// armed, or mid-stroke — a press never hijacks a live gesture. If
+    /// another tool gets picked while held, that choice wins on release.
+    fn handle_space_hand(&mut self, ctx: &egui::Context) {
+        let usable = self.capture.is_none() && !ctx.text_edit_focused();
+        let (pressed, down, pointer_down) = ctx.input(|i| {
+            let pressed = i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::Space,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    }
+                )
+            });
+            (pressed, i.key_down(egui::Key::Space), i.pointer.any_down())
+        });
+        let before = self.space_hand;
+        let after = space_hand_step(self.tool, before, pressed, down, pointer_down, usable);
+        if before.is_some() || after.is_some() {
+            // Swallow Space key events while engaged (and on the frame it
+            // ends) so a focused widget can't also react to the key.
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    !matches!(
+                        e,
+                        egui::Event::Key {
+                            key: egui::Key::Space,
+                            ..
+                        }
+                    )
+                })
+            });
+        }
+        match (before, after) {
+            (None, Some(_)) => self.tool = Tool::Hand,
+            (Some(prev), None) if self.tool == Tool::Hand => self.tool = prev,
+            _ => {}
+        }
+        self.space_hand = after;
+    }
+
     /// M49: perform one shortcut action — the same effect and status
     /// strings the toolbar buttons and the old hardwired keys used.
     fn apply_action(&mut self, action: ActionId) {
@@ -1340,7 +1434,8 @@ impl ProCraftApp {
     }
 
     /// M49: the Shortcuts editor — one row per action, the drag-modifier
-    /// row, and Reset all. Clicking a binding arms capture for that row.
+    /// row with its direction picker, and Reset all. Clicking a binding
+    /// arms capture for that row.
     fn shortcuts_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_shortcuts;
         egui::Window::new("Shortcuts")
@@ -1408,6 +1503,24 @@ impl ProCraftApp {
                     };
                     if !next.is_empty() && next != cur {
                         self.shortcuts.set_drag(DragActionId::BrushSize, next);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Drag direction"));
+                    let mut mode = self.shortcuts.size_drag_mode();
+                    egui::ComboBox::from_id_salt("size_drag_mode")
+                        .selected_text(size_drag_mode_label(mode))
+                        .show_ui(ui, |ui| {
+                            for m in [
+                                SizeDragMode::Horizontal,
+                                SizeDragMode::Vertical,
+                                SizeDragMode::Distance,
+                            ] {
+                                ui.selectable_value(&mut mode, m, size_drag_mode_label(m));
+                            }
+                        });
+                    if mode != self.shortcuts.size_drag_mode() {
+                        self.shortcuts.set_size_drag_mode(mode);
                     }
                 });
                 ui.separator();
@@ -3453,6 +3566,7 @@ impl eframe::App for ProCraftApp {
         // — clearing the selection.
         self.handle_capture(ui.ctx());
         self.dispatch_shortcuts(ui.ctx());
+        self.handle_space_hand(ui.ctx());
         if !ui.ctx().text_edit_focused()
             && ui
                 .ctx()
@@ -6909,7 +7023,15 @@ impl eframe::App for ProCraftApp {
                 // any paper color; hover has no pressure so this is the
                 // base size, dynamics spread real dabs around it.
                 if matches!(self.tool, Tool::Brush | Tool::Eraser | Tool::Smudge) {
-                    if let Some(pos) = resp.hover_pos() {
+                    // While a size drag runs the ring stays pinned at the
+                    // gesture's start point (the size, not the pointer,
+                    // is what's moving).
+                    let ring_at = self
+                        .size_drag
+                        .as_ref()
+                        .map(|sd| sd.anchor)
+                        .or_else(|| resp.hover_pos());
+                    if let Some(pos) = ring_at {
                         let r = brush_ring_radius(self.brush.size, z);
                         ui.painter()
                             .circle_stroke(pos, r, (2.0, Color32::from_gray(30)));
@@ -7294,19 +7416,22 @@ impl eframe::App for ProCraftApp {
 
                 // M49 brush-size drag (default Shift, remappable): while the
                 // bound modifiers are held with a paint tool, a primary drag
-                // scales size by horizontal travel via `size_drag_factor`
-                // (same 1.25/120px step as zoom); release keeps it, Esc
-                // during the drag reverts to the pinned base.
+                // scales size by travel along the configured direction
+                // (left–right / up–down / distance, see `SizeDragMode`) via
+                // `size_drag_factor` (same 1.25/120px step as zoom) from the
+                // pinned base; release keeps it, Esc during the drag reverts.
                 let size_mod = self.shortcuts.drag_get(DragActionId::BrushSize);
                 let size_mods = ui.ctx().input(|i| {
                     size_mod.matches(i.modifiers.ctrl, i.modifiers.shift, i.modifiers.alt)
                 });
                 let paint_tool = matches!(self.tool, Tool::Brush | Tool::Eraser | Tool::Smudge);
-                if let Some(sd) = &mut self.size_drag {
+                if let Some(sd) = &self.size_drag {
                     if resp.dragged_by(egui::PointerButton::Primary) {
-                        if let Some(pos) = resp.hover_pos() {
-                            self.brush.size = drag_size(self.brush.size, pos.x - sd.last_x);
-                            sd.last_x = pos.x;
+                        if let Some(pos) = resp.interact_pointer_pos().or_else(|| resp.hover_pos())
+                        {
+                            let mode = self.shortcuts.size_drag_mode();
+                            let travel = size_drag_travel(mode, sd.anchor, pos);
+                            self.brush.size = drag_size(sd.base, travel);
                         }
                     }
                     if resp.drag_stopped() {
@@ -7321,10 +7446,12 @@ impl eframe::App for ProCraftApp {
                     && !gesture
                     && resp.drag_started_by(egui::PointerButton::Primary)
                 {
-                    self.size_drag = Some(SizeDrag {
-                        base: self.brush.size,
-                        last_x: resp.hover_pos().map(|p| p.x).unwrap_or(0.0),
-                    });
+                    if let Some(pos) = resp.interact_pointer_pos().or_else(|| resp.hover_pos()) {
+                        self.size_drag = Some(SizeDrag {
+                            base: self.brush.size,
+                            anchor: pos,
+                        });
+                    }
                     self.painting = false;
                     self.last = None;
                     return;
@@ -9106,5 +9233,73 @@ mod tests {
         );
         // The edit was baked into the re-captured base and survives.
         assert!(doc.layers[0].pixels.chunks(4).any(|p| p[1] > 0));
+    }
+
+    #[test]
+    fn size_drag_travel_reads_the_selected_direction() {
+        let a = egui::pos2(100.0, 100.0);
+        // Horizontal: right grows, left shrinks (signed dx).
+        assert_eq!(
+            size_drag_travel(SizeDragMode::Horizontal, a, egui::pos2(220.0, 40.0)),
+            120.0
+        );
+        assert_eq!(
+            size_drag_travel(SizeDragMode::Horizontal, a, egui::pos2(0.0, 260.0)),
+            -100.0
+        );
+        // Vertical: up grows, down shrinks (positive up-travel).
+        assert_eq!(
+            size_drag_travel(SizeDragMode::Vertical, a, egui::pos2(140.0, -20.0)),
+            120.0
+        );
+        assert_eq!(
+            size_drag_travel(SizeDragMode::Vertical, a, egui::pos2(100.0, 220.0)),
+            -120.0
+        );
+        // Distance: straight-line travel from the anchor — any direction
+        // grows, so the value is never negative.
+        assert_eq!(
+            size_drag_travel(SizeDragMode::Distance, a, egui::pos2(220.0, 100.0)),
+            120.0
+        );
+        let diag = size_drag_travel(SizeDragMode::Distance, a, egui::pos2(136.0, 148.0));
+        assert!((diag - 60.0).abs() < 1e-3, "3-4-5 travel was {diag}");
+        assert!(size_drag_travel(SizeDragMode::Distance, a, egui::pos2(0.0, 0.0)) > 0.0);
+    }
+
+    #[test]
+    fn drag_size_scales_from_base_and_clamps() {
+        assert!((drag_size(100.0, 120.0) - 125.0).abs() < 1e-3);
+        assert!((drag_size(100.0, -120.0) - 80.0).abs() < 1e-3);
+        assert_eq!(drag_size(2.0, -10_000.0), 1.0);
+        assert_eq!(drag_size(150.0, 10_000.0), 200.0);
+        // Zero travel = the untouched base size.
+        assert_eq!(drag_size(50.0, 0.0), 50.0);
+    }
+
+    #[test]
+    fn space_hand_step_is_a_pure_transition() {
+        let b = Tool::Brush;
+        // A fresh Space press engages the hand...
+        assert_eq!(space_hand_step(b, None, true, true, false, true), Some(b));
+        // ...holding keeps it (key repeats carry no fresh press)...
+        assert_eq!(
+            space_hand_step(Tool::Hand, Some(b), false, true, false, true),
+            Some(b)
+        );
+        // ...and release ends it.
+        assert_eq!(
+            space_hand_step(Tool::Hand, Some(b), false, false, false, true),
+            None
+        );
+        // A pointer already down blocks engagement (no mid-stroke hijack).
+        assert_eq!(space_hand_step(b, None, true, true, true, true), None);
+        // Typing or an armed capture blocks it too.
+        assert_eq!(space_hand_step(b, None, true, true, false, false), None);
+        // Losing the context mid-hold releases the hand.
+        assert_eq!(
+            space_hand_step(Tool::Hand, Some(b), false, true, false, false),
+            None
+        );
     }
 }

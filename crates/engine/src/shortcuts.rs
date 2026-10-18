@@ -371,6 +371,41 @@ impl DragActionId {
     }
 }
 
+/// Direction a canvas size-drag measures its travel along.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SizeDragMode {
+    /// Left–right travel: right grows, left shrinks.
+    #[default]
+    Horizontal,
+    /// Up–down travel: up grows, down shrinks.
+    Vertical,
+    /// Straight-line distance from the drag's starting point: any
+    /// direction grows; within one gesture the size never drops below
+    /// where it started.
+    Distance,
+}
+
+impl SizeDragMode {
+    /// Stable persistence key.
+    pub fn to_key(&self) -> &'static str {
+        match self {
+            SizeDragMode::Horizontal => "horizontal",
+            SizeDragMode::Vertical => "vertical",
+            SizeDragMode::Distance => "distance",
+        }
+    }
+
+    /// Inverse of to_key; None for unknown persisted keys.
+    pub fn from_key(k: &str) -> Option<SizeDragMode> {
+        match k {
+            "horizontal" => Some(SizeDragMode::Horizontal),
+            "vertical" => Some(SizeDragMode::Vertical),
+            "distance" => Some(SizeDragMode::Distance),
+            _ => None,
+        }
+    }
+}
+
 fn default_bindings() -> BTreeMap<ActionId, Option<KeyChord>> {
     let mut m = BTreeMap::new();
     for a in ActionId::ALL {
@@ -416,6 +451,8 @@ fn default_drag() -> BTreeMap<DragActionId, ModSet> {
 pub struct Shortcuts {
     bindings: BTreeMap<ActionId, Option<KeyChord>>,
     drag: BTreeMap<DragActionId, ModSet>,
+    /// Direction the brush-size drag measures travel along.
+    size_drag_mode: SizeDragMode,
 }
 
 impl Default for Shortcuts {
@@ -423,6 +460,7 @@ impl Default for Shortcuts {
         Shortcuts {
             bindings: default_bindings(),
             drag: default_drag(),
+            size_drag_mode: SizeDragMode::default(),
         }
     }
 }
@@ -462,6 +500,7 @@ impl Shortcuts {
     pub fn reset_all(&mut self) {
         self.bindings = default_bindings();
         self.drag = default_drag();
+        self.size_drag_mode = SizeDragMode::default();
     }
 
     /// Modifier combo for drag gesture `d`.
@@ -472,6 +511,16 @@ impl Shortcuts {
     /// Set the modifier combo for drag gesture `d`.
     pub fn set_drag(&mut self, d: DragActionId, set: ModSet) {
         self.drag.insert(d, set);
+    }
+
+    /// Direction the brush-size drag measures its travel along.
+    pub fn size_drag_mode(&self) -> SizeDragMode {
+        self.size_drag_mode
+    }
+
+    /// Set the brush-size drag direction.
+    pub fn set_size_drag_mode(&mut self, mode: SizeDragMode) {
+        self.size_drag_mode = mode;
     }
 
     /// Sparse persisted form: only entries differing from the defaults
@@ -490,7 +539,13 @@ impl Shortcuts {
                 drag.insert(d.to_key().to_string(), *s);
             }
         }
-        StoredShortcuts { bindings, drag }
+        let size_drag_mode = (self.size_drag_mode != SizeDragMode::default())
+            .then(|| self.size_drag_mode.to_key().to_string());
+        StoredShortcuts {
+            bindings,
+            drag,
+            size_drag_mode,
+        }
     }
 
     /// Rebuild from the sparse form: defaults first, then apply entries in
@@ -549,6 +604,12 @@ impl Shortcuts {
                 )),
             }
         }
+        if let Some(k) = &s.size_drag_mode {
+            match SizeDragMode::from_key(k) {
+                Some(m) => out.size_drag_mode = m,
+                None => warns.push(format!("Drag direction '{}' ignored: unknown mode", k)),
+            }
+        }
         (out, warns)
     }
 }
@@ -561,6 +622,9 @@ pub struct StoredShortcuts {
     pub bindings: BTreeMap<String, Option<KeyChord>>,
     #[serde(default)]
     pub drag: BTreeMap<String, ModSet>,
+    /// Brush-size drag direction; absent/None = horizontal (the default).
+    #[serde(default)]
+    pub size_drag_mode: Option<String>,
 }
 
 #[cfg(test)]
@@ -727,5 +791,57 @@ mod tests {
         assert_eq!(s.drag_get(DragActionId::BrushSize), ModSet::SHIFT);
         assert_eq!(warns.len(), 1);
         assert!(warns[0].contains("modifier"));
+    }
+
+    #[test]
+    fn size_drag_mode_defaults_to_horizontal_and_stores_nothing() {
+        let s = Shortcuts::default();
+        assert_eq!(s.size_drag_mode(), SizeDragMode::Horizontal);
+        assert!(
+            s.to_stored().size_drag_mode.is_none(),
+            "default isn't stored"
+        );
+    }
+
+    #[test]
+    fn size_drag_mode_is_sparse_and_round_trips() {
+        let mut s = Shortcuts::default();
+        s.set_size_drag_mode(SizeDragMode::Distance);
+        let stored = s.to_stored();
+        assert_eq!(stored.size_drag_mode.as_deref(), Some("distance"));
+        let json = serde_json::to_string(&stored).unwrap();
+        let back: StoredShortcuts = serde_json::from_str(&json).unwrap();
+        let (s2, warns) = Shortcuts::from_stored(&back);
+        assert!(warns.is_empty());
+        assert_eq!(s2.size_drag_mode(), SizeDragMode::Distance);
+    }
+
+    #[test]
+    fn old_settings_without_size_drag_mode_load_as_horizontal() {
+        // Pre-v0.9.1 files have no "size_drag_mode" key at all.
+        let back: StoredShortcuts = serde_json::from_str("{}").unwrap();
+        let (s, warns) = Shortcuts::from_stored(&back);
+        assert!(warns.is_empty());
+        assert_eq!(s.size_drag_mode(), SizeDragMode::Horizontal);
+    }
+
+    #[test]
+    fn stored_unknown_size_drag_mode_warns_and_keeps_default() {
+        let stored = StoredShortcuts {
+            size_drag_mode: Some("sideways".into()),
+            ..StoredShortcuts::default()
+        };
+        let (s, warns) = Shortcuts::from_stored(&stored);
+        assert_eq!(s.size_drag_mode(), SizeDragMode::Horizontal);
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("sideways"));
+    }
+
+    #[test]
+    fn reset_all_restores_the_default_size_drag_mode() {
+        let mut s = Shortcuts::default();
+        s.set_size_drag_mode(SizeDragMode::Vertical);
+        s.reset_all();
+        assert_eq!(s.size_drag_mode(), SizeDragMode::Horizontal);
     }
 }

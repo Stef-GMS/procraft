@@ -3270,7 +3270,7 @@ impl Document {
                     if text.chars().count() > MAX_TEXT_CHARS {
                         return Err("project text has too many characters".to_string());
                     }
-                    if text.lines().count() > MAX_TEXT_LINES {
+                    if text.split('\n').count() > MAX_TEXT_LINES {
                         return Err("project text has too many lines".to_string());
                     }
                     Some(TextBlock {
@@ -3881,6 +3881,13 @@ mod tests {
         // Within both byte and char caps but past the line cap.
         let path = dir.join("procraft-v11-hostile-lines.pcraft");
         std::fs::write(&path, build(None, 4.0, &"x\n".repeat(MAX_TEXT_LINES + 1))).unwrap();
+        assert!(Document::open_project(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+        // At the line cap with a trailing newline: split('\n') — the
+        // layout's own count — sees one segment more than lines() does,
+        // so the editor would refuse this file without the load check.
+        let path = dir.join("procraft-v11-hostile-trailnl.pcraft");
+        std::fs::write(&path, build(None, 4.0, &"x\n".repeat(MAX_TEXT_LINES))).unwrap();
         assert!(Document::open_project(&path).is_err());
         let _ = std::fs::remove_file(&path);
         // Structurally valid record but unparseable font bytes.

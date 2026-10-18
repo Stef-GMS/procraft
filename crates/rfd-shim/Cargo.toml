@@ -28,4 +28,8 @@ objc2-ui-kit = { version = "0.3", features = [
     "UIActivityViewController",
     "UIActivity",
     "UIPopoverPresentationController",
+    "UIScene",
+    "UIWindowScene",
+    "UIStatusBarManager",
+    "objc2-core-foundation",
 ] }

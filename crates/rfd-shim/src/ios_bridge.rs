@@ -175,11 +175,26 @@ fn find_root() -> Result<Retained<UIViewController>, &'static str> {
 }
 
 /// Window safe-area insets (top, bottom) in points for edge-to-edge padding.
+///
+/// iPadOS 26 regression family: `safeAreaInsets` can go stale after a
+/// rotation, leaving the top bar under the status bar. The status bar
+/// manager's frame stays fresh, so while the bar is visible the top inset
+/// is the larger of the two — in portrait they agree, so the max can only
+/// restore a stale value, never inflate a correct one.
 pub(super) fn safe_area_insets() -> Result<(u32, u32), &'static str> {
     let window = find_window()?;
     let insets = window.safeAreaInsets();
+    let mut top = insets.top;
+    if let Some(manager) = window
+        .windowScene()
+        .and_then(|scene| scene.statusBarManager())
+    {
+        if !manager.isStatusBarHidden() {
+            top = top.max(manager.statusBarFrame().size.height);
+        }
+    }
     Ok((
-        insets.top.max(0.0).round() as u32,
+        top.max(0.0).round() as u32,
         insets.bottom.max(0.0).round() as u32,
     ))
 }

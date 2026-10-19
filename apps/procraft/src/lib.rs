@@ -220,15 +220,57 @@ impl ShapeKind {
 
 /// Live ColorDrop preview: the pre-fill layer snapshot plus the drag
 /// geometry, so each tolerance update restores and re-fills from the same
-/// seed (one undo step for the whole gesture).
+/// seed (one undo step for the whole gesture). Kept alive after the
+/// gesture so the Tolerance/Grow sliders stay live: every update re-fills
+/// from this snapshot, which anchors growth to the fill's original
+/// (inner) boundary instead of stacking a new band on its grown outer
+/// edge.
 struct FillPreview {
     layer: usize,
     seed: (u32, u32),
     pixels: Vec<u8>,
+    color: Color,
+    opacity: f32,
     start_x: f32,
     start_tol: u8,
     applied: u8,
     live_hash: u64,
+    /// Document context the fill was computed under. A change (selection,
+    /// symmetry, active layer) finalizes the preview rather than replaying
+    /// the fill into a different context.
+    selection: Option<(u32, u32, u32, u32)>,
+    mask_hash: Option<u64>,
+    symmetry: SymmetryMode,
+    segments: u8,
+    sym_center: Option<(f32, f32)>,
+}
+
+/// Restore the pre-fill snapshot and re-run the fill at `tolerance`/`grow`.
+/// Always re-applies from the original boundary, so a slider scrub both
+/// expands and shrinks the result (and a re-tap never compounds growth).
+fn fill_from_baseline(doc: &mut Document, fp: &mut FillPreview, tolerance: u8, grow: u8) {
+    if let Some(layer) = doc.layers.get_mut(fp.layer) {
+        layer.pixels = fp.pixels.clone();
+    }
+    let brush = Brush {
+        opacity: fp.opacity,
+        ..Default::default()
+    };
+    doc.flood_fill(&brush, fp.color, fp.seed.0, fp.seed.1, tolerance, grow);
+    fp.applied = tolerance;
+    if let Some(layer) = doc.layers.get(fp.layer) {
+        fp.live_hash = pixels_hash(&layer.pixels);
+    }
+}
+
+/// Whether the document still matches the context the fill was made in.
+fn fill_context_matches(doc: &Document, fp: &FillPreview) -> bool {
+    doc.active == fp.layer
+        && doc.selection == fp.selection
+        && doc.selection_mask.as_deref().map(pixels_hash) == fp.mask_hash
+        && doc.symmetry == fp.symmetry
+        && doc.symmetry_segments == fp.segments
+        && doc.symmetry_center == fp.sym_center
 }
 
 /// Live filter preview baseline: scrubbing a filter slider restores these
@@ -690,6 +732,7 @@ struct ProCraftApp {
     last_autosave: f64,
     recovery_offer: bool,
     fill_tolerance: u8,
+    fill_grow: u8,
     fill_preview: Option<FillPreview>,
     smudge_strength: f32,
     filter_preview: Option<FilterPreview>,
@@ -935,6 +978,7 @@ impl ProCraftApp {
             last_autosave: 0.0,
             recovery_offer: std::path::Path::new(&recovery_path).exists(),
             fill_tolerance: 32,
+            fill_grow: 2,
             fill_preview: None,
             smudge_strength: 0.5,
             filter_preview: None,
@@ -1347,7 +1391,13 @@ impl ProCraftApp {
     /// strings the toolbar buttons and the old hardwired keys used.
     fn apply_action(&mut self, action: ActionId) {
         match action {
-            ActionId::Tool(t) => self.tool = tool_from_id(t),
+            ActionId::Tool(t) => {
+                let tool = tool_from_id(t);
+                if tool != Tool::Fill {
+                    self.fill_preview = None;
+                }
+                self.tool = tool;
+            }
             ActionId::Undo => {
                 if self.doc.undo() {
                     self.ghost_dirty = true;
@@ -1542,6 +1592,29 @@ impl ProCraftApp {
 
     fn current_color(&self) -> Color {
         Color::rgb(self.color[0], self.color[1], self.color[2])
+    }
+
+    /// Re-apply the last fill after a Tolerance/Grow slider move. Drops the
+    /// session (leaving the canvas untouched) if another edit or a context
+    /// change made the snapshot stale.
+    fn reapply_live_fill(&mut self) {
+        let Some(mut fp) = self.fill_preview.take() else {
+            return;
+        };
+        let layer_ok = self
+            .doc
+            .layers
+            .get(fp.layer)
+            .is_some_and(|l| pixels_hash(&l.pixels) == fp.live_hash);
+        if !layer_ok || !fill_context_matches(&self.doc, &fp) {
+            return;
+        }
+        fill_from_baseline(&mut self.doc, &mut fp, self.fill_tolerance, self.fill_grow);
+        self.status = format!(
+            "Fill preview — tolerance {}, grow {}.",
+            fp.applied, self.fill_grow
+        );
+        self.fill_preview = Some(fp);
     }
 
     /// Rebuild the cached mask-edge points for marching ants. Rect-only
@@ -3338,6 +3411,38 @@ fn stroke_steps(len: f32) -> usize {
     (len / 4.0).ceil().clamp(1.0, 64.0) as usize
 }
 
+/// Flush the smoothed stroke's final tail (curve cursor -> last raw
+/// sample) at pointer release. Only the painting branch owns this: the
+/// smudge tool advances its own last-point chain and must never run a
+/// brush flush from the shared curve state (that drew a stale brush
+/// segment from the smudge position to an earlier brush stroke).
+fn flush_stroke_tail(
+    doc: &mut Document,
+    brush: &Brush,
+    color: Color,
+    curve: &mut StrokeCurve,
+    last: &mut Option<(f32, f32)>,
+    dyn_state: DabDynamics,
+    leftover: &mut f32,
+) -> bool {
+    let Some((from, to)) = curve.finish() else {
+        return false;
+    };
+    if last.is_none() {
+        return false;
+    }
+    let len = ((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt();
+    let steps = stroke_steps(len);
+    for k in 1..=steps {
+        let t = k as f32 / steps as f32;
+        let p = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+        let (l, lo) = doc.stroke_to_dyn(brush, color, *last, dyn_state, p, dyn_state, *leftover);
+        *last = l;
+        *leftover = lo;
+    }
+    true
+}
+
 /// Textured quad for a rotated canvas view: `corners` are TL, TR, BR, BL
 /// with matching unit UVs, tinted (egui has no canvas transform, so the
 /// texture stays axis-aligned and the quad does the rotating).
@@ -4719,6 +4824,7 @@ impl eframe::App for ProCraftApp {
                     }
                 });
             });
+            let was_fill = self.tool == Tool::Fill;
             ui.radio_value(&mut self.tool, Tool::Brush, tool_label(Tool::Brush, self.has_symbols))
                 .on_hover_text(self.tool_hint(ToolId::Brush));
             ui.radio_value(&mut self.tool, Tool::Eraser, tool_label(Tool::Eraser, self.has_symbols))
@@ -4745,9 +4851,20 @@ impl eframe::App for ProCraftApp {
                 .on_hover_text(self.tool_hint(ToolId::Shapes));
             ui.radio_value(&mut self.tool, Tool::Text, tool_label(Tool::Text, self.has_symbols))
                 .on_hover_text(self.tool_hint(ToolId::Text));
+            if was_fill && self.tool != Tool::Fill {
+                self.fill_preview = None;
+            }
             if self.tool == Tool::Fill {
+                let tol_before = self.fill_tolerance;
+                let grow_before = self.fill_grow;
                 stepped_slider(ui, &mut self.fill_tolerance, 0..=255, 1.0, "Tolerance");
-                ui.label("Tap fills; hold + drag sideways to sweep tolerance.");
+                stepped_slider(ui, &mut self.fill_grow, 0..=16, 1.0, "Grow");
+                if (self.fill_tolerance != tol_before || self.fill_grow != grow_before)
+                    && self.fill_preview.is_some()
+                {
+                    self.reapply_live_fill();
+                }
+                ui.label("Tap fills; hold + drag sideways to sweep tolerance. Tolerance and Grow stay live after a fill; Grow paints the anti-aliased edge and stops at dark line art.");
             }
             if self.tool == Tool::Picker {
                 ui.label("Tap the canvas to lift its color; the loupe magnifies the target.");
@@ -7644,36 +7761,88 @@ impl eframe::App for ProCraftApp {
                         if let Some(pos) = resp.interact_pointer_pos() {
                             let (x, y) = to_canvas(pos);
                             let (cx, cy) = clamp_pt(x, y);
+                            let seed = (cx as u32, cy as u32);
                             let layer = self.doc.active;
-                            let pixels = self
-                                .doc
-                                .layers
-                                .get(layer)
-                                .map(|l| l.pixels.clone())
-                                .unwrap_or_default();
-                            self.doc.checkpoint();
-                            let brush = self.base_brush();
-                            let color = self.current_color();
-                            self.doc.flood_fill(
-                                &brush,
-                                color,
-                                cx as u32,
-                                cy as u32,
-                                self.fill_tolerance,
-                            );
-                            self.fill_preview = Some(FillPreview {
-                                layer,
-                                seed: (cx as u32, cy as u32),
-                                pixels: pixels.clone(),
-                                start_x: pos.x,
-                                start_tol: self.fill_tolerance,
-                                applied: self.fill_tolerance,
-                                live_hash: pixels_hash(&pixels),
+                            // Re-tapping the same seed while the fill is
+                            // still live re-applies it from the original
+                            // snapshot instead of growing from the already
+                            // grown outer edge.
+                            let same_live = self.fill_preview.as_ref().is_some_and(|fp| {
+                                fp.layer == layer
+                                    && fp.seed == seed
+                                    && self
+                                        .doc
+                                        .layers
+                                        .get(fp.layer)
+                                        .is_some_and(|l| pixels_hash(&l.pixels) == fp.live_hash)
+                                    && fill_context_matches(&self.doc, fp)
                             });
-                            self.status = format!(
-                                "Fill preview — drag sideways for tolerance ({}).",
-                                self.fill_tolerance
-                            );
+                            if same_live {
+                                if let Some(mut fp) = self.fill_preview.take() {
+                                    fill_from_baseline(
+                                        &mut self.doc,
+                                        &mut fp,
+                                        self.fill_tolerance,
+                                        self.fill_grow,
+                                    );
+                                    // A sideways drag from this new press
+                                    // sweeps from here, not the first tap.
+                                    fp.start_x = pos.x;
+                                    fp.start_tol = self.fill_tolerance;
+                                    self.status = format!(
+                                        "Fill preview — tolerance {}, grow {}.",
+                                        fp.applied, self.fill_grow
+                                    );
+                                    self.fill_preview = Some(fp);
+                                }
+                            } else {
+                                let pixels = self
+                                    .doc
+                                    .layers
+                                    .get(layer)
+                                    .map(|l| l.pixels.clone())
+                                    .unwrap_or_default();
+                                self.doc.checkpoint();
+                                let brush = self.base_brush();
+                                let color = self.current_color();
+                                self.doc.flood_fill(
+                                    &brush,
+                                    color,
+                                    seed.0,
+                                    seed.1,
+                                    self.fill_tolerance,
+                                    self.fill_grow,
+                                );
+                                // Hash what our fill just left behind, not
+                                // the snapshot: the sweep's guard compares
+                                // the live layer against the last apply.
+                                let live_hash = self
+                                    .doc
+                                    .layers
+                                    .get(layer)
+                                    .map(|l| pixels_hash(&l.pixels))
+                                    .unwrap_or_default();
+                                self.fill_preview = Some(FillPreview {
+                                    layer,
+                                    seed,
+                                    pixels,
+                                    color,
+                                    opacity: brush.opacity,
+                                    start_x: pos.x,
+                                    start_tol: self.fill_tolerance,
+                                    applied: self.fill_tolerance,
+                                    live_hash,
+                                    selection: self.doc.selection,
+                                    mask_hash: self.doc.selection_mask.as_deref().map(pixels_hash),
+                                    symmetry: self.doc.symmetry,
+                                    segments: self.doc.symmetry_segments,
+                                    sym_center: self.doc.symmetry_center,
+                                });
+                                self.status = format!(
+                                    "Fill preview — drag sideways for tolerance ({}).",
+                                    self.fill_tolerance
+                                );
+                            }
                         }
                     } else if resp.dragged() && !gesture {
                         if let Some(mut fp) = self.fill_preview.take() {
@@ -7693,18 +7862,13 @@ impl eframe::App for ProCraftApp {
                                         .clamp(0, 255)
                                         as u8;
                                     if tol != fp.applied {
-                                        if let Some(layer) = self.doc.layers.get_mut(fp.layer) {
-                                            layer.pixels = fp.pixels.clone();
-                                        }
-                                        let brush = self.base_brush();
-                                        let color = self.current_color();
-                                        self.doc
-                                            .flood_fill(&brush, color, fp.seed.0, fp.seed.1, tol);
-                                        fp.applied = tol;
+                                        fill_from_baseline(
+                                            &mut self.doc,
+                                            &mut fp,
+                                            tol,
+                                            self.fill_grow,
+                                        );
                                         self.fill_tolerance = tol;
-                                        if let Some(layer) = self.doc.layers.get(fp.layer) {
-                                            fp.live_hash = pixels_hash(&layer.pixels);
-                                        }
                                         self.status = format!("Fill preview — tolerance {tol}.");
                                     }
                                 }
@@ -7715,8 +7879,16 @@ impl eframe::App for ProCraftApp {
                             }
                         }
                     } else if resp.drag_stopped() {
-                        if let Some(fp) = self.fill_preview.take() {
-                            self.status = format!("Filled (tolerance {}).", fp.applied);
+                        // Keep the preview: the panel re-applies it live
+                        // while Tolerance/Grow change (anchored to the
+                        // original snapshot, so Grow can shrink as well as
+                        // expand). It expires on tool change, pinch, or any
+                        // other edit.
+                        if let Some(fp) = self.fill_preview.as_ref() {
+                            self.status = format!(
+                                "Filled (tolerance {}, grow {}).",
+                                fp.applied, self.fill_grow
+                            );
                             self.capture_timelapse();
                         }
                     }
@@ -8230,40 +8402,6 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                     if resp.drag_stopped() {
-                        if self.painting {
-                            // Finish the smoothed path: its last tail (from
-                            // the curve cursor to the final sample) was
-                            // never stamped, there is no later point to
-                            // curve through.
-                            if let Some((from, to)) = self.stroke_curve.finish() {
-                                if self.last.is_some() {
-                                    let brush = self.base_brush();
-                                    let color = self.current_color();
-                                    let len =
-                                        ((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt();
-                                    let steps = stroke_steps(len);
-                                    for k in 1..=steps {
-                                        let t = k as f32 / steps as f32;
-                                        let p = (
-                                            from.0 + (to.0 - from.0) * t,
-                                            from.1 + (to.1 - from.1) * t,
-                                        );
-                                        let (last, leftover) = self.doc.stroke_to_dyn(
-                                            &brush,
-                                            color,
-                                            self.last,
-                                            self.last_dyn,
-                                            p,
-                                            self.last_dyn,
-                                            self.leftover,
-                                        );
-                                        self.last = last;
-                                        self.leftover = leftover;
-                                    }
-                                    self.stroke_painted = true;
-                                }
-                            }
-                        }
                         if self.stroke_painted {
                             self.stroke_painted = false;
                             self.capture_timelapse();
@@ -8499,6 +8637,21 @@ impl eframe::App for ProCraftApp {
                     }
                 }
                 if resp.drag_stopped() {
+                    if self.painting {
+                        let brush = self.base_brush();
+                        let color = self.current_color();
+                        if flush_stroke_tail(
+                            &mut self.doc,
+                            &brush,
+                            color,
+                            &mut self.stroke_curve,
+                            &mut self.last,
+                            self.last_dyn,
+                            &mut self.leftover,
+                        ) {
+                            self.stroke_painted = true;
+                        }
+                    }
                     if self.stroke_painted {
                         self.stroke_painted = false;
                         self.capture_timelapse();
@@ -9190,6 +9343,64 @@ mod tests {
     }
 
     #[test]
+    fn flush_stroke_tail_stamps_the_pending_tail_once() {
+        let mut doc = Document::new(20, 6);
+        let paint = Brush {
+            size: 3.0,
+            opacity: 1.0,
+            softness: 0.0,
+            ..Default::default()
+        };
+        doc.fill_rect(&paint, Color::rgb(255, 255, 255), 0, 0, 19, 5);
+        let mut curve = StrokeCurve::new();
+        assert!(curve.push((2.0, 3.0)).is_none());
+        assert!(curve.push((10.0, 3.0)).is_some());
+        let mut last = Some((6.0, 3.0));
+        let mut leftover = 0.0;
+        assert!(flush_stroke_tail(
+            &mut doc,
+            &paint,
+            Color::rgb(255, 0, 0),
+            &mut curve,
+            &mut last,
+            DabDynamics::default(),
+            &mut leftover,
+        ));
+        let i = ((3 * doc.w + 9) * 4) as usize;
+        assert_eq!(&doc.layers[0].pixels[i..i + 3], &[255, 0, 0]);
+        // The tail is consumed exactly once.
+        assert!(!flush_stroke_tail(
+            &mut doc,
+            &paint,
+            Color::rgb(0, 255, 0),
+            &mut curve,
+            &mut last,
+            DabDynamics::default(),
+            &mut leftover,
+        ));
+    }
+
+    #[test]
+    fn flush_stroke_tail_without_a_pending_curve_is_a_noop() {
+        let mut doc = Document::new(8, 8);
+        let brush = Brush::default();
+        let mut curve = StrokeCurve::new();
+        let mut last = Some((4.0, 4.0));
+        let mut leftover = 0.0;
+        let before = doc.layers[0].pixels.clone();
+        assert!(!flush_stroke_tail(
+            &mut doc,
+            &brush,
+            Color::rgb(255, 0, 0),
+            &mut curve,
+            &mut last,
+            DabDynamics::default(),
+            &mut leftover,
+        ));
+        assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
     fn stroke_steps_densify_long_pieces() {
         assert_eq!(stroke_steps(0.0), 1);
         assert_eq!(stroke_steps(3.9), 1);
@@ -9367,5 +9578,62 @@ mod tests {
             space_hand_step(Tool::Hand, Some(b), false, true, false, false),
             None
         );
+    }
+
+    #[test]
+    fn live_fill_reapplies_from_the_original_boundary() {
+        // White field, a 4px light-gray band the fill can grow into, and a
+        // black wall behind it. Grow must be measured from the original
+        // (inner) boundary: scrub 8 -> 2 -> 4 and every step has to match a
+        // direct fill at that Grow, instead of stacking bands outward.
+        fn scene() -> Document {
+            let brush = Brush::default();
+            let mut doc = Document::new(14, 9);
+            doc.fill_rect(&brush, Color::rgb(255, 255, 255), 0, 0, 13, 8);
+            for x in 8..=11 {
+                doc.fill_rect(&brush, Color::rgb(200, 200, 200), x, 0, x, 8);
+            }
+            doc.fill_rect(&brush, Color::rgb(0, 0, 0), 12, 0, 12, 8);
+            doc
+        }
+        fn direct(grow: u8) -> Document {
+            let mut doc = scene();
+            doc.flood_fill(&Brush::default(), Color::rgb(0, 0, 255), 3, 4, 0, grow);
+            doc
+        }
+        fn px(doc: &Document, x: u32, y: u32) -> [u8; 4] {
+            let i = ((y * doc.w + x) * 4) as usize;
+            [
+                doc.layers[0].pixels[i],
+                doc.layers[0].pixels[i + 1],
+                doc.layers[0].pixels[i + 2],
+                doc.layers[0].pixels[i + 3],
+            ]
+        }
+
+        let mut live = scene();
+        let mut fp = FillPreview {
+            layer: 0,
+            seed: (3, 4),
+            pixels: live.layers[0].pixels.clone(),
+            color: Color::rgb(0, 0, 255),
+            opacity: 1.0,
+            start_x: 0.0,
+            start_tol: 0,
+            applied: 0,
+            live_hash: 0,
+            selection: None,
+            mask_hash: None,
+            symmetry: SymmetryMode::Off,
+            segments: 0,
+            sym_center: None,
+        };
+        fill_from_baseline(&mut live, &mut fp, 0, 8);
+        assert_eq!(px(&live, 11, 4), [0, 0, 255, 255]);
+        fill_from_baseline(&mut live, &mut fp, 0, 2);
+        assert_eq!(live.layers[0].pixels, direct(2).layers[0].pixels);
+        assert_eq!(px(&live, 11, 4), [200, 200, 200, 255]);
+        fill_from_baseline(&mut live, &mut fp, 0, 4);
+        assert_eq!(live.layers[0].pixels, direct(4).layers[0].pixels);
     }
 }

@@ -1774,8 +1774,21 @@ impl Document {
     /// layer with `color` at brush opacity. A pixel belongs to the region
     /// when every channel is within `tolerance` of the seed pixel. Honors
     /// the active selection and mirrors across symmetry axes.
-    /// Caller checkpoints first.
-    pub fn flood_fill(&mut self, brush: &Brush, color: Color, x: u32, y: u32, tolerance: u8) {
+    /// `grow` extends the matched region outward by up to that many px
+    /// (straight-line distance), painting over the anti-aliased fringe left
+    /// by tolerance misses. Growth stays inside the selection and canvas
+    /// edges, and stops at opaque pixels clearly darker than the fill (line
+    /// art), so a fill never spills across its outline. Caller checkpoints
+    /// first.
+    pub fn flood_fill(
+        &mut self,
+        brush: &Brush,
+        color: Color,
+        x: u32,
+        y: u32,
+        tolerance: u8,
+        grow: u8,
+    ) {
         if self.active >= self.layers.len() || !self.pixel_selected(x, y) {
             return;
         }
@@ -1805,7 +1818,9 @@ impl Document {
             snap[seed_off + 3],
         ];
         let opacity = brush.opacity.clamp(0.0, 1.0);
-        if blend_over(target, color, opacity) == target {
+        // A seed already carrying the fill color is a no-op only without
+        // growth; with `grow` the second fill must still extend the region.
+        if grow == 0 && blend_over(target, color, opacity) == target {
             return;
         }
         let matches = |px: &[u8]| {
@@ -1848,6 +1863,7 @@ impl Document {
         let mut visited = vec![0u8; (w * h) as usize];
         let mut stack = seeds;
         let mut any = false;
+        let mut matched: Vec<(u32, u32)> = Vec::new();
         while let Some((cx, cy)) = stack.pop() {
             let idx = (cy * w + cx) as usize;
             if visited[idx] == 1 {
@@ -1866,6 +1882,7 @@ impl Document {
             if !matches(&content) {
                 continue;
             }
+            matched.push((cx, cy));
             // Store only where the buffer exists (see `slot`).
             if let Some(o) = slot(cx, cy) {
                 if o + 3 < layer.pixels.len() {
@@ -1884,6 +1901,146 @@ impl Document {
             }
             if cy + 1 < h && selected(cx, cy + 1) {
                 stack.push((cx, cy + 1));
+            }
+        }
+        // Grow: expand the matched region outward by up to `grow` px,
+        // painting over the fringe that tolerance left behind. Measured
+        // with a chamfer distance transform (ortho 100 / diag 141 — exact
+        // on the axes and 45° diagonals, up to ~8% long at 1:2 slopes, the
+        // conservative side) so N px means N px radially in EVERY
+        // direction: 4-neighbor rings under-reach the diagonals by
+        // √2 and leave halo arcs along a circle's 45° sectors. The BFS's
+        // `visited` map cannot stand in for region membership (it also
+        // holds rejected pixels — the fringe itself), hence the separate
+        // map. Growth stays gated by selection and canvas edges.
+        if grow > 0 && !matched.is_empty() {
+            const ORTHO: u32 = 100;
+            const DIAG: u32 = 141;
+            // Cost ≤ limit spans at most `grow` px of displacement. The
+            // +60 slack covers half a cell (the tolerance boundary sits
+            // between cell centers, so centre-to-centre distance reads up
+            // to ~0.5 px long) plus a little chamfer error at shallow
+            // angles; without it, diagonal notches of the digitized
+            // boundary leave sub-pixel halo specks at grow N. Empirically
+            // (3 px ramp test) survivors sit ≤241 and the nearest black
+            // line pixel at 282, so the slack clears fringe without
+            // nibbling the stroke.
+            let limit = grow as u32 * ORTHO + 60;
+            let mut in_region = vec![0u8; (w * h) as usize];
+            let (mut bx0, mut by0, mut bx1, mut by1) = (w, h, 0u32, 0u32);
+            for &(cx, cy) in &matched {
+                in_region[(cy * w + cx) as usize] = 1;
+                bx0 = bx0.min(cx);
+                by0 = by0.min(cy);
+                bx1 = bx1.max(cx);
+                by1 = by1.max(cy);
+            }
+            // Cost ≤ limit spans at most grow + 0.6 px of displacement;
+            // pad one more cell for the grid offset at the edges.
+            let pad = grow as u32 + 1;
+            bx0 = bx0.saturating_sub(pad);
+            by0 = by0.saturating_sub(pad);
+            bx1 = (bx1 + pad).min(w - 1);
+            by1 = (by1 + pad).min(h - 1);
+            let (bw, bh) = ((bx1 - bx0 + 1) as usize, (by1 - by0 + 1) as usize);
+            let inf = u32::MAX / 2;
+            // Opaque pixels clearly darker than the fill are line art:
+            // growth may neither run through them nor paint over them. The
+            // 140 floor keeps a dark fill from walling off its own fringe.
+            let fill_brightness = color.0[0].max(color.0[1]).max(color.0[2]);
+            let barrier = ((fill_brightness as u32 * 3 / 5) as u8).max(140);
+            let mut dist = vec![inf; bw * bh];
+            let mut open = vec![false; bw * bh];
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let i = by * bw + bx;
+                    let (nx, ny) = (bx0 + bx as u32, by0 + by as u32);
+                    let region = in_region[(ny * w + nx) as usize] == 1;
+                    let mut is_open = selected(nx, ny);
+                    if is_open && !region {
+                        if let Some(o) = slot(nx, ny) {
+                            if o + 3 < layer.pixels.len()
+                                && layer.pixels[o + 3] >= 128
+                                && layer.pixels[o]
+                                    .max(layer.pixels[o + 1])
+                                    .max(layer.pixels[o + 2])
+                                    < barrier
+                            {
+                                is_open = false;
+                            }
+                        }
+                    }
+                    open[i] = is_open;
+                    if region {
+                        dist[i] = 0;
+                    }
+                }
+            }
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let i = by * bw + bx;
+                    if dist[i] == 0 || !open[i] {
+                        continue;
+                    }
+                    let mut d = dist[i];
+                    if bx > 0 {
+                        d = d.min(dist[i - 1].saturating_add(ORTHO));
+                    }
+                    if by > 0 {
+                        d = d.min(dist[i - bw].saturating_add(ORTHO));
+                    }
+                    if bx > 0 && by > 0 {
+                        d = d.min(dist[i - bw - 1].saturating_add(DIAG));
+                    }
+                    if bx + 1 < bw && by > 0 {
+                        d = d.min(dist[i - bw + 1].saturating_add(DIAG));
+                    }
+                    dist[i] = d;
+                }
+            }
+            for by in (0..bh).rev() {
+                for bx in (0..bw).rev() {
+                    let i = by * bw + bx;
+                    if dist[i] == 0 || !open[i] {
+                        continue;
+                    }
+                    let mut d = dist[i];
+                    if bx + 1 < bw {
+                        d = d.min(dist[i + 1].saturating_add(ORTHO));
+                    }
+                    if by + 1 < bh {
+                        d = d.min(dist[i + bw].saturating_add(ORTHO));
+                    }
+                    if bx + 1 < bw && by + 1 < bh {
+                        d = d.min(dist[i + bw + 1].saturating_add(DIAG));
+                    }
+                    if bx > 0 && by + 1 < bh {
+                        d = d.min(dist[i + bw - 1].saturating_add(DIAG));
+                    }
+                    dist[i] = d;
+                }
+            }
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let i = by * bw + bx;
+                    if dist[i] == 0 || dist[i] > limit || !open[i] {
+                        continue;
+                    }
+                    let (nx, ny) = (bx0 + bx as u32, by0 + by as u32);
+                    if let Some(o) = slot(nx, ny) {
+                        if o + 3 < layer.pixels.len() {
+                            let content = [
+                                layer.pixels[o],
+                                layer.pixels[o + 1],
+                                layer.pixels[o + 2],
+                                layer.pixels[o + 3],
+                            ];
+                            layer.pixels[o..o + 4]
+                                .copy_from_slice(&blend_over(content, color, opacity));
+                            any = true;
+                        }
+                    }
+                }
             }
         }
         if any {
@@ -1967,7 +2124,7 @@ mod tests {
         };
         // Opaque red wall splitting the canvas.
         doc.fill_rect(&brush, Color::rgb(255, 0, 0), 5, 0, 5, 9);
-        doc.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 0);
+        doc.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 0, 0);
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 10 + x) * 4) as usize;
             [
@@ -1992,7 +2149,7 @@ mod tests {
             ..Default::default()
         };
         doc.fill_rect(&brush, Color::rgb(255, 0, 0), 5, 0, 5, 10);
-        doc.flood_fill(&brush, Color::rgb(0, 255, 0), 1, 5, 0);
+        doc.flood_fill(&brush, Color::rgb(0, 255, 0), 1, 5, 0, 0);
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 11 + x) * 4) as usize;
             [
@@ -2033,13 +2190,13 @@ mod tests {
         // Strict: only the seed side fills.
         let mut tight = Document::new(10, 10);
         two_tone(&mut tight);
-        tight.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 0);
+        tight.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 0, 0);
         assert_eq!(at(&tight, 0, 5), [0, 0, 255]);
         assert_eq!(at(&tight, 9, 5), [206, 0, 0]);
         // Loose: the neighbor tone joins the region.
         let mut loose = Document::new(10, 10);
         two_tone(&mut loose);
-        loose.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 10);
+        loose.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 10, 0);
         assert_eq!(at(&loose, 0, 5), [0, 0, 255]);
         assert_eq!(at(&loose, 9, 5), [0, 0, 255]);
     }
@@ -2055,15 +2212,273 @@ mod tests {
         let mut direct = Document::new(10, 10);
         direct.fill_rect(&brush, Color::rgb(200, 0, 0), 0, 0, 4, 9);
         direct.fill_rect(&brush, Color::rgb(206, 0, 0), 5, 0, 9, 9);
-        direct.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 10);
+        direct.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 10, 0);
         let mut preview = Document::new(10, 10);
         preview.fill_rect(&brush, Color::rgb(200, 0, 0), 0, 0, 4, 9);
         preview.fill_rect(&brush, Color::rgb(206, 0, 0), 5, 0, 9, 9);
         let snap = preview.layers[0].pixels.clone();
-        preview.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 0);
+        preview.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 0, 0);
         preview.layers[0].pixels = snap;
-        preview.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 10);
+        preview.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 10, 0);
         assert_eq!(preview.layers[0].pixels, direct.layers[0].pixels);
+    }
+
+    #[test]
+    fn flood_fill_grow_covers_the_fringe() {
+        // Anti-aliased line art: the fill-matching edge is white (cols 0-4),
+        // the soft fringe (col 5) and the dark core (col 6) are not, the
+        // far side (cols 7-9) is white again. Grow paints over the fringe.
+        let scene = |doc: &mut Document| {
+            let brush = Brush {
+                opacity: 1.0,
+                ..Default::default()
+            };
+            doc.fill_rect(&brush, Color::rgb(255, 255, 255), 0, 0, 9, 9);
+            doc.fill_rect(&brush, Color::rgb(160, 160, 160), 5, 0, 5, 9);
+            doc.fill_rect(&brush, Color::rgb(0, 0, 0), 6, 0, 6, 9);
+            doc.fill_rect(&brush, Color::rgb(255, 255, 255), 7, 0, 9, 9);
+        };
+        let at = |d: &Document, x: u32, y: u32| {
+            let o = ((y * 10 + x) * 4) as usize;
+            [
+                d.layers[0].pixels[o],
+                d.layers[0].pixels[o + 1],
+                d.layers[0].pixels[o + 2],
+                d.layers[0].pixels[o + 3],
+            ]
+        };
+        let brush = Brush {
+            opacity: 1.0,
+            ..Default::default()
+        };
+        // Growth 0 (the old behavior): the fringe survives.
+        let mut flat = Document::new(10, 10);
+        scene(&mut flat);
+        flat.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 32, 0);
+        assert_eq!(at(&flat, 4, 5), [0, 0, 255, 255]);
+        assert_eq!(at(&flat, 5, 5), [160, 160, 160, 255]);
+        // Growth 1: the fringe is covered, the dark core (distance 2) is not.
+        let mut grown = Document::new(10, 10);
+        scene(&mut grown);
+        grown.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 32, 1);
+        assert_eq!(at(&grown, 5, 5), [0, 0, 255, 255]);
+        assert_eq!(at(&grown, 6, 5), [0, 0, 0, 255]);
+        assert_eq!(at(&grown, 7, 5), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn flood_fill_again_with_more_grow_covers_the_fringe() {
+        // A second fill lands on a seed that already has the fill color;
+        // it must still honor a larger Grow instead of early-returning.
+        let scene = |doc: &mut Document| {
+            let brush = Brush {
+                opacity: 1.0,
+                ..Default::default()
+            };
+            doc.fill_rect(&brush, Color::rgb(255, 255, 255), 0, 0, 9, 9);
+            doc.fill_rect(&brush, Color::rgb(160, 160, 160), 5, 0, 5, 9);
+            doc.fill_rect(&brush, Color::rgb(0, 0, 0), 6, 0, 6, 9);
+            doc.fill_rect(&brush, Color::rgb(255, 255, 255), 7, 0, 9, 9);
+        };
+        let at = |d: &Document, x: u32, y: u32| {
+            let o = ((y * 10 + x) * 4) as usize;
+            [
+                d.layers[0].pixels[o],
+                d.layers[0].pixels[o + 1],
+                d.layers[0].pixels[o + 2],
+                d.layers[0].pixels[o + 3],
+            ]
+        };
+        let brush = Brush {
+            opacity: 1.0,
+            ..Default::default()
+        };
+        let mut doc = Document::new(10, 10);
+        scene(&mut doc);
+        doc.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 32, 0);
+        assert_eq!(at(&doc, 5, 5), [160, 160, 160, 255]);
+        doc.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 32, 1);
+        assert_eq!(at(&doc, 5, 5), [0, 0, 255, 255], "grow ignored on re-fill");
+        assert_eq!(at(&doc, 6, 5), [0, 0, 0, 255]);
+        assert_eq!(at(&doc, 7, 5), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn flood_fill_grow_never_crosses_a_dark_line() {
+        // A full-height black line splits white paper. Even a huge Grow
+        // must not paint through the outline onto the other side.
+        let brush = Brush {
+            opacity: 1.0,
+            ..Default::default()
+        };
+        let mut doc = Document::new(21, 21);
+        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 0, 0, 20, 20);
+        doc.fill_rect(&brush, Color::rgb(0, 0, 0), 10, 0, 10, 20);
+        doc.flood_fill(&brush, Color::rgb(0, 0, 255), 3, 3, 32, 16);
+        let at = |x: u32, y: u32| {
+            let o = ((y * 21 + x) * 4) as usize;
+            [
+                doc.layers[0].pixels[o],
+                doc.layers[0].pixels[o + 1],
+                doc.layers[0].pixels[o + 2],
+                doc.layers[0].pixels[o + 3],
+            ]
+        };
+        assert_eq!(at(9, 10), [0, 0, 255, 255]);
+        assert_eq!(at(10, 10), [0, 0, 0, 255]);
+        assert_eq!(at(11, 10), [255, 255, 255, 255], "grow crossed darkness");
+        assert_eq!(at(20, 20), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn flood_fill_grow_respects_selection() {
+        let brush = Brush {
+            opacity: 1.0,
+            ..Default::default()
+        };
+        let mut doc = Document::new(10, 10);
+        doc.selection = Some((0, 0, 4, 9));
+        // Gray column 4 matches nothing, but it is inside the selection:
+        // growth may paint it. Column 5 is outside the selection: blocked.
+        doc.fill_rect(&brush, Color::rgb(160, 160, 160), 4, 0, 4, 9);
+        doc.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 32, 5);
+        let at = |d: &Document, x: u32, y: u32| {
+            let o = ((y * 10 + x) * 4) as usize;
+            [
+                d.layers[0].pixels[o],
+                d.layers[0].pixels[o + 1],
+                d.layers[0].pixels[o + 2],
+                d.layers[0].pixels[o + 3],
+            ]
+        };
+        assert_eq!(at(&doc, 3, 5), [0, 0, 255, 255]);
+        assert_eq!(at(&doc, 4, 5), [0, 0, 255, 255]);
+        assert_eq!(at(&doc, 5, 5)[3], 0);
+    }
+
+    #[test]
+    fn flood_fill_grow_mirrors_with_symmetry() {
+        use crate::document::SymmetryMode;
+        let brush = Brush {
+            opacity: 1.0,
+            ..Default::default()
+        };
+        let mut doc = Document::new(11, 11);
+        doc.symmetry = SymmetryMode::Horizontal;
+        doc.fill_rect(&brush, Color::rgb(160, 160, 160), 4, 0, 4, 10);
+        doc.fill_rect(&brush, Color::rgb(255, 0, 0), 5, 0, 5, 10);
+        doc.fill_rect(&brush, Color::rgb(160, 160, 160), 6, 0, 6, 10);
+        doc.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 5, 32, 1);
+        let at = |d: &Document, x: u32, y: u32| {
+            let o = ((y * 11 + x) * 4) as usize;
+            [
+                d.layers[0].pixels[o],
+                d.layers[0].pixels[o + 1],
+                d.layers[0].pixels[o + 2],
+                d.layers[0].pixels[o + 3],
+            ]
+        };
+        assert_eq!(at(&doc, 4, 5), [0, 0, 255, 255]);
+        assert_eq!(at(&doc, 6, 5), [0, 0, 255, 255]);
+        assert_eq!(at(&doc, 5, 5), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn flood_fill_grow_clears_a_realistic_antialiased_edge() {
+        // A 4 px black ring with a 3 px anti-aliased inner ramp (white at
+        // d=17 fading to black at d=20) — the halo case from the field:
+        // fill inside, a light ring survives at tolerance 32.
+        let scene = |doc: &mut Document| {
+            let brush = Brush {
+                opacity: 1.0,
+                ..Default::default()
+            };
+            doc.fill_rect(&brush, Color::rgb(255, 255, 255), 0, 0, 63, 63);
+            for y in 0..64u32 {
+                for x in 0..64u32 {
+                    let dx = x as f32 - 31.5;
+                    let dy = y as f32 - 31.5;
+                    let d = (dx * dx + dy * dy).sqrt();
+                    let v = if (17.0..20.0).contains(&d) {
+                        (255.0 * (1.0 - (d - 17.0) / 3.0)).round() as u8
+                    } else if (20.0..=24.0).contains(&d) {
+                        0
+                    } else {
+                        continue;
+                    };
+                    let o = ((y * 64 + x) * 4) as usize;
+                    doc.layers[0].pixels[o] = v;
+                    doc.layers[0].pixels[o + 1] = v;
+                    doc.layers[0].pixels[o + 2] = v;
+                }
+            }
+        };
+        let brush = Brush {
+            opacity: 1.0,
+            ..Default::default()
+        };
+        // Grow clears the pale part of the anti-aliased ramp (v >= 153, the
+        // white-fill barrier) but stops at the darker ramp and the black
+        // core: it never paints through line art.
+        let pale_halo = |d: &Document| {
+            d.layers[0]
+                .pixels
+                .chunks(4)
+                .filter(|p| (153..=222).contains(&p[0]))
+                .count()
+        };
+        let dark_ramp = |d: &Document| {
+            d.layers[0]
+                .pixels
+                .chunks(4)
+                .filter(|p| (1..=152).contains(&p[0]))
+                .count()
+        };
+        let black_core = |d: &Document| {
+            d.layers[0]
+                .pixels
+                .chunks(4)
+                .filter(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
+                .count()
+        };
+        let mut flat = Document::new(64, 64);
+        scene(&mut flat);
+        flat.flood_fill(&brush, Color::rgb(0, 0, 255), 32, 32, 32, 0);
+        let mut grown = Document::new(64, 64);
+        scene(&mut grown);
+        grown.flood_fill(&brush, Color::rgb(0, 0, 255), 32, 32, 32, 2);
+        // The halo is real and grow 2 as the default clears its pale part...
+        assert!(pale_halo(&flat) > 0, "no halo to fix");
+        assert_eq!(pale_halo(&grown), 0, "pale halo survived grow 2");
+        // ...without eating the dark ramp or the stroke's black core.
+        assert_eq!(dark_ramp(&grown), dark_ramp(&flat), "grow ate the ramp");
+        assert_eq!(black_core(&grown), black_core(&flat));
+    }
+
+    #[test]
+    fn flood_fill_grow_clamps_at_canvas_edges() {
+        let brush = Brush {
+            opacity: 1.0,
+            ..Default::default()
+        };
+        let mut doc = Document::new(3, 3);
+        // Only the center matches; a huge growth floods the rest.
+        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 1, 1, 1, 1);
+        doc.flood_fill(&brush, Color::rgb(0, 0, 255), 1, 1, 0, 200);
+        for y in 0..3u32 {
+            for x in 0..3u32 {
+                let o = ((y * 3 + x) * 4) as usize;
+                assert_eq!(
+                    [
+                        doc.layers[0].pixels[o],
+                        doc.layers[0].pixels[o + 1],
+                        doc.layers[0].pixels[o + 2],
+                        doc.layers[0].pixels[o + 3],
+                    ],
+                    [0, 0, 255, 255]
+                );
+            }
+        }
     }
 
     #[test]

@@ -741,6 +741,24 @@ struct SizeDrag {
     anchor: egui::Pos2,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrushSlot {
+    Builtin(usize),
+    Custom(usize),
+}
+
+fn slot_is_active(selected: Option<BrushSlot>, candidate: BrushSlot) -> bool {
+    selected == Some(candidate)
+}
+
+fn slot_after_remove(selected: Option<BrushSlot>, removed: usize) -> Option<BrushSlot> {
+    match selected {
+        Some(BrushSlot::Custom(index)) if index == removed => None,
+        Some(BrushSlot::Custom(index)) if index > removed => Some(BrushSlot::Custom(index - 1)),
+        other => other,
+    }
+}
+
 struct ProCraftApp {
     doc: Document,
     brush: Brush,
@@ -853,6 +871,7 @@ struct ProCraftApp {
     android_inset_top: f32,
     preview_theme: Option<Theme>,
     custom_brushes: Vec<BrushPreset>,
+    brush_slot: Option<BrushSlot>,
     new_brush_name: String,
     palettes: PaletteSet,
     pal_renaming: bool,
@@ -1093,6 +1112,7 @@ impl ProCraftApp {
             android_inset_top: -1.0,
             preview_theme: None,
             custom_brushes: Vec::new(),
+            brush_slot: None,
             new_brush_name: String::new(),
             palettes: PaletteSet::new(),
             pal_renaming: false,
@@ -2394,6 +2414,25 @@ impl ProCraftApp {
                 }
             }
         }
+    }
+
+    fn choose_brush(&mut self, slot: BrushSlot, brush: &Brush) {
+        self.brush = brush.clone();
+        self.tool = Tool::Brush;
+        self.brush_slot = Some(slot);
+    }
+
+    fn brush_slot_active(&self, slot: BrushSlot) -> bool {
+        slot_is_active(self.brush_slot, slot)
+    }
+
+    fn remove_custom_brush(&mut self, index: usize) -> Option<String> {
+        if index >= self.custom_brushes.len() {
+            return None;
+        }
+        let name = self.custom_brushes.remove(index).name;
+        self.brush_slot = slot_after_remove(self.brush_slot, index);
+        Some(name)
     }
 
     /// Unique display name for a new custom brush: "Foo", "Foo (2)", ...
@@ -6314,11 +6353,10 @@ impl eframe::App for ProCraftApp {
                 for (idx, (name, preset)) in builtin.into_iter().enumerate() {
                     // Name and thumbnail both apply the brush; the active
                     // brush reads highlighted.
-                    let active = self.brush == preset;
+                    let active = self.brush_slot_active(BrushSlot::Builtin(idx));
                     ui.horizontal(|ui| {
                         if ui.add_sized([64.0, 22.0], egui::Button::new(name).selected(active)).clicked() {
-                            self.brush = preset.clone();
-                            self.tool = Tool::Brush;
+                            self.choose_brush(BrushSlot::Builtin(idx), &preset);
                         }
                         egui::Frame::group(ui.style()).show(ui, |ui| {
                             if let Some(tex) = self.preset_textures.get(idx) {
@@ -6327,8 +6365,7 @@ impl eframe::App for ProCraftApp {
                                         .sense(Sense::click()),
                                 );
                                 if thumb.clicked() {
-                                    self.brush = preset.clone();
-                                    self.tool = Tool::Brush;
+                                    self.choose_brush(BrushSlot::Builtin(idx), &preset);
                                 }
                             }
                         });
@@ -6354,6 +6391,8 @@ impl eframe::App for ProCraftApp {
                             let name = self.unique_brush_name(&want);
                             let brush = Brush { eraser: false, ..self.brush.clone() };
                             self.custom_brushes.push(BrushPreset { name: name.clone(), brush });
+                            self.brush_slot =
+                                Some(BrushSlot::Custom(self.custom_brushes.len() - 1));
                             self.new_brush_name.clear();
                             self.status = format!("Brush '{name}' added.");
                         }
@@ -6443,11 +6482,10 @@ impl eframe::App for ProCraftApp {
                                 let p = &self.custom_brushes[idx];
                                 (p.name.clone(), p.brush.clone())
                             };
-                            let active = self.brush == brush;
+                            let active = self.brush_slot_active(BrushSlot::Custom(idx));
                             ui.horizontal(|ui| {
                                 if ui.add_sized([64.0, 22.0], egui::Button::new(&name).selected(active)).clicked() {
-                                    self.brush = brush.clone();
-                                    self.tool = Tool::Brush;
+                                    self.choose_brush(BrushSlot::Custom(idx), &brush);
                                 }
                                 egui::Frame::group(ui.style()).show(ui, |ui| {
                                     if let Some(tex) = self.preset_textures.get(base + idx) {
@@ -6456,8 +6494,7 @@ impl eframe::App for ProCraftApp {
                                                 .sense(Sense::click()),
                                         );
                                         if thumb.clicked() {
-                                            self.brush = brush.clone();
-                                            self.tool = Tool::Brush;
+                                            self.choose_brush(BrushSlot::Custom(idx), &brush);
                                         }
                                     }
                                 });
@@ -6469,9 +6506,9 @@ impl eframe::App for ProCraftApp {
                         }
                     });
                     if let Some(idx) = remove {
-                        let name = self.custom_brushes[idx].name.clone();
-                        self.custom_brushes.remove(idx);
-                        self.status = format!("Brush '{name}' removed.");
+                        if let Some(name) = self.remove_custom_brush(idx) {
+                            self.status = format!("Brush '{name}' removed.");
+                        }
                     }
                 }
             });
@@ -10371,6 +10408,19 @@ mod tests {
         }
         // Length alone distinguishes.
         assert_ne!(pixels_hash(&a), pixels_hash(&a[..2048]));
+    }
+
+    #[test]
+    fn brush_slot_selection_distinguishes_equal_brushes_and_reindexes() {
+        let selected = Some(BrushSlot::Custom(1));
+        assert!(slot_is_active(selected, BrushSlot::Custom(1)));
+        assert!(!slot_is_active(selected, BrushSlot::Custom(0)));
+        assert_eq!(slot_after_remove(selected, 0), Some(BrushSlot::Custom(0)));
+        assert_eq!(slot_after_remove(selected, 1), None);
+        assert_eq!(
+            slot_after_remove(Some(BrushSlot::Builtin(2)), 0),
+            Some(BrushSlot::Builtin(2))
+        );
     }
 
     #[test]

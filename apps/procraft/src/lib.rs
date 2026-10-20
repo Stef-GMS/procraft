@@ -39,11 +39,11 @@ fn pending_open_exts(kind: PendingOpen) -> &'static [&'static str] {
         PendingOpen::Psd => &["psd"],
         PendingOpen::Font => &["ttf", "otf"],
         PendingOpen::Brushes => &[
-            "pcbrush", "json", "abr", "brush", "brushset", "kpp", "bundle", "gbr", "png", "jpg",
-            "jpeg", "webp", "bmp",
+            "pcbrush", "json", "abr", "brush", "brushset", "kpp", "bundle", "sut", "gbr", "png",
+            "jpg", "jpeg", "webp", "bmp",
         ],
         PendingOpen::Palette => &["pcpalette", "json", "gpl"],
-        PendingOpen::DualTip => &["pcbrush", "json", "abr", "brushset"],
+        PendingOpen::DualTip => &["pcbrush", "json", "abr", "brushset", "sut"],
         PendingOpen::Gif => &["gif"],
     }
 }
@@ -6083,7 +6083,8 @@ impl eframe::App for ProCraftApp {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Brushes", &[
                                 "pcbrush", "json", "abr", "brush", "brushset",
-                                "kpp", "bundle", "gbr", "png", "jpg", "jpeg", "webp", "bmp",
+                                "kpp", "bundle", "sut", "gbr", "png", "jpg", "jpeg", "webp",
+                                "bmp",
                             ])
                             .pick_file()
                         {
@@ -6097,7 +6098,8 @@ impl eframe::App for ProCraftApp {
                             let _ = rfd::FileDialog::new()
                                 .add_filter("Brushes", &[
                                     "pcbrush", "json", "abr", "brush", "brushset",
-                                    "kpp", "bundle", "gbr", "png", "jpg", "jpeg", "webp", "bmp",
+                                    "kpp", "bundle", "sut", "gbr", "png", "jpg", "jpeg",
+                                    "webp", "bmp",
                                 ])
                                 .pick_file();
                             self.pending_open = Some(PendingOpen::Brushes);
@@ -6466,7 +6468,7 @@ impl eframe::App for ProCraftApp {
                     if ui.button("Import…").clicked() {
                         #[cfg(not(target_os = "ios"))]
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Brushes", &["pcbrush", "json", "abr", "brushset"])
+                                .add_filter("Brushes", &["pcbrush", "json", "abr", "brushset", "sut"])
                             .pick_file()
                         {
                             self.status = self.absorb_dual_tip(&path);
@@ -6474,7 +6476,7 @@ impl eframe::App for ProCraftApp {
                         #[cfg(target_os = "ios")]
                         {
                             let _ = rfd::FileDialog::new()
-                                .add_filter("Brushes", &["pcbrush", "json", "abr", "brushset"])
+                            .add_filter("Brushes", &["pcbrush", "json", "abr", "brushset", "sut"])
                                 .pick_file();
                             self.pending_open = Some(PendingOpen::DualTip);
                             self.status = "Pick a dual tip…".to_string();

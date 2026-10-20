@@ -1,11 +1,14 @@
 //! Third-party brush import: Photoshop `.abr`, Procreate `.brush`/`.brushset`,
-//! Krita `.kpp`/`.bundle`, GIMP `.gbr` and plain tip images. All parsers are
+//! Clip Studio Paint `.sut`, Krita `.kpp`/`.bundle`, GIMP `.gbr` and plain tip
+//! images. All parsers are
 //! original code written from public format notes; anything unexpected is a
 //! clean error, never silent garbage. Every format degrades to the same two
 //! things ProCraft understands: parametric settings and a grayscale stamp tip.
 
 use super::brush::{Brush, BrushTip, MAX_LIBRARY_BRUSHES, MAX_TIP_SIDE};
 use crate::brush::open_brush_library;
+
+mod csp;
 
 /// One imported brush: display name plus ready-to-paint settings.
 #[derive(Clone, Debug)]
@@ -128,7 +131,7 @@ fn cap_list(mut list: Vec<ImportedBrush>) -> Result<Vec<ImportedBrush>, String> 
 
 /// Import brushes from any supported file, picked by extension:
 /// `.pcbrush`/`.json`, `.abr`, `.brush`/`.brushset`, `.kpp`/`.bundle`,
-/// `.gbr`, or tip images (png/jpg/webp/bmp/gif/tiff).
+/// `.sut`, `.gbr`, or tip images (png/jpg/webp/bmp/gif/tiff).
 pub fn import_brush_file(path: &std::path::Path) -> Result<Vec<ImportedBrush>, String> {
     let bytes = read_capped(path)?;
     if bytes.is_empty() {
@@ -156,6 +159,7 @@ pub fn import_brush_file(path: &std::path::Path) -> Result<Vec<ImportedBrush>, S
         "brush" | "brushset" => import_procreate(&bytes, &stem),
         "kpp" => import_kpp(path, &bytes, &stem),
         "bundle" => import_krita_bundle(&bytes),
+        "sut" => csp::import_sut(&bytes, &stem),
         "gbr" => import_gbr(&bytes, &stem),
         "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "tif" | "tiff" => {
             import_image_tip(&bytes, &stem)

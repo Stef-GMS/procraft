@@ -175,6 +175,78 @@ fn tool_label(tool: Tool, symbols: bool) -> &'static str {
     }
 }
 
+/// One control in the context-sensitive bar under the top bar. The bar is
+/// driven by this list so every tool's quick options live in one place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum QuickControl {
+    Size,
+    Opacity,
+    Softness,
+    Spacing,
+    Stabilizer,
+    Strength,
+    Tolerance,
+    Grow,
+    PickerPx,
+    Feather,
+    SelGrow,
+    OpaqueThreshold,
+    OutlinePx,
+    Invert,
+    ClearSelection,
+    SmoothSelection,
+    ShapeKind,
+    ShapeFill,
+    ShapeSides,
+    CropApply,
+    CropCancel,
+    TextSize,
+    TextLeading,
+    TextTracking,
+    TextOutline,
+    EditText,
+}
+
+fn quick_controls(tool: Tool) -> &'static [QuickControl] {
+    use QuickControl::*;
+    match tool {
+        Tool::Brush | Tool::Eraser => &[Size, Opacity, Softness, Spacing, Stabilizer],
+        Tool::Smudge => &[Size, Strength],
+        Tool::Select | Tool::Lasso => &[
+            Feather,
+            SelGrow,
+            OpaqueThreshold,
+            OutlinePx,
+            Invert,
+            ClearSelection,
+            SmoothSelection,
+        ],
+        Tool::Fill => &[Tolerance, Grow],
+        Tool::Picker => &[PickerPx],
+        Tool::Liquify => &[Size, Strength],
+        Tool::Shapes => &[ShapeKind, ShapeFill, ShapeSides],
+        Tool::Crop => &[CropApply, CropCancel],
+        Tool::Text => &[TextSize, TextLeading, TextTracking, TextOutline, EditText],
+        Tool::Move | Tool::Hand => &[],
+    }
+}
+
+/// Finger-sized hit height for the quick bar; desktop keeps the compact
+/// 20 px controls.
+fn quick_hit_height(layout: BarLayout) -> f32 {
+    match layout {
+        BarLayout::Wide => 20.0,
+        BarLayout::Narrow => 34.0,
+        BarLayout::Tablet => 40.0,
+    }
+}
+
+/// Phones and tablets get one horizontally scrollable row (vertical space
+/// is canvas); desktop wraps inline.
+fn quick_scrolls(layout: BarLayout) -> bool {
+    layout != BarLayout::Wide
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ShapeKind {
     Line,
@@ -2031,6 +2103,299 @@ impl ProCraftApp {
             });
     }
 
+    fn tool_options_bar(&mut self, ui: &mut egui::Ui, layout: BarLayout) {
+        let hit = quick_hit_height(layout);
+        if layout != BarLayout::Wide {
+            ui.spacing_mut().interact_size.y = hit;
+        }
+        if quick_scrolls(layout) {
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                ui.horizontal(|ui| self.quick_controls_ui(ui, hit));
+            });
+        } else {
+            ui.horizontal_wrapped(|ui| self.quick_controls_ui(ui, hit));
+        }
+    }
+
+    fn quick_controls_ui(&mut self, ui: &mut egui::Ui, hit: f32) {
+        ui.strong(tool_label(self.tool, self.has_symbols));
+        ui.separator();
+        if quick_controls(self.tool).is_empty() {
+            let hint = match self.tool {
+                Tool::Hand => "Drag to pan · pinch to zoom",
+                Tool::Move => "Drag to move layer content",
+                _ => "",
+            };
+            ui.label(hint);
+            return;
+        }
+        for control in quick_controls(self.tool) {
+            self.quick_control_ui(ui, *control, hit);
+        }
+    }
+
+    fn quick_control_ui(&mut self, ui: &mut egui::Ui, control: QuickControl, hit: f32) {
+        let has_selection = self.doc.selection.is_some() || self.doc.selection_mask.is_some();
+        match control {
+            QuickControl::Size => {
+                if self.tool == Tool::Liquify {
+                    quick_slider(ui, &mut self.liquify_size, 8.0..=512.0, 1.0, "Size", hit);
+                } else {
+                    quick_slider(ui, &mut self.brush.size, 1.0..=200.0, 1.0, "Size", hit);
+                }
+            }
+            QuickControl::Opacity => quick_slider(
+                ui,
+                &mut self.brush.opacity,
+                0.05..=1.0,
+                0.05,
+                "Opacity",
+                hit,
+            ),
+            QuickControl::Softness => quick_slider(
+                ui,
+                &mut self.brush.softness,
+                0.0..=1.0,
+                0.05,
+                "Softness",
+                hit,
+            ),
+            QuickControl::Spacing => quick_slider(
+                ui,
+                &mut self.brush.spacing,
+                0.05..=1.0,
+                0.05,
+                "Spacing",
+                hit,
+            ),
+            QuickControl::Stabilizer => quick_slider(
+                ui,
+                &mut self.brush.stabilizer,
+                0.0..=1.0,
+                0.05,
+                "Stabilizer",
+                hit,
+            ),
+            QuickControl::Strength => {
+                if self.tool == Tool::Smudge {
+                    quick_slider(
+                        ui,
+                        &mut self.smudge_strength,
+                        0.0..=1.0,
+                        0.05,
+                        "Strength",
+                        hit,
+                    );
+                } else {
+                    quick_slider(
+                        ui,
+                        &mut self.liquify_strength,
+                        0.05..=1.0,
+                        0.05,
+                        "Strength",
+                        hit,
+                    );
+                }
+            }
+            QuickControl::Tolerance => {
+                let before = self.fill_tolerance;
+                quick_slider(ui, &mut self.fill_tolerance, 0..=255, 1.0, "Tolerance", hit);
+                if self.fill_tolerance != before && self.fill_preview.is_some() {
+                    self.reapply_live_fill();
+                }
+            }
+            QuickControl::Grow => {
+                let before = self.fill_grow;
+                quick_slider(ui, &mut self.fill_grow, 0..=16, 1.0, "Grow", hit);
+                if self.fill_grow != before && self.fill_preview.is_some() {
+                    self.reapply_live_fill();
+                }
+            }
+            QuickControl::PickerPx => {
+                quick_slider(ui, &mut self.picker_size, 140.0..=420.0, 5.0, "Picker", hit)
+            }
+            QuickControl::Feather => {
+                quick_slider(ui, &mut self.sel_feather, 0..=32, 1.0, "Feather", hit);
+                if ui
+                    .add_enabled(has_selection, egui::Button::new("Apply"))
+                    .clicked()
+                {
+                    if self.doc.feather_selection(self.sel_feather) {
+                        self.status =
+                            format!("Feathered ({} px).", self.doc.selection_pixel_count());
+                    } else {
+                        self.status = "No selection to feather.".to_string();
+                    }
+                    self.sel_edges_dirty = true;
+                }
+            }
+            QuickControl::SelGrow => {
+                quick_slider(ui, &mut self.sel_grow, -32..=32, 1.0, "Grow", hit);
+                if ui
+                    .add_enabled(has_selection, egui::Button::new("Apply"))
+                    .clicked()
+                {
+                    if self.doc.grow_selection(self.sel_grow) {
+                        self.status = format!("Grown ({} px).", self.doc.selection_pixel_count());
+                    } else {
+                        self.status = "No selection to grow.".to_string();
+                    }
+                    self.sel_edges_dirty = true;
+                }
+            }
+            QuickControl::OpaqueThreshold => {
+                quick_slider(ui, &mut self.sel_opaque_t, 0..=255, 1.0, "Opaque >", hit);
+                if ui
+                    .add_enabled(has_selection, egui::Button::new("Select"))
+                    .clicked()
+                {
+                    if self.doc.select_opaque(self.sel_opaque_t) {
+                        self.status =
+                            format!("Opaque selected ({} px).", self.doc.selection_pixel_count());
+                    } else {
+                        self.status = "Layer is empty.".to_string();
+                    }
+                    self.sel_edges_dirty = true;
+                }
+            }
+            QuickControl::OutlinePx => {
+                quick_slider(ui, &mut self.sel_stroke_w, 1..=16, 1.0, "Outline", hit);
+                if ui
+                    .add_enabled(
+                        has_selection && !self.text_paint_blocked(),
+                        egui::Button::new("Paint"),
+                    )
+                    .clicked()
+                {
+                    self.doc.checkpoint();
+                    let brush = self.base_brush();
+                    let color = self.current_color();
+                    if self.doc.stroke_selection(&brush, color, self.sel_stroke_w) {
+                        self.status = "Outlined.".to_string();
+                    } else {
+                        self.status = "No selection to outline.".to_string();
+                    }
+                }
+            }
+            QuickControl::Invert => {
+                if ui
+                    .add_enabled(has_selection, egui::Button::new("Invert"))
+                    .clicked()
+                {
+                    if self.doc.invert_selection() {
+                        self.status =
+                            format!("Inverted ({} px).", self.doc.selection_pixel_count());
+                    } else {
+                        self.status = "No selection to invert.".to_string();
+                    }
+                    self.sel_edges_dirty = true;
+                }
+            }
+            QuickControl::ClearSelection => {
+                if ui
+                    .add_enabled(has_selection, egui::Button::new("Clear"))
+                    .clicked()
+                {
+                    self.doc.clear_selection();
+                    self.lasso_poly.clear();
+                    self.sel_edges_dirty = true;
+                    self.status = "Selection cleared.".to_string();
+                }
+            }
+            QuickControl::SmoothSelection => {
+                if ui
+                    .add_enabled(has_selection, egui::Button::new("Smooth"))
+                    .clicked()
+                {
+                    if self.doc.smooth_selection() {
+                        self.status =
+                            format!("Smoothed ({} px).", self.doc.selection_pixel_count());
+                    } else {
+                        self.status = "No selection to smooth.".to_string();
+                    }
+                    self.sel_edges_dirty = true;
+                }
+            }
+            QuickControl::ShapeKind => {
+                egui::ComboBox::from_id_salt("quick_shape")
+                    .selected_text(self.shape_kind.name())
+                    .show_ui(ui, |ui| {
+                        if hit > 20.0 {
+                            ui.spacing_mut().interact_size.y = hit;
+                        }
+                        for kind in ShapeKind::ALL {
+                            ui.selectable_value(&mut self.shape_kind, kind, kind.name());
+                        }
+                    });
+            }
+            QuickControl::ShapeFill => {
+                if self.shape_kind.fillable() {
+                    ui.checkbox(&mut self.shape_fill, "Fill");
+                }
+            }
+            QuickControl::ShapeSides => {
+                if self.shape_kind == ShapeKind::Polygon {
+                    quick_slider(ui, &mut self.shape_sides, 3..=12, 1.0, "Sides", hit);
+                }
+            }
+            QuickControl::CropApply => match self.crop_rect {
+                Some((x0, y0, x1, y1)) => {
+                    if ui.button("Apply crop").clicked() {
+                        match self.doc.crop(x0, y0, x1, y1) {
+                            Ok(()) => {
+                                let (w, h) = (self.doc.w, self.doc.h);
+                                self.after_canvas_change();
+                                self.status = format!("Cropped to {w}x{h} (history cleared).");
+                            }
+                            Err(e) => self.status = format!("Crop failed: {e}"),
+                        }
+                    }
+                }
+                None => {
+                    ui.label("Drag a rect on the canvas.");
+                }
+            },
+            QuickControl::CropCancel => {
+                if self.crop_rect.is_some() && ui.button("Cancel crop").clicked() {
+                    self.crop_rect = None;
+                    self.status = "Crop cancelled.".to_string();
+                }
+            }
+            QuickControl::TextSize => quick_slider(
+                ui,
+                &mut self.text_size,
+                MIN_TEXT_PX..=128.0,
+                1.0,
+                "Size px",
+                hit,
+            ),
+            QuickControl::TextLeading => quick_slider(
+                ui,
+                &mut self.text_leading,
+                -MAX_TEXT_SPACING..=MAX_TEXT_SPACING,
+                1.0,
+                "Leading",
+                hit,
+            ),
+            QuickControl::TextTracking => quick_slider(
+                ui,
+                &mut self.text_tracking,
+                -MAX_TEXT_SPACING..=MAX_TEXT_SPACING,
+                1.0,
+                "Tracking",
+                hit,
+            ),
+            QuickControl::TextOutline => {
+                ui.checkbox(&mut self.text_outline, "Outline");
+            }
+            QuickControl::EditText => {
+                if ui.button("Edit text").clicked() {
+                    self.text_open = true;
+                }
+            }
+        }
+    }
+
     /// Unique display name for a new custom brush: "Foo", "Foo (2)", ...
     fn unique_brush_name(&self, want: &str) -> String {
         let want = want.trim();
@@ -2631,6 +2996,40 @@ fn stepped_slider_inner<Num: egui::emath::Numeric>(
             if label_end {
                 ui.label(text);
             }
+        }
+    });
+}
+
+/// Horizontal-bar slider: "Name value [-][bar][+]" in one run, sized for
+/// the quick bar (`hit` is the touch height map from `quick_hit_height`).
+fn quick_slider<Num: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+    step: f64,
+    text: &str,
+    hit: f32,
+) {
+    let lo = range.start().to_f64();
+    let hi = range.end().to_f64();
+    let v = value.to_f64();
+    let num = if v.fract() == 0.0 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.2}")
+    };
+    let slider_w = if hit > 20.0 { 96.0 } else { 84.0 };
+    let btn_w = if hit > 20.0 { hit } else { 24.0 };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        ui.spacing_mut().slider_width = slider_w;
+        ui.label(format!("{text} {num}"));
+        if ui.add_sized([btn_w, hit], egui::Button::new("−")).clicked() {
+            *value = Num::from_f64((value.to_f64() - step).clamp(lo, hi));
+        }
+        ui.add(egui::Slider::new(value, range).show_value(false));
+        if ui.add_sized([btn_w, hit], egui::Button::new("+")).clicked() {
+            *value = Num::from_f64((value.to_f64() + step).clamp(lo, hi));
         }
     });
 }
@@ -4226,6 +4625,14 @@ impl eframe::App for ProCraftApp {
                     self.view_controls(ui, false, true);
                 }
             });
+        });
+
+        let tool_layout = bar_layout(
+            ui.ctx().viewport_rect().width(),
+            cfg!(any(target_os = "ios", target_os = "android")),
+        );
+        egui::Panel::top("tool-options").show(ui, |ui| {
+            self.tool_options_bar(ui, tool_layout);
         });
 
         // M33 Gallery: file browser (New / Open / Recent / Duplicate).
@@ -8967,6 +9374,81 @@ mod tests {
         assert_eq!(bar_layout(844.0, true), BarLayout::Tablet);
         assert_eq!(bar_layout(600.0, false), BarLayout::Wide);
         assert_eq!(bar_layout(1280.0, false), BarLayout::Wide);
+    }
+
+    #[test]
+    fn quick_bar_covers_the_active_tools_controls() {
+        assert_eq!(
+            quick_controls(Tool::Brush),
+            &[
+                QuickControl::Size,
+                QuickControl::Opacity,
+                QuickControl::Softness,
+                QuickControl::Spacing,
+                QuickControl::Stabilizer,
+            ]
+        );
+        assert_eq!(quick_controls(Tool::Eraser), quick_controls(Tool::Brush));
+        assert_eq!(
+            quick_controls(Tool::Smudge),
+            &[QuickControl::Size, QuickControl::Strength]
+        );
+        assert_eq!(
+            quick_controls(Tool::Fill),
+            &[QuickControl::Tolerance, QuickControl::Grow]
+        );
+        assert_eq!(quick_controls(Tool::Picker), &[QuickControl::PickerPx]);
+        assert_eq!(
+            quick_controls(Tool::Liquify),
+            &[QuickControl::Size, QuickControl::Strength]
+        );
+        assert_eq!(
+            quick_controls(Tool::Select),
+            &[
+                QuickControl::Feather,
+                QuickControl::SelGrow,
+                QuickControl::OpaqueThreshold,
+                QuickControl::OutlinePx,
+                QuickControl::Invert,
+                QuickControl::ClearSelection,
+                QuickControl::SmoothSelection,
+            ]
+        );
+        assert_eq!(quick_controls(Tool::Lasso), quick_controls(Tool::Select));
+        assert_eq!(
+            quick_controls(Tool::Shapes),
+            &[
+                QuickControl::ShapeKind,
+                QuickControl::ShapeFill,
+                QuickControl::ShapeSides,
+            ]
+        );
+        assert_eq!(
+            quick_controls(Tool::Text),
+            &[
+                QuickControl::TextSize,
+                QuickControl::TextLeading,
+                QuickControl::TextTracking,
+                QuickControl::TextOutline,
+                QuickControl::EditText,
+            ]
+        );
+        assert_eq!(
+            quick_controls(Tool::Crop),
+            &[QuickControl::CropApply, QuickControl::CropCancel]
+        );
+        assert!(quick_controls(Tool::Move).is_empty());
+        assert!(quick_controls(Tool::Hand).is_empty());
+    }
+
+    #[test]
+    fn quick_bar_touch_geometry_is_finger_sized() {
+        assert_eq!(quick_hit_height(BarLayout::Wide), 20.0);
+        assert_eq!(quick_hit_height(BarLayout::Narrow), 34.0);
+        assert_eq!(quick_hit_height(BarLayout::Tablet), 40.0);
+        assert!(quick_scrolls(BarLayout::Narrow));
+        assert!(quick_scrolls(BarLayout::Tablet));
+        assert!(!quick_scrolls(BarLayout::Wide));
     }
 
     #[test]

@@ -1233,6 +1233,20 @@ impl Document {
     /// midpoint would drift a pixel per turn). None when nothing is
     /// painted.
     fn content_center(pixels: &[u8], w: u32, h: u32) -> Option<(f32, f32)> {
+        let (x0, y0, x1, y1) = Self::pixel_bounds(pixels, w, h)?;
+        Some(((x0 + x1) * 0.5, (y0 + y1) * 0.5))
+    }
+
+    /// Inclusive opaque-pixel bbox (min x, min y, max x, max y) for a
+    /// layer, so on-canvas transforms can cover the drawing instead of
+    /// the whole canvas. None when the layer is empty.
+    pub fn content_bounds(&self, index: usize) -> Option<(f32, f32, f32, f32)> {
+        let (w, h) = (self.w, self.h);
+        let layer = self.layers.get(index)?;
+        Self::pixel_bounds(&layer.pixels, w, h)
+    }
+
+    fn pixel_bounds(pixels: &[u8], w: u32, h: u32) -> Option<(f32, f32, f32, f32)> {
         if w == 0 || h == 0 || pixels.len() != (w * h * 4) as usize {
             return None;
         }
@@ -1250,7 +1264,7 @@ impl Document {
         if x0 == u32::MAX {
             return None;
         }
-        Some(((x0 + x1) as f32 * 0.5, (y0 + y1) as f32 * 0.5))
+        Some((x0 as f32, y0 as f32, x1 as f32, y1 as f32))
     }
 
     /// Shared scale-then-rotate resampler over RGBA bytes about pivot
@@ -1407,6 +1421,100 @@ impl Document {
                 let o = ((y * w + x) * 4) as usize;
                 if sx >= 0.0 && sx < w as f32 && sy >= 0.0 && sy < h as f32 {
                     next[o..o + 4].copy_from_slice(&Self::sample_bilinear(src, w, h, sx, sy));
+                }
+            }
+        }
+        next
+    }
+
+    /// Pin warp for a triangle mesh: `src` and `dst` hold matching pin
+    /// positions (row-major by index) and `tris` indexes them. Every
+    /// destination pixel falling in a `dst` triangle samples the affine
+    /// blend of the same triangle's `src` positions, so content follows
+    /// a pin exactly and untouched pins hold their pixels in place
+    /// (identity pins are an exact no-op). Pins plus a fixed outer ring
+    /// cover the whole canvas, so vacated areas turn transparent like
+    /// the other remaps. Masks travel with their layer. Degenerate
+    /// (collapsed) triangles are skipped; an all-degenerate mesh leaves
+    /// the layer untouched. Caller checkpoints for undo first.
+    pub fn warp_layer_tris(
+        &mut self,
+        index: usize,
+        src: &[(f32, f32)],
+        dst: &[(f32, f32)],
+        tris: &[[u32; 3]],
+    ) {
+        if index >= self.layers.len() || src.len() != dst.len() || src.len() < 3 {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
+        if w < 2 || h < 2 {
+            return;
+        }
+        let n = src.len() as u32;
+        if tris.is_empty() || tris.iter().any(|t| t.iter().any(|&i| i >= n)) {
+            return;
+        }
+        if src == dst {
+            return;
+        }
+        let pixels = self.layers[index].pixels.clone();
+        self.layers[index].pixels = Self::tri_buffer(&pixels, w, h, src, dst, tris);
+        if let Some(m) = self.layers[index].mask.clone() {
+            let rgba: Vec<u8> = m.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
+            let out = Self::tri_buffer(&rgba, w, h, src, dst, tris);
+            self.layers[index].mask = Some(out.as_chunks::<4>().0.iter().map(|p| p[0]).collect());
+        }
+        self.mark_full_dirty();
+    }
+
+    /// Shared pin-warp resampler: rasterize each destination triangle,
+    /// map pixel centers through its barycentric weights onto the source
+    /// triangle and sample bilinearly. Inclusive edge tolerance (1e-3)
+    /// keeps shared edges from cracking; later triangles win overlaps.
+    fn tri_buffer(
+        src_px: &[u8],
+        w: u32,
+        h: u32,
+        src: &[(f32, f32)],
+        dst: &[(f32, f32)],
+        tris: &[[u32; 3]],
+    ) -> Vec<u8> {
+        let mut next = vec![0u8; (w * h * 4) as usize];
+        for t in tris {
+            let (i0, i1, i2) = (t[0] as usize, t[1] as usize, t[2] as usize);
+            let (ax, ay) = dst[i0];
+            let (bx, by) = dst[i1];
+            let (cx, cy) = dst[i2];
+            let area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+            if area.abs() < 1e-6 {
+                continue;
+            }
+            let (lo_x, hi_x) = (ax.min(bx).min(cx), ax.max(bx).max(cx));
+            let (lo_y, hi_y) = (ay.min(by).min(cy), ay.max(by).max(cy));
+            if hi_x < 0.0 || hi_y < 0.0 || lo_x > w as f32 - 1.0 || lo_y > h as f32 - 1.0 {
+                continue;
+            }
+            let x0 = lo_x.floor().max(0.0) as u32;
+            let y0 = lo_y.floor().max(0.0) as u32;
+            let x1 = (hi_x.ceil().min(w as f32 - 1.0)) as u32;
+            let y1 = (hi_y.ceil().min(h as f32 - 1.0)) as u32;
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let (px, py) = (x as f32, y as f32);
+                    let w0 = ((bx - px) * (cy - py) - (cx - px) * (by - py)) / area;
+                    let w1 = ((cx - px) * (ay - py) - (ax - px) * (cy - py)) / area;
+                    let w2 = 1.0 - w0 - w1;
+                    if w0 < -1e-3 || w1 < -1e-3 || w2 < -1e-3 {
+                        continue;
+                    }
+                    let sx = w0 * src[i0].0 + w1 * src[i1].0 + w2 * src[i2].0;
+                    let sy = w0 * src[i0].1 + w1 * src[i1].1 + w2 * src[i2].1;
+                    if sx >= 0.0 && sx < w as f32 && sy >= 0.0 && sy < h as f32 {
+                        let o = ((y * w + x) * 4) as usize;
+                        next[o..o + 4]
+                            .copy_from_slice(&Self::sample_bilinear(src_px, w, h, sx, sy));
+                    }
                 }
             }
         }
@@ -5012,6 +5120,95 @@ mod tests {
         doc.layers[0].pixels.copy_from_slice(&[255, 0, 0, 255]);
         doc.warp_layer(0, 1, 1, &[(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
         assert_eq!(&doc.layers[0].pixels, &[255, 0, 0, 255]);
+    }
+
+    fn tri_pins(w: f32, h: f32, center: (f32, f32)) -> Vec<(f32, f32)> {
+        vec![
+            (0.0, 0.0),
+            (w - 1.0, 0.0),
+            (w - 1.0, h - 1.0),
+            (0.0, h - 1.0),
+            center,
+        ]
+    }
+
+    const TRI_FAN: [[u32; 3]; 4] = [[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]];
+
+    #[test]
+    fn tri_identity_pins_are_noop() {
+        let mut doc = Document::new(8, 8);
+        for b in doc.layers[0].pixels.iter_mut() {
+            *b = 100;
+        }
+        let before = doc.layers[0].pixels.clone();
+        let src = tri_pins(8.0, 8.0, (4.0, 4.0));
+        doc.warp_layer_tris(0, &src, &src, &TRI_FAN);
+        assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
+    fn tri_pin_pull_moves_paint_and_mask() {
+        // Paint sits exactly under the center pin; drag the pin to (2,2).
+        // The destination point (2,2) is the moved pin itself, so it
+        // samples the paint's original spot and the mask travels with it.
+        let mut doc = Document::new(8, 8);
+        let o = ((4 * 8 + 4) * 4) as usize;
+        doc.layers[0].pixels[o..o + 4].copy_from_slice(&[255, 0, 0, 255]);
+        let mut m = vec![0u8; 64];
+        m[(4 * 8 + 4) as usize] = 255;
+        doc.layers[0].mask = Some(m);
+        let src = tri_pins(8.0, 8.0, (4.0, 4.0));
+        let dst = tri_pins(8.0, 8.0, (2.0, 2.0));
+        doc.warp_layer_tris(0, &src, &dst, &TRI_FAN);
+        let d = ((2 * 8 + 2) * 4) as usize;
+        assert_eq!(&doc.layers[0].pixels[d..d + 4], &[255, 0, 0, 255]);
+        assert_eq!(
+            doc.layers[0].mask.as_ref().unwrap()[(2 * 8 + 2) as usize],
+            255
+        );
+        assert_eq!(doc.layers[0].pixels[o + 3], 0);
+    }
+
+    #[test]
+    fn tri_corner_pins_stay_fixed_while_center_moves() {
+        // The canvas corners are pins too: content near an unmoved
+        // corner keeps sampling itself, so a center pull does not drag
+        // the whole layer.
+        let mut doc = Document::new(8, 8);
+        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        let src = tri_pins(8.0, 8.0, (4.0, 4.0));
+        let dst = tri_pins(8.0, 8.0, (2.0, 2.0));
+        doc.warp_layer_tris(0, &src, &dst, &TRI_FAN);
+        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn tri_bad_input_is_noop() {
+        let mut doc = Document::new(8, 8);
+        for b in doc.layers[0].pixels.iter_mut() {
+            *b = 100;
+        }
+        let before = doc.layers[0].pixels.clone();
+        let src = tri_pins(8.0, 8.0, (4.0, 4.0));
+        doc.warp_layer_tris(9, &src, &src, &TRI_FAN);
+        doc.warp_layer_tris(0, &src, &src[..3], &TRI_FAN);
+        doc.warp_layer_tris(0, &src, &src, &[[0, 1, 99]]);
+        doc.warp_layer_tris(0, &src, &src, &[]);
+        let mut flat = Document::new(1, 1);
+        flat.layers[0].pixels.copy_from_slice(&[255, 0, 0, 255]);
+        flat.warp_layer_tris(0, &src, &src, &TRI_FAN);
+        assert_eq!(doc.layers[0].pixels, before);
+        assert_eq!(&flat.layers[0].pixels, &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn content_bounds_covers_the_painted_pixels() {
+        let mut doc = Document::new(8, 8);
+        assert_eq!(doc.content_bounds(0), None);
+        doc.layers[0].pixels[((3 * 8 + 2) * 4 + 3) as usize] = 255;
+        doc.layers[0].pixels[((5 * 8 + 6) * 4 + 3) as usize] = 255;
+        assert_eq!(doc.content_bounds(0), Some((2.0, 3.0, 6.0, 5.0)));
+        assert_eq!(doc.content_bounds(9), None);
     }
 
     #[test]

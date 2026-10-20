@@ -1,5 +1,11 @@
 # ProCraft
 
+<p align="center">
+  <a href="assets/procraft-promo.mp4">
+    <img src="assets/procraft-readme-banner.gif" alt="ProCraft — Digital Painting & Animation Studio in Rust" width="100%" />
+  </a>
+</p>
+
 [![Discord](https://img.shields.io/badge/Discord-Join%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/eaxeQGzgtt)
 
 By [surfrpt1](https://github.com/surfrpt1).

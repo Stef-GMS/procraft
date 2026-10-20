@@ -74,7 +74,8 @@ Photos after a media scan.
 - [x] Typography (M38): TTF/OTF import, leading/tracking/outline; Brush depth (M39); Liquify-lite (M40); Time-lapse snapshots (M41); iPad layout polish (M42)
 - [x] Transform depth (M43/M44): corner-pin distort + warp mesh (masks travel); Stability hardening (M45): fuzz open, OOM guards; SAF picker (M46); Palm rejection + Pencil (M47)
 - [x] Touch workflow: Hand pan tool (margin-grab fix), Pencil + two-finger pan, shift+wheel horizontal pan, hidden scrollbars, tap undo/redo
-- [x] On-canvas transform handles (M48): corner-pin + 3x3 warp-mesh handles with live preview, release-apply, Reset / Esc cancel
+- [x] On-canvas transform handles (M48): distort, skew, perspective, free, and warp-mesh handles with live preview, release-apply, Reset / Esc cancel
+- [x] Puppet Warp (M48): active-pin ring, Alt/Delete-pin tool, Shift/marquee multi-select, group move, expandable mesh; deleting a pin restores its effect, and undo/layer changes re-arm instead of warping stale pixels
 - [x] Settings + keybinds (M49): cross-platform `settings.json` (seed-once from legacy ui.json, corrupt-file quarantine), Shortcuts editor with exact-chord dispatch (Ctrl+Shift+Z fixed), Shift+drag brush size
 - [x] Editable text layers (M50): Procreate-style re-editable text (tap to select / re-edit / move), Rasterize bakes to pixels, v11 project format (v1-v10 still open), paint-guard hint on text layers
 - [x] Tablet/phone top bar: folded view cluster, touch-sized View ▾ / File ▾ menus, drag-collapse panel sections, iOS safe-area refold, Android status-bar inset

@@ -3226,7 +3226,8 @@ fn xform_mode_status(mode: XformMode) -> &'static str {
         }
         XformMode::Mesh => "Mesh lattice armed — drag a lattice point to warp.",
         XformMode::Puppet => {
-            "Puppet warp armed — drag pins; click to add, right-click to remove."
+            "Puppet warp armed — click to add, Shift-click or box-select to select, \
+             drag pins to move, Alt/right-click to delete."
         }
     }
 }
@@ -3235,6 +3236,9 @@ fn xform_mode_status(mode: XformMode) -> &'static str {
 const XFORM_MESH_MIN: u32 = 1;
 const XFORM_MESH_MAX: u32 = 8;
 const XFORM_MESH_DEFAULT: u32 = 2;
+
+/// Maximum extra margin around a Puppet frame for thin-line warps.
+const XFORM_EXPAND_MAX: f32 = 128.0;
 
 /// Puppet warp pin budget (frame pins included).
 const XFORM_PIN_MAX: usize = 24;
@@ -3274,8 +3278,8 @@ fn xform_extra_anchors(pins: &[(f32, f32)], w: f32, h: f32) -> Vec<(f32, f32)> {
 /// Transform frame: the active layer's opaque bbox padded a little and
 /// clamped to the canvas, so handles wrap the drawing instead of the
 /// whole canvas (empty layers fall back to the full canvas).
-fn xform_bounds(doc: &Document, w: f32, h: f32) -> (f32, f32, f32, f32) {
-    let pad = 3.0;
+fn xform_bounds(doc: &Document, w: f32, h: f32, margin: f32) -> (f32, f32, f32, f32) {
+    let pad = margin;
     match doc.content_bounds(doc.active) {
         Some((x0, y0, x1, y1)) => (
             (x0 - pad).clamp(0.0, w - 1.0),
@@ -3567,11 +3571,21 @@ fn xform_preview(doc: &mut Document, x: &mut XformState) -> XformApply {
         return XformApply::NoOp;
     }
     let active = doc.active;
-    let stale = match x.base.as_ref() {
-        None => true,
+    // The pins only describe the pixels they were armed against. When
+    // undo, a filter, a resize or a layer switch changes those pixels
+    // behind the session's back, re-arm around the current content
+    // instead of warping the new pixels through stale pin geometry
+    // (which can map the whole layer off-canvas and look like lost paint).
+    let rearm = match x.base.as_ref() {
         Some(b) => b.layer != active || b.rev != doc.revision(),
+        None => x.session_rev != doc.revision() || x.session_layer != active,
     };
-    if stale {
+    if rearm {
+        let mode = x.mode;
+        x.arm(mode, doc);
+        return XformApply::NoOp;
+    }
+    if x.base.is_none() {
         let pins = if x.grab.is_some() {
             x.grab_from.clone()
         } else {
@@ -3668,8 +3682,47 @@ fn xform_preview(doc: &mut Document, x: &mut XformState) -> XformApply {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Grab {
     Pin(usize),
+    /// Move every currently selected Puppet pin together.
+    Selected,
     All,
     Rotate,
+}
+
+/// CSP-style "Click pin" tool property: clicking a Puppet pin either
+/// selects it or deletes it outright.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PinTool {
+    Select,
+    Delete,
+}
+
+impl PinTool {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Select => "Select pin",
+            Self::Delete => "Delete pin",
+        }
+    }
+}
+
+/// What a click on a pin does when it is already selected (or not).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PinSelect {
+    Replace,
+    Add,
+    Subtract,
+    Toggle,
+}
+
+impl PinSelect {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Replace => "Replace selection",
+            Self::Add => "Add to selection",
+            Self::Subtract => "Subtract from selection",
+            Self::Toggle => "Toggle selection",
+        }
+    }
 }
 
 /// Armed transform state. Pins drag on the canvas; every tick previews
@@ -3691,6 +3744,9 @@ struct XformState {
     bounds: Option<(f32, f32, f32, f32)>,
     /// Mesh lattice points (canvas edges + bounds-bounded interior).
     grid: Vec<(f32, f32)>,
+    /// Extra margin (canvas px) around the content bounds for thin
+    /// strokes that need more reference space, as in CSP's mesh expand.
+    expand: f32,
     /// Interior cell counts picked from the panel (1..=8 per axis).
     mesh_cols: u32,
     mesh_rows: u32,
@@ -3711,8 +3767,23 @@ struct XformState {
     /// Skew drag axis for the current gesture: `Some(true)` slides a row
     /// horizontally, `Some(false)` slides a column vertically.
     skew_lock: Option<bool>,
+    /// Most recently added/selected Puppet pin (the orange ring pin).
+    active_pin: Option<usize>,
+    /// Puppet pins selected for a group move. Indices match `pins`.
+    selected_pins: Vec<usize>,
+    /// CSP tool-property state for Puppet pin clicks.
+    pin_tool: PinTool,
+    pin_select: PinSelect,
+    /// Live marquee in canvas coordinates (start, current) while the
+    /// pointer drags from outside the mesh.
+    marquee: Option<((f32, f32), (f32, f32))>,
     /// Live-preview session base (captured lazily; see [`xform_preview`]).
     base: Option<XformBase>,
+    /// Document revision and active layer when the session was armed.
+    /// Used before the first base capture, when there is no base revision
+    /// to compare against, so undo/layer changes still discard stale pins.
+    session_rev: u64,
+    session_layer: usize,
     /// Whether the current gesture already pushed its undo checkpoint.
     checkpointed: bool,
 }
@@ -3726,6 +3797,7 @@ impl XformState {
             tris: Vec::new(),
             bounds: None,
             grid: Vec::new(),
+            expand: 0.0,
             mesh_cols: XFORM_MESH_DEFAULT,
             mesh_rows: XFORM_MESH_DEFAULT,
             grid_cols: 1,
@@ -3734,7 +3806,14 @@ impl XformState {
             grab_at: (0.0, 0.0),
             grab_from: Vec::new(),
             skew_lock: None,
+            active_pin: None,
+            selected_pins: Vec::new(),
+            pin_tool: PinTool::Select,
+            pin_select: PinSelect::Replace,
+            marquee: None,
             base: None,
+            session_rev: 0,
+            session_layer: 0,
             checkpointed: false,
         }
     }
@@ -3762,8 +3841,131 @@ impl XformState {
         }
     }
 
+    fn pin_selected(&self, i: usize) -> bool {
+        self.selected_pins.contains(&i)
+    }
+
+    fn toggle_pin_selection(&mut self, i: usize) {
+        if let Some(pos) = self.selected_pins.iter().position(|&s| s == i) {
+            self.selected_pins.remove(pos);
+        } else {
+            self.selected_pins.push(i);
+            self.selected_pins.sort_unstable();
+        }
+    }
+
+    /// Apply the panel's click-select rule. Returns whether the pin is
+    /// selected afterwards; an unselected pin must not begin a drag.
+    fn click_pin(&mut self, i: usize, shift: bool) -> bool {
+        if i >= self.pins.len() {
+            return false;
+        }
+        if shift {
+            self.toggle_pin_selection(i);
+        } else {
+            match self.pin_select {
+                PinSelect::Replace => {
+                    self.selected_pins.clear();
+                    self.selected_pins.push(i);
+                }
+                PinSelect::Add => {
+                    if !self.pin_selected(i) {
+                        self.selected_pins.push(i);
+                        self.selected_pins.sort_unstable();
+                    }
+                }
+                PinSelect::Subtract => {
+                    self.selected_pins.retain(|&s| s != i);
+                }
+                PinSelect::Toggle => self.toggle_pin_selection(i),
+            }
+        }
+        self.post_selection_active(i);
+        self.pin_selected(i)
+    }
+
+    /// Make an unselected pin part of the drag selection for the modes
+    /// where dragging implies selecting it. Toggle/Subtract wait for the
+    /// click so a drag never silently changes those selections.
+    fn prepare_pin_drag(&mut self, i: usize, shift: bool) {
+        if self.mode != XformMode::Puppet || i >= self.pins.len() {
+            return;
+        }
+        self.active_pin = Some(i);
+        // Shift-click decides on release; pre-selecting here would make
+        // the click toggle the pin straight back off.
+        if shift {
+            return;
+        }
+        if !self.pin_selected(i) && matches!(self.pin_select, PinSelect::Replace | PinSelect::Add) {
+            if self.pin_select == PinSelect::Replace {
+                self.selected_pins.clear();
+            }
+            self.selected_pins.push(i);
+            self.selected_pins.sort_unstable();
+        }
+    }
+
+    fn post_selection_active(&mut self, i: usize) {
+        if self.pin_selected(i) {
+            self.active_pin = Some(i);
+        } else {
+            self.active_pin = self.selected_pins.last().copied();
+        }
+    }
+
+    /// Finish a marquee: Shift adds to the current selection; otherwise
+    /// the panel's Select pins rule decides.
+    fn marquee_select(&mut self, shift: bool) {
+        let Some(((ax, ay), (bx, by))) = self.marquee.take() else {
+            return;
+        };
+        let (x0, x1) = (ax.min(bx), ax.max(bx));
+        let (y0, y1) = (ay.min(by), ay.max(by));
+        let hits: Vec<usize> = self
+            .pins
+            .iter()
+            .enumerate()
+            .filter(|(_, &(x, y))| x >= x0 && x <= x1 && y >= y0 && y <= y1)
+            .map(|(i, _)| i)
+            .collect();
+        if shift || self.pin_select == PinSelect::Add {
+            for i in hits {
+                if !self.pin_selected(i) {
+                    self.selected_pins.push(i);
+                }
+            }
+            self.selected_pins.sort_unstable();
+        } else {
+            match self.pin_select {
+                PinSelect::Subtract => self.selected_pins.retain(|i| !hits.contains(i)),
+                PinSelect::Toggle => {
+                    for i in hits {
+                        self.toggle_pin_selection(i);
+                    }
+                }
+                PinSelect::Replace | PinSelect::Add => self.selected_pins = hits,
+            }
+        }
+        self.active_pin = self.selected_pins.last().copied();
+    }
+
     fn begin_grab(&mut self, i: usize, at: (f32, f32)) {
         self.grab = Some(Grab::Pin(i));
+        self.grab_at = at;
+        self.grab_from = self.points().to_vec();
+        self.checkpointed = false;
+        self.skew_lock = None;
+        if self.mode == XformMode::Puppet {
+            self.active_pin = Some(i);
+        }
+    }
+
+    fn begin_selected(&mut self, at: (f32, f32)) {
+        if self.selected_pins.is_empty() {
+            return;
+        }
+        self.grab = Some(Grab::Selected);
         self.grab_at = at;
         self.grab_from = self.points().to_vec();
         self.checkpointed = false;
@@ -3804,15 +4006,25 @@ impl XformState {
                     }
                 }
             }
-            XformMode::Distort | XformMode::Puppet => {
-                if let Grab::Pin(i) = g {
+            XformMode::Distort | XformMode::Puppet => match g {
+                Grab::Pin(i) => {
                     if let (Some(from), Some(slot)) =
                         (self.grab_from.get(i).copied(), self.pins.get_mut(i))
                     {
                         *slot = (from.0 + dx, from.1 + dy);
                     }
                 }
-            }
+                Grab::Selected => {
+                    for &i in &self.selected_pins {
+                        if let (Some(from), Some(slot)) =
+                            (self.grab_from.get(i).copied(), self.pins.get_mut(i))
+                        {
+                            *slot = (from.0 + dx, from.1 + dy);
+                        }
+                    }
+                }
+                _ => {}
+            },
             XformMode::Free => match g {
                 Grab::Pin(i) => self.drag_scale(i, dx, dy),
                 Grab::All => {
@@ -3830,6 +4042,7 @@ impl XformState {
                         *p = (cx + px * cos - py * sin, cy + px * sin + py * cos);
                     }
                 }
+                Grab::Selected => {}
             },
             XformMode::Skew => self.drag_skew(dx, dy),
             XformMode::Perspective => self.drag_perspective(dx, dy),
@@ -3925,11 +4138,26 @@ impl XformState {
 
     fn rebuild_tris(&mut self, doc: &Document) {
         let (w, h) = (doc.w as f32, doc.h as f32);
-        self.mesh_anchors = xform_extra_anchors(&self.pins, w, h);
-        let mut all = self.pins.clone();
-        all.extend(self.mesh_anchors.iter().copied());
-        self.tris = xform_delaunay(&all);
-        self.base = None;
+        // A live session has one topology over its source pins; current
+        // pins are destinations for that same topology. Adding or
+        // removing a pin must keep the pristine base and recompute from
+        // source positions, otherwise the removed pin's warp is baked and
+        // can no longer snap back.
+        let source = match self.base.as_ref() {
+            Some(b) => b.pins.clone(),
+            None => self.pins.clone(),
+        };
+        let anchors = xform_extra_anchors(&source, w, h);
+        let mut all = source.clone();
+        all.extend(anchors.iter().copied());
+        let tris = xform_delaunay(&all);
+        self.mesh_anchors = anchors.clone();
+        self.tris = tris.clone();
+        if let Some(b) = self.base.as_mut() {
+            b.pins = source;
+            b.anchors = anchors;
+            b.tris = tris;
+        }
     }
 
     /// Switch modes: restore any in-flight grab into the mode that owns
@@ -3941,10 +4169,15 @@ impl XformState {
         self.cancel_grab();
         self.mode = mode;
         self.base = None;
+        self.session_rev = doc.revision();
+        self.session_layer = doc.active;
         self.checkpointed = false;
         self.skew_lock = None;
+        self.active_pin = None;
+        self.selected_pins.clear();
+        self.marquee = None;
         let (w, h) = (doc.w as f32, doc.h as f32);
-        let b = xform_bounds(doc, w, h);
+        let b = xform_bounds(doc, w, h, 3.0 + self.expand);
         self.bounds = Some(b);
         match mode {
             XformMode::Off => {}
@@ -3988,11 +4221,60 @@ impl XformState {
             return false;
         }
         self.pins.push(at);
+        // A live base needs the new pin's source position too, so
+        // deleting it later can rebuild the remaining warp without
+        // baking this pin's effect. It starts at its click point and
+        // therefore does not move pixels on add.
+        if let Some(b) = self.base.as_mut() {
+            b.pins.push(at);
+        }
         self.rebuild_tris(doc);
+        // The new pin becomes the active one, mirroring CSP: its orange
+        // ring marks the last pin the user placed.
+        self.active_pin = Some(self.pins.len() - 1);
+        self.selected_pins.clear();
+        self.selected_pins.push(self.pins.len() - 1);
         true
     }
 
-    fn remove_pin_near(&mut self, at: (f32, f32), radius: f32, doc: &Document) -> bool {
+    fn remove_pin(&mut self, i: usize, doc: &mut Document) -> bool {
+        if self.mode != XformMode::Puppet || self.pins.len() <= 3 || i >= self.pins.len() {
+            return false;
+        }
+        self.pins.remove(i);
+        if let Some(b) = self.base.as_mut() {
+            if i < b.pins.len() {
+                b.pins.remove(i);
+            }
+        }
+        let mut selected = std::mem::take(&mut self.selected_pins);
+        selected.retain(|&s| s != i);
+        for s in &mut selected {
+            if *s > i {
+                *s -= 1;
+            }
+        }
+        self.selected_pins = selected;
+        self.active_pin = match self.active_pin {
+            Some(a) if a == i => None,
+            Some(a) if a > i => Some(a - 1),
+            other => other,
+        };
+        if self.active_pin.is_none() {
+            self.active_pin = self.selected_pins.last().copied();
+        }
+        self.rebuild_tris(doc);
+        // The video's pin rule: deleting a pin removes its effect.
+        // Recompute the remaining pins from the pristine base right away
+        // instead of leaving the warp baked into the layer.
+        if self.base.is_some() {
+            self.checkpointed = false;
+            let _ = xform_preview(doc, self);
+        }
+        true
+    }
+
+    fn remove_pin_near(&mut self, at: (f32, f32), radius: f32, doc: &mut Document) -> bool {
         if self.mode != XformMode::Puppet || self.pins.len() <= 3 {
             return false;
         }
@@ -4006,14 +4288,14 @@ impl XformState {
         let Some((i, _)) = best else {
             return false;
         };
-        self.pins.remove(i);
-        self.rebuild_tris(doc);
-        true
+        self.remove_pin(i, doc)
     }
 
-    fn clear_pins(&mut self, doc: &Document) {
+    fn clear_pins(&mut self, doc: &mut Document) {
         if self.mode == XformMode::Puppet {
-            self.arm(XformMode::Puppet, doc);
+            // Clearing every pin removes every pin's effect: restore the
+            // pristine session base, then reseed the frame pins.
+            self.reset_transform(doc);
         }
     }
 
@@ -7395,11 +7677,81 @@ impl eframe::App for ProCraftApp {
                             }
                         }
                         if self.xform.mode == XformMode::Puppet {
+                            let mut expand = self.xform.expand;
+                            ui.add(
+                                egui::Slider::new(&mut expand, 0.0..=XFORM_EXPAND_MAX)
+                                    .text("Expand mesh")
+                                    .suffix(" px"),
+                            );
+                            if (expand - self.xform.expand).abs() > 0.01 {
+                                self.xform.expand = expand;
+                                self.xform.arm(XformMode::Puppet, &self.doc);
+                                self.status =
+                                    format!("Puppet mesh expanded by {expand:.0} px; pins reset.");
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                let mut pin_tool = self.xform.pin_tool;
+                                ui.label("Click pin:");
+                                egui::ComboBox::from_id_salt("pin_tool")
+                                    .width(112.0)
+                                    .selected_text(pin_tool.label())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut pin_tool,
+                                            PinTool::Select,
+                                            PinTool::Select.label(),
+                                        );
+                                        ui.selectable_value(
+                                            &mut pin_tool,
+                                            PinTool::Delete,
+                                            PinTool::Delete.label(),
+                                        );
+                                    });
+                                if pin_tool != self.xform.pin_tool {
+                                    self.xform.pin_tool = pin_tool;
+                                    self.status = format!("Puppet click: {}.", pin_tool.label());
+                                }
+                                if pin_tool == PinTool::Select {
+                                    let mut select = self.xform.pin_select;
+                                    ui.label("Select:");
+                                    egui::ComboBox::from_id_salt("pin_select")
+                                        .width(150.0)
+                                        .selected_text(select.label())
+                                        .show_ui(ui, |ui| {
+                                            for mode in [
+                                                PinSelect::Replace,
+                                                PinSelect::Add,
+                                                PinSelect::Subtract,
+                                                PinSelect::Toggle,
+                                            ] {
+                                                ui.selectable_value(
+                                                    &mut select,
+                                                    mode,
+                                                    mode.label(),
+                                                );
+                                            }
+                                        });
+                                    if select != self.xform.pin_select {
+                                        self.xform.pin_select = select;
+                                        self.status =
+                                            format!("Puppet selection: {}.", select.label());
+                                    }
+                                }
+                            });
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(format!("Pins: {}", self.xform.pins.len()));
-                                ui.label("Click to add a pin; right-click one to remove.");
+                                if !self.xform.selected_pins.is_empty() {
+                                    ui.label(format!(
+                                        "Selected: {}",
+                                        self.xform.selected_pins.len()
+                                    ));
+                                }
+                                ui.label(
+                                    "Click to add; Shift-click or drag a box to select; \
+                                     drag a selected pin to move the group.",
+                                );
                                 if ui.button("Clear pins").clicked() {
-                                    self.xform.clear_pins(&self.doc);
+                                    self.xform.clear_pins(&mut self.doc);
                                     self.status =
                                         "Puppet pins reset to the frame corners.".to_string();
                                 }
@@ -8231,6 +8583,8 @@ impl eframe::App for ProCraftApp {
                             continue;
                         }
                         let grabbed = self.xform.grabbed_pin() == Some(i);
+                        let selected = self.xform.pin_selected(i);
+                        let active = self.xform.active_pin == Some(i);
                         if *parked {
                             let r = 10.0;
                             let diamond = vec![
@@ -8239,15 +8593,38 @@ impl eframe::App for ProCraftApp {
                                 *p + egui::Vec2::new(0.0, r),
                                 *p + egui::Vec2::new(-r, 0.0),
                             ];
+                            let outline = if selected || active { accent } else { red };
                             ui.painter()
-                                .add(egui::Shape::closed_line(diamond, (3.0, red)));
+                                .add(egui::Shape::closed_line(diamond, (3.0, outline)));
                             ui.painter().circle_filled(*p, 2.0, Color32::WHITE);
+                            if active {
+                                ui.painter().circle_stroke(*p, 15.0, (2.0, accent));
+                            }
                         } else {
-                            let r = if grabbed { 11.0 } else { 9.0 };
-                            let fill = if grabbed { accent } else { red };
+                            let r = if grabbed {
+                                11.0
+                            } else if active {
+                                10.0
+                            } else {
+                                9.0
+                            };
+                            let fill = if grabbed || selected { accent } else { red };
                             ui.painter().circle_filled(*p, r, fill);
                             ui.painter().circle_stroke(*p, r, (2.0, Color32::WHITE));
+                            if active {
+                                ui.painter().circle_stroke(*p, r + 4.0, (2.0, accent));
+                            }
                         }
+                    }
+                    if let Some(((sx, sy), (ex, ey))) = self.xform.marquee {
+                        let mr = egui::Rect::from_two_pos(to_screen(sx, sy), to_screen(ex, ey));
+                        ui.painter().rect_filled(
+                            mr,
+                            0.0,
+                            Color32::from_rgba_unmultiplied(255, 210, 90, 24),
+                        );
+                        ui.painter()
+                            .rect_stroke(mr, 0.0, (1.0, accent), egui::StrokeKind::Middle);
                     }
                 }
                 // Onion skins over the current frame (assist only, not in
@@ -8333,7 +8710,9 @@ impl eframe::App for ProCraftApp {
 
                 // Eyedropper: Alt-click samples the composited canvas color
                 // into the brush on any tool (Alt held blocks painting).
-                if ctx.input(|i| i.modifiers.alt) {
+                // Puppet Warp reserves Alt-click for deleting a pin, as CSP
+                // does, so it bypasses the picker.
+                if ctx.input(|i| i.modifiers.alt) && self.xform.mode != XformMode::Puppet {
                     if resp.drag_started() || resp.clicked() {
                         if let Some(pos) = resp.interact_pointer_pos() {
                             let (x, y) = to_canvas(pos);
@@ -8440,7 +8819,7 @@ impl eframe::App for ProCraftApp {
                     {
                         if let Some(at) = ptr {
                             let r = 18.0 / z.max(0.05);
-                            if self.xform.remove_pin_near(at, r, &self.doc) {
+                            if self.xform.remove_pin_near(at, r, &mut self.doc) {
                                 self.status =
                                     format!("Puppet pin removed ({} left).", self.xform.pins.len());
                             }
@@ -8449,6 +8828,8 @@ impl eframe::App for ProCraftApp {
                     if resp.drag_started() && !gesture && !self.text_paint_blocked() {
                         if let Some(pos) = resp.hover_pos() {
                             let at = to_canvas(pos);
+                            let alt = ctx.input(|i| i.modifiers.alt);
+                            let shift = ctx.input(|i| i.modifiers.shift);
                             let mut best: Option<(usize, f32)> = None;
                             for (i, &(x, y)) in self.xform.points().iter().enumerate() {
                                 if self.xform.mode == XformMode::Mesh
@@ -8464,7 +8845,31 @@ impl eframe::App for ProCraftApp {
                                 }
                             }
                             if let Some((i, _)) = best.filter(|&(_, d)| d <= 28.0) {
-                                self.xform.begin_grab(i, at);
+                                if self.xform.mode == XformMode::Puppet {
+                                    if alt || self.xform.pin_tool == PinTool::Delete {
+                                        if self.xform.remove_pin(i, &mut self.doc) {
+                                            self.status = format!(
+                                                "Puppet pin removed ({} left).",
+                                                self.xform.pins.len()
+                                            );
+                                        }
+                                    } else {
+                                        self.xform.prepare_pin_drag(i, shift);
+                                        if self.xform.pin_selected(i)
+                                            && self.xform.selected_pins.len() > 1
+                                        {
+                                            self.xform.begin_selected(at);
+                                        } else {
+                                            self.xform.begin_grab(i, at);
+                                        }
+                                    }
+                                } else {
+                                    self.xform.begin_grab(i, at);
+                                }
+                            } else if self.xform.mode == XformMode::Puppet {
+                                if !alt && !self.xform.point_in_frame(at) {
+                                    self.xform.marquee = Some((at, at));
+                                }
                             } else if self.xform.mode == XformMode::Free {
                                 let mut grabbed = false;
                                 if let Some((hx, hy)) = self.xform.rotate_handle(z) {
@@ -8480,16 +8885,20 @@ impl eframe::App for ProCraftApp {
                                 }
                             }
                         }
-                    } else if resp.dragged() && self.xform.grab.is_some() {
+                    } else if resp.dragged() {
                         if let Some(pos) = resp.hover_pos() {
                             let (x, y) = to_canvas(pos);
-                            let (dx, dy) = (x - self.xform.grab_at.0, y - self.xform.grab_at.1);
-                            self.xform.drag_by(dx, dy);
-                            if !self.text_paint_blocked()
-                                && xform_preview(&mut self.doc, &mut self.xform)
-                                    == XformApply::Skipped
-                            {
-                                self.status = "Pins overlap — transform skipped.".to_string();
+                            if self.xform.grab.is_some() {
+                                let (dx, dy) = (x - self.xform.grab_at.0, y - self.xform.grab_at.1);
+                                self.xform.drag_by(dx, dy);
+                                if !self.text_paint_blocked()
+                                    && xform_preview(&mut self.doc, &mut self.xform)
+                                        == XformApply::Skipped
+                                {
+                                    self.status = "Pins overlap — transform skipped.".to_string();
+                                }
+                            } else if let Some((start, _)) = self.xform.marquee {
+                                self.xform.marquee = Some((start, (x, y)));
                             }
                         }
                     }
@@ -8514,19 +8923,67 @@ impl eframe::App for ProCraftApp {
                                 };
                             }
                         }
+                        if let Some(((sx, sy), (ex, ey))) = self.xform.marquee {
+                            let moved = ((ex - sx).powi(2) + (ey - sy).powi(2)).sqrt() * z;
+                            if moved > 4.0 {
+                                let shift = ctx.input(|i| i.modifiers.shift);
+                                self.xform.marquee_select(shift);
+                                self.status = format!(
+                                    "{} Puppet pin(s) selected.",
+                                    self.xform.selected_pins.len()
+                                );
+                            } else {
+                                self.xform.marquee = None;
+                            }
+                        }
                     }
                     if self.xform.mode == XformMode::Puppet
-                        && self.xform.grab.is_none()
                         && resp.clicked()
                         && !self.text_paint_blocked()
                     {
+                        // A press on a pin may have armed a grab already.
+                        // A click means no real drag: drop that gesture so
+                        // it cannot move pins on the next pointer tick.
+                        if self.xform.grab.is_some() {
+                            if self.xform.grab_from.as_slice() == self.xform.points() {
+                                self.xform.cancel_grab();
+                            } else {
+                                self.xform.grab = None;
+                                self.xform.grab_from.clear();
+                            }
+                        }
+                        self.xform.marquee = None;
                         if let Some(pos) = resp.interact_pointer_pos() {
-                            let on_pin = self.xform.pins.iter().any(|&(x, y)| {
+                            let alt = ctx.input(|i| i.modifiers.alt);
+                            let shift = ctx.input(|i| i.modifiers.shift);
+                            let mut hit: Option<(usize, f32)> = None;
+                            for (i, &(x, y)) in self.xform.pins.iter().enumerate() {
                                 let (p0, _) = vp_handle_pos(rect, z, x, y);
                                 let p = rot_pt(p0, cc, ang);
-                                (p.x - pos.x).hypot(p.y - pos.y) <= 20.0
-                            });
-                            if !on_pin && self.xform.add_pin(to_canvas(pos), &self.doc) {
+                                let d = (p.x - pos.x).hypot(p.y - pos.y);
+                                if hit.is_none_or(|(_, bd)| d < bd) {
+                                    hit = Some((i, d));
+                                }
+                            }
+                            if let Some((i, _)) = hit.filter(|&(_, d)| d <= 20.0) {
+                                if alt || self.xform.pin_tool == PinTool::Delete {
+                                    if self.xform.remove_pin(i, &mut self.doc) {
+                                        self.status = format!(
+                                            "Puppet pin removed ({} left).",
+                                            self.xform.pins.len()
+                                        );
+                                    }
+                                } else {
+                                    self.xform.click_pin(i, shift);
+                                    self.status = format!(
+                                        "{} Puppet pin(s) selected.",
+                                        self.xform.selected_pins.len()
+                                    );
+                                }
+                            } else if !alt
+                                && self.xform.pin_tool == PinTool::Select
+                                && self.xform.add_pin(to_canvas(pos), &self.doc)
+                            {
                                 self.status =
                                     format!("Puppet pin added ({}).", self.xform.pins.len());
                             }
@@ -10394,7 +10851,7 @@ mod tests {
 
     #[test]
     fn xform_puppet_adds_and_removes_pins() {
-        let doc = xform_test_doc16();
+        let mut doc = xform_test_doc16();
         let mut s = XformState::off();
         s.arm(XformMode::Puppet, &doc);
         assert_eq!(s.pins.len(), 4);
@@ -10406,13 +10863,136 @@ mod tests {
             .iter()
             .all(|t| t.iter().all(|&i| (i as usize) < s.pins.len() + 4)));
         assert!(s.base.is_none());
-        assert!(s.remove_pin_near((7.1, 7.2), 2.0, &doc));
+        assert!(s.remove_pin_near((7.1, 7.2), 2.0, &mut doc));
         assert_eq!(s.pins.len(), 4);
         assert!(!s.pins.contains(&(7.0, 7.0)));
         // The frame itself is never removed (a mesh needs its corners).
         s.pins.truncate(3);
-        assert!(!s.remove_pin_near((1.0, 1.0), 100.0, &doc));
+        assert!(!s.remove_pin_near((1.0, 1.0), 100.0, &mut doc));
         assert_eq!(s.pins.len(), 3);
+    }
+
+    #[test]
+    fn xform_expand_mesh_widens_the_puppet_frame() {
+        let doc = xform_test_doc16();
+        let mut s = XformState::off();
+        s.expand = 10.0;
+        s.arm(XformMode::Puppet, &doc);
+        assert_eq!(s.bounds, Some((0.0, 0.0, 15.0, 15.0)));
+        assert_eq!(
+            s.pins,
+            vec![(0.0, 0.0), (15.0, 0.0), (15.0, 15.0), (0.0, 15.0)]
+        );
+    }
+
+    #[test]
+    fn xform_pin_click_modes_build_the_selection() {
+        let doc = xform_test_doc16();
+        let mut s = XformState::off();
+        s.arm(XformMode::Puppet, &doc);
+        s.add_pin((7.0, 7.0), &doc);
+        s.add_pin((9.0, 9.0), &doc);
+        // Adding a pin makes it the sole active/selected pin.
+        assert_eq!(s.active_pin, Some(5));
+        assert_eq!(s.selected_pins, vec![5]);
+
+        assert!(s.click_pin(4, false));
+        assert_eq!(s.selected_pins, vec![4]);
+        assert_eq!(s.active_pin, Some(4));
+
+        // Shift adds/removes without discarding the rest.
+        s.click_pin(5, true);
+        assert_eq!(s.selected_pins, vec![4, 5]);
+        assert_eq!(s.active_pin, Some(5));
+        s.click_pin(4, true);
+        assert_eq!(s.selected_pins, vec![5]);
+
+        s.pin_select = PinSelect::Add;
+        s.click_pin(4, false);
+        assert_eq!(s.selected_pins, vec![4, 5]);
+        s.pin_select = PinSelect::Subtract;
+        s.click_pin(5, false);
+        assert_eq!(s.selected_pins, vec![4]);
+        s.pin_select = PinSelect::Toggle;
+        s.click_pin(4, false);
+        assert!(s.selected_pins.is_empty());
+        assert_eq!(s.active_pin, None);
+
+        // Shift-click waits for release: a press must not pre-select and
+        // then let the click toggle the pin straight back off.
+        s.pin_select = PinSelect::Replace;
+        s.selected_pins = vec![5];
+        s.prepare_pin_drag(4, true);
+        assert_eq!(s.selected_pins, vec![5]);
+        assert_eq!(s.active_pin, Some(4));
+    }
+
+    #[test]
+    fn xform_selected_pins_drag_as_a_group() {
+        let doc = xform_test_doc16();
+        let mut s = XformState::off();
+        s.arm(XformMode::Puppet, &doc);
+        s.add_pin((7.0, 7.0), &doc);
+        s.add_pin((9.0, 9.0), &doc);
+        let frame = s.pins[..4].to_vec();
+        s.pin_select = PinSelect::Add;
+        s.click_pin(4, false);
+        s.click_pin(5, false);
+        assert_eq!(s.selected_pins, vec![4, 5]);
+
+        s.prepare_pin_drag(4, false);
+        s.begin_selected((0.0, 0.0));
+        assert_eq!(s.grab, Some(Grab::Selected));
+        s.drag_by(2.0, -1.0);
+        assert_eq!(s.pins[4], (9.0, 6.0));
+        assert_eq!(s.pins[5], (11.0, 8.0));
+        assert_eq!(s.pins[..4], frame[..]);
+    }
+
+    #[test]
+    fn xform_marquee_selects_pins_inside_the_box() {
+        let doc = xform_test_doc16();
+        let mut s = XformState::off();
+        s.arm(XformMode::Puppet, &doc);
+        s.add_pin((6.0, 6.0), &doc);
+        s.add_pin((10.0, 10.0), &doc);
+
+        s.marquee = Some(((5.0, 5.0), (11.0, 11.0)));
+        s.marquee_select(false);
+        assert_eq!(s.selected_pins, vec![4, 5]);
+        assert_eq!(s.active_pin, Some(5));
+
+        // Shift extends an existing selection rather than replacing it.
+        s.marquee = Some(((5.0, 5.0), (7.0, 7.0)));
+        s.marquee_select(true);
+        assert_eq!(s.selected_pins, vec![4, 5]);
+
+        // A plain box replaces; Subtract removes the boxed pins.
+        s.pin_select = PinSelect::Subtract;
+        s.marquee = Some(((5.0, 5.0), (7.0, 7.0)));
+        s.marquee_select(false);
+        assert_eq!(s.selected_pins, vec![5]);
+        s.pin_select = PinSelect::Replace;
+        s.marquee = Some(((9.0, 9.0), (11.0, 11.0)));
+        s.marquee_select(false);
+        assert_eq!(s.selected_pins, vec![5]);
+    }
+
+    #[test]
+    fn xform_removing_a_pin_keeps_selection_indices_valid() {
+        let mut doc = xform_test_doc16();
+        let mut s = XformState::off();
+        s.arm(XformMode::Puppet, &doc);
+        s.add_pin((6.0, 6.0), &doc);
+        s.add_pin((8.0, 8.0), &doc);
+        s.add_pin((10.0, 10.0), &doc);
+        s.selected_pins = vec![4, 5, 6];
+        s.active_pin = Some(6);
+        assert!(s.remove_pin(5, &mut doc));
+        assert_eq!(s.pins.len(), 6);
+        assert_eq!(s.selected_pins, vec![4, 5]);
+        assert_eq!(s.active_pin, Some(5));
+        assert_eq!(s.pins[5], (10.0, 10.0));
     }
 
     // --- Live transform preview session: drag previews from a base ---
@@ -10463,6 +11043,18 @@ mod tests {
 
     fn xform_alpha(doc: &Document, x: usize, y: usize) -> u8 {
         doc.layers[0].pixels[(y * 8 + x) * 4 + 3]
+    }
+
+    fn xform_alpha16(doc: &Document, layer: usize, x: usize, y: usize) -> u8 {
+        doc.layers[layer].pixels[(y * 16 + x) * 4 + 3]
+    }
+
+    fn xform_opaque16(doc: &Document, layer: usize) -> usize {
+        doc.layers[layer]
+            .pixels
+            .chunks(4)
+            .filter(|p| p[3] != 0)
+            .count()
     }
 
     /// One gesture: grab pin 0, translate every pin by (dx, dy), preview,
@@ -10631,12 +11223,102 @@ mod tests {
         doc.layers[0].pixels[i + 1] = 200;
         doc.layers[0].pixels[i + 3] = 255;
         doc.mark_full_dirty();
+        // The first tick after an external edit re-arms instead of
+        // warping the edited pixels through pin geometry that no longer
+        // belongs to them, so the edit survives and nothing is erased.
+        assert_eq!(
+            xform_translate(&mut doc, &mut x, 0.5, 0.0),
+            XformApply::NoOp
+        );
+        assert!(doc.layers[0].pixels.chunks(4).any(|p| p[1] >= 20));
+        // The fresh session then warps coherently from the edited pixels.
         assert_eq!(
             xform_translate(&mut doc, &mut x, 0.5, 0.0),
             XformApply::Applied
         );
-        // The edit was baked into the re-captured base and survives.
         assert!(doc.layers[0].pixels.chunks(4).any(|p| p[1] >= 20));
+    }
+
+    #[test]
+    fn xform_undo_then_drag_keeps_paint() {
+        let mut doc = xform_test_doc_full();
+        let pristine = doc.layers[0].pixels.clone();
+        let mut x = XformState::off();
+        x.arm(XformMode::Distort, &doc);
+        // Fling the canvas away, then undo the gesture.
+        assert_eq!(
+            xform_translate(&mut doc, &mut x, 40.0, 0.0),
+            XformApply::Applied
+        );
+        assert_eq!(xform_alpha(&doc, 4, 3), 0);
+        assert!(doc.undo());
+        assert_eq!(doc.layers[0].pixels, pristine);
+        // The next drag must not map the restored pixels through the
+        // stale off-canvas pin geometry.
+        let r = xform_translate(&mut doc, &mut x, -40.0, 0.0);
+        assert!(matches!(r, XformApply::NoOp | XformApply::Restored));
+        assert_eq!(doc.layers[0].pixels, pristine);
+    }
+
+    #[test]
+    fn xform_layer_switch_rearms_instead_of_blanking() {
+        let mut doc = xform_test_doc16();
+        doc.add_layer("overlay".to_string());
+        for y in 4..8 {
+            for x in 0..4 {
+                let i = (y * 16 + x) * 4;
+                doc.layers[1].pixels[i + 1] = 255;
+                doc.layers[1].pixels[i + 3] = 255;
+            }
+        }
+        doc.active = 0;
+        let mut x = XformState::off();
+        x.arm(XformMode::Distort, &doc);
+        let before = xform_opaque16(&doc, 1);
+        assert_eq!(before, 16);
+        // A different layer becomes active while the handles stay armed.
+        doc.active = 1;
+        let r = xform_translate(&mut doc, &mut x, 1.0, 0.0);
+        assert_eq!(r, XformApply::NoOp);
+        assert_eq!(xform_opaque16(&doc, 1), before);
+        assert_eq!(xform_alpha16(&doc, 1, 0, 4), 255);
+    }
+
+    #[test]
+    fn xform_delete_pin_restores_its_effect() {
+        let mut doc = xform_test_doc16();
+        let pristine = doc.layers[0].pixels.clone();
+        let mut x = XformState::off();
+        x.arm(XformMode::Puppet, &doc);
+        assert!(x.add_pin((8.0, 8.0), &doc));
+        x.begin_grab(4, (8.0, 8.0));
+        x.pins[4] = (11.0, 8.0);
+        assert_eq!(xform_preview(&mut doc, &mut x), XformApply::Applied);
+        x.grab = None;
+        x.grab_from.clear();
+        assert_ne!(doc.layers[0].pixels, pristine);
+        // Deleting a pin removes its effect: the pristine base comes
+        // back for the remaining pins instead of baking the warp.
+        assert!(x.remove_pin_near((11.0, 8.0), 3.0, &mut doc));
+        assert_eq!(doc.layers[0].pixels, pristine);
+    }
+
+    #[test]
+    fn xform_clear_pins_restores_original() {
+        let mut doc = xform_test_doc16();
+        let pristine = doc.layers[0].pixels.clone();
+        let mut x = XformState::off();
+        x.arm(XformMode::Puppet, &doc);
+        assert!(x.add_pin((8.0, 8.0), &doc));
+        x.begin_grab(4, (8.0, 8.0));
+        x.pins[4] = (11.0, 8.0);
+        assert_eq!(xform_preview(&mut doc, &mut x), XformApply::Applied);
+        x.grab = None;
+        x.grab_from.clear();
+        assert_ne!(doc.layers[0].pixels, pristine);
+        x.clear_pins(&mut doc);
+        assert_eq!(doc.layers[0].pixels, pristine);
+        assert_eq!(x.pins.len(), 4);
     }
 
     // --- Midpoint-smoothed stroke path (chord corners -> curves) ---

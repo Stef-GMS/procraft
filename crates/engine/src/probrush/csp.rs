@@ -29,7 +29,7 @@ pub(super) fn import_sut(bytes: &[u8], stem: &str) -> Result<Vec<ImportedBrush>,
             node_variant = int_value(table, row, "NodeVariantID").unwrap_or(0);
         }
     }
-    let settings = variant
+    let (settings, pattern_key) = variant
         .as_ref()
         .and_then(|table| {
             let row = table
@@ -37,11 +37,11 @@ pub(super) fn import_sut(bytes: &[u8], stem: &str) -> Result<Vec<ImportedBrush>,
                 .iter()
                 .find(|row| int_value(table, row, "VariantID") == Some(node_variant))
                 .or_else(|| table.rows.first())?;
-            Some(Settings::read(table, row))
+            Some((Settings::read(table, row), pattern_reference(table, row)))
         })
         .unwrap_or_default();
 
-    let mut brush = if let Some((w, h, mask)) = material_tip(&db) {
+    let mut brush = if let Some((w, h, mask)) = material_tip(&db, pattern_key.as_deref()) {
         stamp_brush(name.clone(), w, h, mask, settings.spacing)?.brush
     } else {
         Brush {
@@ -50,6 +50,7 @@ pub(super) fn import_sut(bytes: &[u8], stem: &str) -> Result<Vec<ImportedBrush>,
             softness: settings.softness,
             spacing: settings.spacing,
             roundness: settings.roundness,
+            scatter: settings.scatter,
             tip: None,
             ..Brush::default()
         }
@@ -61,6 +62,7 @@ pub(super) fn import_sut(bytes: &[u8], stem: &str) -> Result<Vec<ImportedBrush>,
     brush.softness = settings.softness;
     brush.spacing = settings.spacing;
     brush.roundness = settings.roundness;
+    brush.scatter = settings.scatter;
 
     cap_list(vec![ImportedBrush { name, brush }])
 }
@@ -72,6 +74,7 @@ struct Settings {
     softness: f32,
     spacing: f32,
     roundness: f32,
+    scatter: f32,
 }
 
 impl Default for Settings {
@@ -83,6 +86,7 @@ impl Default for Settings {
             softness: 0.5,
             spacing: 0.15,
             roundness: 1.0,
+            scatter: 0.0,
         }
     }
 }
@@ -102,6 +106,12 @@ impl Settings {
                 s.opacity = f.clamp(0.0, 1.0) as f32;
             }
         }
+        if let Some(v) = number(table, row, "BrushFlow") {
+            let f = if v > 1.0 { v / 100.0 } else { v };
+            if f.is_finite() {
+                s.opacity = (s.opacity * f.clamp(0.0, 1.0) as f32).clamp(0.0, 1.0);
+            }
+        }
         if let Some(v) = number(table, row, "BrushHardness") {
             if (0.0..=100.0).contains(&v) {
                 s.softness = (1.0 - v / 100.0) as f32;
@@ -109,8 +119,7 @@ impl Settings {
         }
         if let Some(v) = number(table, row, "BrushInterval") {
             if v.is_finite() && v > 0.0 {
-                let f = if v > 2.0 { v / 100.0 } else { v };
-                s.spacing = clamp_spacing(f as f32, 0.15);
+                s.spacing = clamp_spacing((v / 100.0) as f32, 0.15);
             }
         }
         if let Some(v) = number(table, row, "BrushThickness") {
@@ -118,15 +127,76 @@ impl Settings {
                 s.roundness = (v / 100.0).clamp(0.1, 1.0) as f32;
             }
         }
+        if int_value(table, row, "BrushUseSpray").unwrap_or(0) != 0 {
+            let size = number(table, row, "BrushSize").unwrap_or(24.0).max(1.0);
+            let spray = number(table, row, "BrushSpraySize").unwrap_or(size * 0.3);
+            s.scatter = (spray / size).clamp(0.0, 1.0) as f32;
+        }
         s
     }
 }
 
-fn material_tip(db: &Db) -> Option<(u32, u32, Vec<u8>)> {
+fn pattern_reference(table: &Table, row: &[Value]) -> Option<String> {
+    let Value::Blob(blob) = value(table, row, "BrushPatternImageArray")? else {
+        return None;
+    };
+    utf16_strings(blob)
+        .into_iter()
+        .find(|text| text.contains(":data:") && text.len() >= 8)
+}
+
+fn utf16_strings(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for pair in bytes.as_chunks::<2>().0 {
+        let code = u16::from_le_bytes(*pair);
+        if (0x20..=0x7e).contains(&code) {
+            current.push(code as u8 as char);
+        } else {
+            if current.len() >= 4 {
+                out.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+        }
+    }
+    if current.len() >= 4 {
+        out.push(current);
+    }
+    out
+}
+
+fn row_contains_text(row: &[Value], needle: &str) -> bool {
+    row.iter()
+        .any(|value| matches!(value, Value::Text(text) if text.contains(needle)))
+}
+
+fn row_contains_tag(row: &[Value], tag: &[u8]) -> bool {
+    row.iter()
+        .any(|value| matches!(value, Value::Blob(blob) if find_bytes(blob, 0, tag).is_some()))
+}
+
+fn material_tip(db: &Db, pattern_key: Option<&str>) -> Option<(u32, u32, Vec<u8>)> {
     let table = db.table("MaterialFile")?;
     let file_column = column_index(&table, "FileData");
+    let mut rows: Vec<&Vec<Value>> = Vec::new();
+    if let Some(key) = pattern_key {
+        rows.extend(table.rows.iter().filter(|row| row_contains_text(row, key)));
+    }
+    if rows.is_empty() {
+        rows.extend(
+            table
+                .rows
+                .iter()
+                .filter(|row| row_contains_tag(row, b"BrushPattern")),
+        );
+    }
+    if rows.is_empty() {
+        rows.extend(table.rows.iter());
+    }
+
     let mut best: Option<(u64, u32, u32, Vec<u8>)> = None;
-    for row in &table.rows {
+    for row in rows {
         if let Some(index) = file_column {
             if let Some(Value::Blob(blob)) = row.get(index) {
                 keep_largest(&mut best, largest_png(blob));
@@ -168,17 +238,25 @@ fn largest_png(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
             break;
         }
         let png = &bytes[start..end];
-        if let Ok((w, h, mask)) =
-            decode_png_mask(png, true).or_else(|_| decode_png_mask(png, false))
-        {
+        if let Some((w, h, mask)) = decode_tip_png(png) {
             let area = w as u64 * h as u64;
-            if best.as_ref().map(|b| area > b.0).unwrap_or(true) {
+            if mask.iter().any(|&value| value != 0)
+                && best.as_ref().map(|b| area > b.0).unwrap_or(true)
+            {
                 best = Some((area, w, h, mask));
             }
         }
         from = end;
     }
     best.map(|(_, w, h, mask)| (w, h, mask))
+}
+
+fn decode_tip_png(png: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let white = decode_png_mask(png, true).ok()?;
+    if white.2.iter().any(|&value| value != 0) {
+        return Some(white);
+    }
+    decode_png_mask(png, false).ok()
 }
 
 fn find_bytes(buf: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
@@ -262,6 +340,15 @@ impl<'a> Db<'a> {
         Some((base, kind, count, h + header))
     }
 
+    fn page_rightmost(&self, page: usize) -> Option<usize> {
+        let base = self.page_start(page)?;
+        let h = base + if page == 1 { 100 } else { 0 };
+        if *self.buf.get(h)? != 0x05 {
+            return None;
+        }
+        be32(self.buf, h + 8).map(|p| p as usize)
+    }
+
     fn walk(&self, page: usize, depth: usize, out: &mut Vec<Vec<Value>>) -> Option<()> {
         if depth > 32 {
             return None;
@@ -284,6 +371,9 @@ impl<'a> Db<'a> {
                 }
                 _ => return None,
             }
+        }
+        if kind == 0x05 {
+            self.walk(self.page_rightmost(page)?, depth + 1, out)?;
         }
         Some(())
     }
@@ -626,6 +716,35 @@ mod tests {
         let tip = imported.brush.tip.as_ref().expect("tip");
         assert_eq!((tip.w, tip.h), (8, 8));
         assert!(tip.mask[3 * 8 + 3] > 200);
+        assert_eq!(tip.mask[0], 0);
+    }
+
+    #[test]
+    fn sut_prefers_pattern_material_over_paper_texture() {
+        let bytes = include_bytes!("../../testdata/csp_pattern_sample.sut");
+        let brushes = import_sut(bytes, "sample").expect("import");
+        assert_eq!(brushes.len(), 1);
+        let imported = &brushes[0];
+        assert_eq!(imported.name, "Synthetic Pattern Brush");
+        assert!((imported.brush.size - 60.0).abs() < 0.01);
+        assert!((imported.brush.opacity - 0.4).abs() < 0.01);
+        assert!((imported.brush.softness - 0.3).abs() < 0.01);
+        assert!((imported.brush.spacing - 0.0097).abs() < 0.0001);
+        assert!((imported.brush.roundness - 0.3).abs() < 0.01);
+        assert!((imported.brush.scatter - 0.5).abs() < 0.01);
+        let tip = imported.brush.tip.as_ref().expect("tip");
+        assert_eq!((tip.w, tip.h), (16, 16));
+        assert!(tip.mask[8 * 16 + 8] > 200);
+        assert_eq!(tip.mask[0], 0);
+    }
+
+    #[test]
+    fn sut_reads_black_alpha_pattern_tip() {
+        let bytes = include_bytes!("../../testdata/csp_black_tip_sample.sut");
+        let brushes = import_sut(bytes, "sample").expect("import");
+        let tip = brushes[0].brush.tip.as_ref().expect("tip");
+        assert_eq!((tip.w, tip.h), (16, 16));
+        assert!(tip.mask[8 * 16 + 8] > 200);
         assert_eq!(tip.mask[0], 0);
     }
 

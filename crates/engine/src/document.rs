@@ -800,6 +800,28 @@ impl Document {
         })
     }
 
+    /// Rewind the active layer to the newest checkpoint without consuming it.
+    /// The stroke replay path uses this to redraw the stroke with taper.
+    pub fn restore_last_checkpoint(&mut self) -> bool {
+        let Some(entry) = self.undo.last() else {
+            return false;
+        };
+        let index = entry.layer;
+        {
+            let Some(layer) = self.layers.get_mut(index) else {
+                return false;
+            };
+            layer.pixels.clone_from(&entry.pixels);
+            layer.mask.clone_from(&entry.mask);
+            layer.ox = entry.ox;
+            layer.oy = entry.oy;
+            layer.text.clone_from(&entry.text);
+        }
+        self.active = index.min(self.layers.len().saturating_sub(1));
+        self.mark_full_dirty();
+        true
+    }
+
     /// Restore the most recent snapshot. Returns false when history is empty.
     pub fn undo(&mut self) -> bool {
         if let Some(entry) = self.undo.pop() {
@@ -3702,6 +3724,19 @@ mod tests {
         assert!(doc.undo());
         assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
         assert!(!doc.undo());
+    }
+
+    #[test]
+    fn restore_last_checkpoint_rewinds_without_dropping_undo() {
+        let mut doc = Document::new(1, 1);
+        assert!(!doc.restore_last_checkpoint());
+        doc.checkpoint();
+        doc.layers[0].pixels = vec![9, 9, 9, 9];
+        assert!(doc.restore_last_checkpoint());
+        assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
+        // The checkpoint survives the rewind and still undoes normally.
+        assert!(doc.undo());
+        assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
     }
 
     #[test]

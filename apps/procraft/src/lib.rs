@@ -8,7 +8,7 @@ use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptio
 // iOS has no rfd backend: same call shape, every dialog declined.
 use procraft_engine::{
     analogous, check_font, clamp_frame, classify_touch_tap, complementary, curves_lut,
-    export_gif_ext, export_timelapse, export_tip_png, gallery_thumb, import_brush_file,
+    export_gif_ext, export_timelapse, export_tip_png, gallery_thumb, import_brush_file_report,
     import_gif_document, import_gpl_file, levels_lut, next_frame, onion_ghost, open_brush_library,
     open_palette, open_psd, palette_from_rgba, pan_offset, prev_frame, rasterize_frame,
     rasterize_frame_region, save_brush_library, save_palette, save_psd, shift_wheel_remap,
@@ -28,6 +28,20 @@ use rfd_shim as rfd;
 
 mod settings;
 
+/// Every extension `import_brush_file` can dispatch.
+const BRUSH_IMPORT_EXTS: &[&str] = &[
+    "pcbrush", "json", "abr", "brush", "brushset", "kpp", "bundle", "sut", "gbr", "png", "jpg",
+    "jpeg", "webp", "bmp", "gif", "tif", "tiff",
+];
+
+/// Any brush file that can supply a dual tip.
+const TIP_IMPORT_EXTS: &[&str] = BRUSH_IMPORT_EXTS;
+
+/// Brush size range shared by the quick slider, the panel slider and drag
+/// gestures. The upper bound matches the engine's validation limit.
+const BRUSH_SIZE_MIN: f32 = 1.0;
+const BRUSH_SIZE_MAX: f32 = 400.0;
+
 /// Android: accepted extensions per open kind (mirrors the desktop filters).
 #[cfg(target_os = "android")]
 fn pending_open_exts(kind: PendingOpen) -> &'static [&'static str] {
@@ -38,12 +52,9 @@ fn pending_open_exts(kind: PendingOpen) -> &'static [&'static str] {
         PendingOpen::Project => &["procraft"],
         PendingOpen::Psd => &["psd"],
         PendingOpen::Font => &["ttf", "otf"],
-        PendingOpen::Brushes => &[
-            "pcbrush", "json", "abr", "brush", "brushset", "kpp", "bundle", "sut", "gbr", "png",
-            "jpg", "jpeg", "webp", "bmp",
-        ],
+        PendingOpen::Brushes => BRUSH_IMPORT_EXTS,
         PendingOpen::Palette => &["pcpalette", "json", "gpl"],
-        PendingOpen::DualTip => &["pcbrush", "json", "abr", "brushset", "sut"],
+        PendingOpen::DualTip => TIP_IMPORT_EXTS,
         PendingOpen::Gif => &["gif"],
     }
 }
@@ -677,9 +688,9 @@ fn resolve_capture_event(ev: &egui::Event) -> CaptureOutcome {
 /// M49: brush size after a size-drag of `travel` px along the configured
 /// direction, applied to the gesture's base size (never per-frame
 /// deltas, so the value can't drift), clamped to the size slider's range
-/// (1..=200).
+/// (1..=400).
 fn drag_size(base: f32, travel: f32) -> f32 {
-    (base * size_drag_factor(travel)).clamp(1.0, 200.0)
+    (base * size_drag_factor(travel)).clamp(BRUSH_SIZE_MIN, BRUSH_SIZE_MAX)
 }
 
 /// M49: the brush-size drag's travel in px for `mode`, measured from the
@@ -775,6 +786,7 @@ struct ProCraftApp {
     texture: Option<TextureHandle>,
     painting: bool,
     last: Option<(f32, f32)>,
+    last_target: Option<(f32, f32)>,
     last_dyn: DabDynamics,
     last_t: f64,
     leftover: f32,
@@ -785,6 +797,9 @@ struct ProCraftApp {
     // Midpoint-smoothed stroke path: rounds the corners between sparse
     // input samples so fast strokes ink as curves, not chords.
     stroke_curve: StrokeCurve,
+    // Segments of the live brush stroke, replayed on release when the
+    // brush has a start/end taper.
+    stroke_record: RecordedStroke,
     sel_anchor: Option<(f32, f32)>,
     sel_current: Option<(f32, f32)>,
     /// Drag-crop state: the live drag plus the committed rect (inclusive
@@ -1042,12 +1057,14 @@ impl ProCraftApp {
             texture: None,
             painting: false,
             last: None,
+            last_target: None,
             last_dyn: DabDynamics::default(),
             last_t: 0.0,
             leftover: 0.0,
             smooth_pt: None,
             smooth_pressure: 1.0,
             stroke_curve: StrokeCurve::new(),
+            stroke_record: RecordedStroke::default(),
             sel_anchor: None,
             sel_current: None,
             crop_anchor: None,
@@ -1892,7 +1909,7 @@ impl ProCraftApp {
                 }
                 Err(e) => self.status = format!("PSD open failed: {e}"),
             },
-            PendingOpen::Brushes => match load_brush_file(&path) {
+            PendingOpen::Brushes => match load_brush_file_report(&path) {
                 Ok(libs) => self.status = self.absorb_brushes(libs, &path),
                 Err(e) => self.status = format!("Brush import failed: {e}"),
             },
@@ -1974,16 +1991,7 @@ impl ProCraftApp {
                 eraser: false,
                 ..preset
             };
-            let mut last = None;
-            let mut left = 0.0;
-            let mut x = 8.0;
-            while x <= 136.0 {
-                let y = 18.0 + 8.0 * ((x - 8.0) / 128.0 * std::f32::consts::PI * 2.0).sin();
-                let (l, lo) = doc.stroke_to(&brush, ink, last, (x, y), left);
-                last = l;
-                left = lo;
-                x += 2.0;
-            }
+            paint_preview_stroke(&mut doc, &brush, ink);
             let img = ColorImage::from_rgba_unmultiplied([144, 36], &doc.layers[0].pixels.clone());
             self.preset_textures.push(ctx.load_texture(
                 format!("brush-{idx}"),
@@ -1996,6 +2004,64 @@ impl ProCraftApp {
     /// Total preview cards currently needed (built-ins + customs).
     fn preview_count(&self) -> usize {
         procraft_engine::presets().len() + self.custom_brushes.len()
+    }
+}
+
+fn brush_preview_path() -> Vec<(f32, f32)> {
+    let mut points = Vec::new();
+    let mut x = 8.0;
+    while x <= 136.0 {
+        let y = 18.0 + 8.0 * ((x - 8.0) / 128.0 * std::f32::consts::PI * 2.0).sin();
+        points.push((x, y));
+        x += 2.0;
+    }
+    points
+}
+
+fn preview_path_progress(points: &[(f32, f32)]) -> Vec<f32> {
+    let mut progress = Vec::with_capacity(points.len());
+    progress.push(0.0);
+    let mut total = 0.0;
+    for pair in points.windows(2) {
+        let (dx, dy) = (pair[1].0 - pair[0].0, pair[1].1 - pair[0].1);
+        total += (dx * dx + dy * dy).sqrt();
+        progress.push(total);
+    }
+    if total > 0.0 {
+        for value in &mut progress {
+            *value /= total;
+        }
+    }
+    progress
+}
+
+fn paint_preview_stroke(doc: &mut Document, brush: &Brush, ink: Color) {
+    let points = brush_preview_path();
+    let progress = preview_path_progress(&points);
+    let mut last = None;
+    let mut left = 0.0;
+    for (idx, &to) in points.iter().enumerate() {
+        let angle = if idx > 0 {
+            let from = points[idx - 1];
+            (to.1 - from.1).atan2(to.0 - from.0)
+        } else {
+            let next = points[1];
+            (next.1 - to.1).atan2(next.0 - to.0)
+        };
+        let from_u = if idx == 0 { 0.0 } else { progress[idx - 1] };
+        let from_dyn = DabDynamics {
+            angle,
+            taper: brush.taper.factor_at(from_u),
+            ..Default::default()
+        };
+        let to_dyn = DabDynamics {
+            angle,
+            taper: brush.taper.factor_at(progress[idx]),
+            ..Default::default()
+        };
+        let (l, lo) = doc.stroke_to_dyn(brush, ink, last, from_dyn, to, to_dyn, left);
+        last = l;
+        left = lo;
     }
 }
 
@@ -2013,33 +2079,70 @@ fn load_palette_file(path: &std::path::Path) -> Result<Palette, String> {
         open_palette(path)
     }
 }
-/// Dispatch a brush file by extension into presets (shared by the desktop
-/// Import arm and the iOS picker resolve path).
-fn load_brush_file(path: &std::path::Path) -> Result<Vec<BrushPreset>, String> {
+struct LoadedBrushes {
+    brushes: Vec<BrushPreset>,
+    warnings: Vec<String>,
+    skipped: usize,
+}
+
+/// Dispatch a brush file by extension into presets plus any importer
+/// warnings (shared by the desktop Import arm and the iOS picker path).
+fn load_brush_file_report(path: &std::path::Path) -> Result<LoadedBrushes, String> {
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
     if ext == "pcbrush" || ext == "json" {
-        open_brush_library(path).map(|libs| {
-            libs.into_iter()
+        open_brush_library(path).map(|libs| LoadedBrushes {
+            brushes: libs
+                .into_iter()
                 .map(|p| BrushPreset {
                     name: p.name,
                     brush: p.brush,
                 })
-                .collect()
+                .collect(),
+            warnings: Vec::new(),
+            skipped: 0,
         })
     } else {
-        import_brush_file(path).map(|libs| {
-            libs.into_iter()
+        import_brush_file_report(path).map(|outcome| LoadedBrushes {
+            brushes: outcome
+                .brushes
+                .into_iter()
                 .map(|b| BrushPreset {
                     name: b.name,
                     brush: b.brush,
                 })
-                .collect()
+                .collect(),
+            warnings: outcome.warnings,
+            skipped: outcome.skipped,
         })
     }
+}
+
+fn load_brush_file(path: &std::path::Path) -> Result<Vec<BrushPreset>, String> {
+    load_brush_file_report(path).map(|loaded| loaded.brushes)
+}
+
+fn brush_import_status(
+    added: usize,
+    skipped: usize,
+    warnings: &[String],
+    path: &std::path::Path,
+) -> String {
+    let mut status = format!("Imported {added} brushes from {}.", path.display());
+    if skipped > 0 {
+        status.push_str(&format!(" Skipped {skipped} presets."));
+    }
+    if let Some(first) = warnings.first() {
+        status.push(' ');
+        status.push_str(first);
+        if warnings.len() > 1 {
+            status.push_str(&format!(" (+{} more warnings)", warnings.len() - 1));
+        }
+    }
+    status
 }
 
 impl ProCraftApp {
@@ -2161,7 +2264,14 @@ impl ProCraftApp {
                 if self.tool == Tool::Liquify {
                     quick_slider(ui, &mut self.liquify_size, 8.0..=512.0, 1.0, "Size", hit);
                 } else {
-                    quick_slider(ui, &mut self.brush.size, 1.0..=200.0, 1.0, "Size", hit);
+                    quick_slider(
+                        ui,
+                        &mut self.brush.size,
+                        BRUSH_SIZE_MIN..=BRUSH_SIZE_MAX,
+                        1.0,
+                        "Size",
+                        hit,
+                    );
                 }
             }
             QuickControl::Opacity => quick_slider(
@@ -2452,11 +2562,18 @@ impl ProCraftApp {
 
     /// Append imported presets with dedup names (shared by desktop Import
     /// and the iOS picker resolve path). Returns the status message.
-    fn absorb_brushes(&mut self, libs: Vec<BrushPreset>, path: &std::path::Path) -> String {
+    fn absorb_brushes(&mut self, loaded: LoadedBrushes, path: &std::path::Path) -> String {
+        let LoadedBrushes {
+            brushes,
+            mut warnings,
+            mut skipped,
+        } = loaded;
         let mut added = 0;
-        for p in libs {
+        let mut capped = 0;
+        for p in brushes {
             if self.custom_brushes.len() >= MAX_LIBRARY_BRUSHES {
-                break;
+                capped += 1;
+                continue;
             }
             let name = self.unique_brush_name(&p.name);
             self.custom_brushes.push(BrushPreset {
@@ -2465,7 +2582,11 @@ impl ProCraftApp {
             });
             added += 1;
         }
-        format!("Imported {added} brushes from {}.", path.display())
+        if capped > 0 {
+            skipped += capped;
+            warnings.push(format!("Library is full; {capped} brushes were not added."));
+        }
+        brush_import_status(added, skipped, &warnings, path)
     }
 
     /// Append an imported palette's swatches to the active palette,
@@ -4558,6 +4679,32 @@ fn stabilizer_substep(a: f32, n: usize) -> f32 {
     1.0 - (1.0 - a).powf(1.0 / n as f32)
 }
 
+const SPEED_NORM_PX_PER_SEC: f32 = 2000.0;
+
+fn sample_pointer(
+    smooth_pt: Option<(f32, f32)>,
+    last_target: Option<(f32, f32)>,
+    target: (f32, f32),
+    a: f32,
+    dt: f32,
+) -> ((f32, f32), f32) {
+    let smooth = match smooth_pt {
+        Some((px, py)) => (
+            px + (target.0 - px) * (1.0 - a),
+            py + (target.1 - py) * (1.0 - a),
+        ),
+        None => target,
+    };
+    let speed = match last_target {
+        Some((lx, ly)) => {
+            let dist = ((target.0 - lx).powi(2) + (target.1 - ly).powi(2)).sqrt();
+            (dist / dt.max(f32::EPSILON) / SPEED_NORM_PX_PER_SEC).clamp(0.0, 1.0)
+        }
+        None => 0.0,
+    };
+    (smooth, speed)
+}
+
 /// Quadratic piece to stamp: (start, control, end).
 type StrokePiece = ((f32, f32), (f32, f32), (f32, f32));
 
@@ -4626,11 +4773,92 @@ fn stroke_steps(len: f32) -> usize {
     (len / 4.0).ceil().clamp(1.0, 64.0) as usize
 }
 
+#[derive(Clone, Copy)]
+struct RecordedSegment {
+    from: Option<(f32, f32)>,
+    from_dyn: DabDynamics,
+    to: (f32, f32),
+    to_dyn: DabDynamics,
+}
+
+#[derive(Default)]
+struct RecordedStroke {
+    segments: Vec<RecordedSegment>,
+    total_len: f32,
+}
+
+impl RecordedStroke {
+    fn reset(&mut self) {
+        self.segments.clear();
+        self.total_len = 0.0;
+    }
+
+    fn push(
+        &mut self,
+        from: Option<(f32, f32)>,
+        from_dyn: DabDynamics,
+        to: (f32, f32),
+        to_dyn: DabDynamics,
+    ) {
+        if let Some((fx, fy)) = from {
+            self.total_len += ((to.0 - fx).powi(2) + (to.1 - fy).powi(2)).sqrt();
+        }
+        self.segments.push(RecordedSegment {
+            from,
+            from_dyn,
+            to,
+            to_dyn,
+        });
+    }
+}
+
+/// Rewind the live stroke and redraw it with Procreate's start/end taper.
+/// The checkpoint stays on the undo stack, so one undo still removes the
+/// whole stroke.
+fn taper_replay(doc: &mut Document, brush: &Brush, color: Color, stroke: &RecordedStroke) -> bool {
+    if stroke.segments.is_empty() || stroke.total_len <= 0.0 {
+        return false;
+    }
+    if brush.taper.start <= 0.0 && brush.taper.end <= 0.0 {
+        return false;
+    }
+    if !doc.restore_last_checkpoint() {
+        return false;
+    }
+    let mut travelled = 0.0;
+    let mut leftover = 0.0;
+    for segment in &stroke.segments {
+        let leg = match segment.from {
+            Some((fx, fy)) => ((segment.to.0 - fx).powi(2) + (segment.to.1 - fy).powi(2)).sqrt(),
+            None => 0.0,
+        };
+        let from_u = (travelled / stroke.total_len).clamp(0.0, 1.0);
+        travelled += leg;
+        let to_u = (travelled / stroke.total_len).clamp(0.0, 1.0);
+        let mut from_dyn = segment.from_dyn;
+        from_dyn.taper = brush.taper.factor_at(from_u);
+        let mut to_dyn = segment.to_dyn;
+        to_dyn.taper = brush.taper.factor_at(to_u);
+        let (_, lo) = doc.stroke_to_dyn(
+            brush,
+            color,
+            segment.from,
+            from_dyn,
+            segment.to,
+            to_dyn,
+            leftover,
+        );
+        leftover = lo;
+    }
+    true
+}
+
 /// Flush the smoothed stroke's final tail (curve cursor -> last raw
 /// sample) at pointer release. Only the painting branch owns this: the
 /// smudge tool advances its own last-point chain and must never run a
 /// brush flush from the shared curve state (that drew a stale brush
 /// segment from the smudge position to an earlier brush stroke).
+#[allow(clippy::too_many_arguments)]
 fn flush_stroke_tail(
     doc: &mut Document,
     brush: &Brush,
@@ -4639,6 +4867,7 @@ fn flush_stroke_tail(
     last: &mut Option<(f32, f32)>,
     dyn_state: DabDynamics,
     leftover: &mut f32,
+    stroke: &mut RecordedStroke,
 ) -> bool {
     let Some((from, to)) = curve.finish() else {
         return false;
@@ -4652,6 +4881,7 @@ fn flush_stroke_tail(
         let t = k as f32 / steps as f32;
         let p = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
         let (l, lo) = doc.stroke_to_dyn(brush, color, *last, dyn_state, p, dyn_state, *leftover);
+        stroke.push(*last, dyn_state, p, dyn_state);
         *last = l;
         *leftover = lo;
     }
@@ -6402,14 +6632,10 @@ impl eframe::App for ProCraftApp {
                     if ui.button("Import").clicked() {
                         #[cfg(not(target_os = "ios"))]
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Brushes", &[
-                                "pcbrush", "json", "abr", "brush", "brushset",
-                                "kpp", "bundle", "sut", "gbr", "png", "jpg", "jpeg", "webp",
-                                "bmp",
-                            ])
+                            .add_filter("Brushes", BRUSH_IMPORT_EXTS)
                             .pick_file()
                         {
-                            match load_brush_file(&path) {
+                            match load_brush_file_report(&path) {
                                 Ok(libs) => self.status = self.absorb_brushes(libs, &path),
                                 Err(e) => self.status = format!("Brush import failed: {e}"),
                             }
@@ -6417,11 +6643,7 @@ impl eframe::App for ProCraftApp {
                         #[cfg(target_os = "ios")]
                         {
                             let _ = rfd::FileDialog::new()
-                                .add_filter("Brushes", &[
-                                    "pcbrush", "json", "abr", "brush", "brushset",
-                                    "kpp", "bundle", "sut", "gbr", "png", "jpg", "jpeg",
-                                    "webp", "bmp",
-                                ])
+                                .add_filter("Brushes", BRUSH_IMPORT_EXTS)
                                 .pick_file();
                             self.pending_open = Some(PendingOpen::Brushes);
                             self.status = "Pick brushes…".to_string();
@@ -6752,19 +6974,34 @@ impl eframe::App for ProCraftApp {
                 });
             });
             ui.separator();
-            stepped_slider(ui, &mut self.brush.size, 1.0..=200.0, 1.0, "Size");
+            stepped_slider(
+                ui,
+                &mut self.brush.size,
+                BRUSH_SIZE_MIN..=BRUSH_SIZE_MAX,
+                1.0,
+                "Size",
+            );
             stepped_slider(ui, &mut self.brush.opacity, 0.05..=1.0, 0.05, "Opacity");
             stepped_slider(ui, &mut self.brush.softness, 0.0..=1.0, 0.05, "Softness");
             stepped_slider(ui, &mut self.brush.spacing, 0.05..=1.0, 0.05, "Spacing");
             ui.collapsing("Pressure (touch / Pencil)", |ui| {
-                stepped_slider(ui, &mut self.brush.pressure_size, 0.0..=1.0, 0.05, "Size");
-                stepped_slider(ui, &mut self.brush.pressure_opacity, 0.0..=1.0, 0.05, "Opacity");
+                stepped_slider(ui, &mut self.brush.pressure_size, -1.0..=1.0, 0.05, "Size");
+                stepped_slider(ui, &mut self.brush.pressure_opacity, -1.0..=1.0, 0.05, "Opacity");
                 ui.label("Mouse has no pressure sensor: it paints at full pressure.");
             });
             ui.collapsing("Velocity", |ui| {
                 stepped_slider(ui, &mut self.brush.velocity_size, 0.0..=1.0, 0.05, "Thin");
                 stepped_slider(ui, &mut self.brush.velocity_opacity, 0.0..=1.0, 0.05, "Fade");
                 ui.label("Fast moves thin and fade (this is the old Dynamics, split).");
+            });
+            ui.collapsing("Taper", |ui| {
+                stepped_slider(ui, &mut self.brush.taper.start, 0.0..=1.0, 0.05, "Start");
+                stepped_slider(ui, &mut self.brush.taper.end, 0.0..=1.0, 0.05, "End");
+                stepped_slider(ui, &mut self.brush.taper.size, 0.0..=1.0, 0.05, "Size");
+                stepped_slider(ui, &mut self.brush.taper.shape, 0.0..=1.0, 0.05, "Tip shape");
+                stepped_slider(ui, &mut self.brush.taper.opacity, 0.0..=1.0, 0.05, "Opacity");
+                stepped_slider(ui, &mut self.brush.taper.pressure, 0.0..=1.0, 0.05, "Pressure");
+                ui.label("Taper lengths are fractions of the stroke; applied on release.");
             });
             ui.collapsing("Texture", |ui| {
                 stepped_slider(ui, &mut self.brush.grain, 0.0..=1.0, 0.05, "Grain");
@@ -6787,7 +7024,7 @@ impl eframe::App for ProCraftApp {
                     if ui.button("Import…").clicked() {
                         #[cfg(not(target_os = "ios"))]
                         if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Brushes", &["pcbrush", "json", "abr", "brushset", "sut"])
+                            .add_filter("Brushes", TIP_IMPORT_EXTS)
                             .pick_file()
                         {
                             self.status = self.absorb_dual_tip(&path);
@@ -6795,7 +7032,7 @@ impl eframe::App for ProCraftApp {
                         #[cfg(target_os = "ios")]
                         {
                             let _ = rfd::FileDialog::new()
-                            .add_filter("Brushes", &["pcbrush", "json", "abr", "brushset", "sut"])
+                                .add_filter("Brushes", TIP_IMPORT_EXTS)
                                 .pick_file();
                             self.pending_open = Some(PendingOpen::DualTip);
                             self.status = "Pick a dual tip…".to_string();
@@ -6811,7 +7048,7 @@ impl eframe::App for ProCraftApp {
                     }
                 });
                 if self.brush.dual_tip.is_some() {
-                    stepped_slider(ui, &mut self.brush.dual_scale, 0.1..=2.0, 0.05, "Dual size");
+                    stepped_slider(ui, &mut self.brush.dual_scale, 0.1..=4.0, 0.05, "Dual size");
                 }
             });
             ui.collapsing("Dab shape", |ui| {
@@ -8334,6 +8571,7 @@ impl eframe::App for ProCraftApp {
                 }
                 self.painting = false;
                 self.last = None;
+                self.last_target = None;
                 self.smooth_pt = None;
                 self.stroke_curve.reset();
                 self.assist_start = None;
@@ -9905,6 +10143,7 @@ impl eframe::App for ProCraftApp {
                         }
                         self.painting = false;
                         self.last = None;
+                        self.last_target = None;
                     }
                     return;
                 }
@@ -9923,10 +10162,12 @@ impl eframe::App for ProCraftApp {
                         self.status = "Paused for painting.".to_string();
                     }
                     self.last = None;
+                    self.last_target = None;
                     self.last_dyn = DabDynamics::default();
                     self.leftover = 0.0;
                     self.smooth_pt = None;
                     self.stroke_curve.reset();
+                    self.stroke_record.reset();
                     self.smooth_pressure = 1.0;
                     self.last_t = ctx.input(|i| i.time);
                     // Drawing Assist: remember the stroke start; the lock
@@ -9963,6 +10204,7 @@ impl eframe::App for ProCraftApp {
                                 pressure,
                                 speed_norm: 0.0,
                                 angle: self.last_dyn.angle,
+                                taper: 1.0,
                             };
                             let (last, leftover) = self.doc.stroke_to_dyn(
                                 &brush,
@@ -9984,6 +10226,7 @@ impl eframe::App for ProCraftApp {
                         }
                         self.painting = false;
                         self.last = None;
+                        self.last_target = None;
                         self.smooth_pt = None;
                         self.assist_start = None;
                         self.assist_lock = None;
@@ -10029,13 +10272,11 @@ impl eframe::App for ProCraftApp {
                             // streaking the canvas edge (and poisoning the
                             // dirty rect, which used to quit the app).
                             let (x, y) = clamp_pt(x, y);
-                            let (sx, sy) = match self.smooth_pt {
-                                Some((px, py)) => {
-                                    (px + (x - px) * (1.0 - a), py + (y - py) * (1.0 - a))
-                                }
-                                None => (x, y),
-                            };
+                            let target = (x, y);
+                            let ((sx, sy), speed_norm) =
+                                sample_pointer(self.smooth_pt, self.last_target, target, a, dt);
                             self.smooth_pt = Some((sx, sy));
+                            self.last_target = Some(target);
                             // Drawing Assist: ride an engaged ray/axis lock,
                             // else fall back to guide point-snap (shapes stay
                             // free). Projected points re-clamp so rays running
@@ -10064,19 +10305,17 @@ impl eframe::App for ProCraftApp {
                                 self.guides.snap_point(w, h, sx, sy)
                             };
                             self.smooth_pressure += (pressure - self.smooth_pressure) * (1.0 - a);
-                            // Speed + direction from the smoothed trail.
-                            let (speed_norm, angle) = match self.last {
+                            let angle = match self.last {
                                 Some((lx, ly)) => {
-                                    let dist = ((sx - lx).powi(2) + (sy - ly).powi(2)).sqrt();
-                                    let n = (dist / dt / 3500.0).clamp(0.0, 1.0);
-                                    let ang = if dist > 0.001 {
-                                        (sy - ly).atan2(sx - lx)
+                                    let dx = sx - lx;
+                                    let dy = sy - ly;
+                                    if dx.hypot(dy) > 0.001 {
+                                        dy.atan2(dx)
                                     } else {
                                         self.last_dyn.angle
-                                    };
-                                    (n, ang)
+                                    }
                                 }
-                                None => (0.0, self.last_dyn.angle),
+                                None => self.last_dyn.angle,
                             };
                             let from_dyn = if self.last.is_some() {
                                 self.last_dyn
@@ -10087,6 +10326,7 @@ impl eframe::App for ProCraftApp {
                                 pressure: self.smooth_pressure,
                                 speed_norm,
                                 angle,
+                                taper: 1.0,
                             };
                             let color = self.current_color();
                             // Ink the smoothed path (see StrokeCurve): the
@@ -10095,15 +10335,17 @@ impl eframe::App for ProCraftApp {
                             // steps so sparse samples still draw curves.
                             match self.stroke_curve.push((sx, sy)) {
                                 None => {
+                                    let from = self.last;
                                     let (last, leftover) = self.doc.stroke_to_dyn(
                                         &brush,
                                         color,
-                                        self.last,
+                                        from,
                                         from_dyn,
                                         (sx, sy),
                                         to_dyn,
                                         self.leftover,
                                     );
+                                    self.stroke_record.push(from, from_dyn, (sx, sy), to_dyn);
                                     self.last = last;
                                     self.leftover = leftover;
                                 }
@@ -10114,15 +10356,17 @@ impl eframe::App for ProCraftApp {
                                     for k in 1..=steps {
                                         let t = k as f32 / steps as f32;
                                         let (px, py) = stroke_quad_pt(p0, ctrl, p1, t);
+                                        let from = self.last;
                                         let (last, leftover) = self.doc.stroke_to_dyn(
                                             &brush,
                                             color,
-                                            self.last,
+                                            from,
                                             from_dyn,
                                             (px, py),
                                             to_dyn,
                                             self.leftover,
                                         );
+                                        self.stroke_record.push(from, from_dyn, (px, py), to_dyn);
                                         self.last = last;
                                         self.leftover = leftover;
                                     }
@@ -10145,9 +10389,14 @@ impl eframe::App for ProCraftApp {
                             &mut self.last,
                             self.last_dyn,
                             &mut self.leftover,
+                            &mut self.stroke_record,
                         ) {
                             self.stroke_painted = true;
                         }
+                        if self.stroke_painted {
+                            taper_replay(&mut self.doc, &brush, color, &self.stroke_record);
+                        }
+                        self.stroke_record.reset();
                     }
                     if self.stroke_painted {
                         self.stroke_painted = false;
@@ -10155,6 +10404,7 @@ impl eframe::App for ProCraftApp {
                     }
                     self.painting = false;
                     self.last = None;
+                    self.last_target = None;
                     self.smooth_pt = None;
                     self.assist_start = None;
                     self.assist_lock = None;
@@ -10233,6 +10483,69 @@ fn android_main(app: android_activity::AndroidApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use procraft_engine::Taper;
+
+    #[test]
+    fn brush_and_tip_filters_cover_every_importable_type() {
+        for ext in [
+            "pcbrush", "json", "abr", "brush", "brushset", "kpp", "bundle", "sut", "gbr", "png",
+            "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff",
+        ] {
+            assert!(
+                BRUSH_IMPORT_EXTS.contains(&ext),
+                "{ext} missing from brush filter"
+            );
+        }
+        for ext in ["kpp", "bundle", "gbr", "png", "gif", "tif", "tiff"] {
+            assert!(
+                TIP_IMPORT_EXTS.contains(&ext),
+                "{ext} missing from tip filter"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn corpus_brush_previews_do_not_panic() {
+        let Ok(dir) = std::env::var("PROCRAFT_BRUSH_CORPUS") else {
+            return;
+        };
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                continue;
+            }
+            let Ok(loaded) = load_brush_file_report(&path) else {
+                continue;
+            };
+            for preset in loaded.brushes {
+                let brush = Brush {
+                    eraser: false,
+                    ..preset.brush
+                };
+                let mut doc = Document::new(144, 36);
+                paint_preview_stroke(&mut doc, &brush, Color::rgb(30, 30, 30));
+            }
+        }
+    }
+
+    #[test]
+    fn brush_import_status_reports_skipped_and_first_warning() {
+        let path = std::path::Path::new("brushes.bundle");
+        let status = brush_import_status(
+            2,
+            1,
+            &[
+                "Skipped preset 'Bad': no sampled tip.".to_string(),
+                "Library is full; 1 brushes were not added.".to_string(),
+            ],
+            path,
+        );
+        assert!(status.contains("Imported 2 brushes"), "{status}");
+        assert!(status.contains("Skipped 1 presets"), "{status}");
+        assert!(status.contains("Skipped preset 'Bad'"), "{status}");
+        assert!(status.contains("1 more warnings"), "{status}");
+    }
 
     fn key_ev(key: egui::Key, mods: egui::Modifiers) -> egui::Event {
         egui::Event::Key {
@@ -10359,7 +10672,9 @@ mod tests {
         assert_eq!(drag_size(50.0, 0.0), 50.0);
         assert_eq!(drag_size(50.0, 120.0), 62.5);
         assert_eq!(drag_size(1.0, -120.0), 1.0); // floor
-        assert_eq!(drag_size(200.0, 120.0), 200.0); // ceiling
+        assert_eq!(drag_size(200.0, 120.0), 250.0);
+        assert_eq!(drag_size(300.0, 0.0), 300.0);
+        assert_eq!(drag_size(400.0, 120.0), 400.0); // ceiling
     }
 
     #[test]
@@ -10392,6 +10707,22 @@ mod tests {
         assert_eq!(stabilizer_substep(a, 1), a);
         // Raw mode (no stabilizer) stays raw for any trail length.
         assert_eq!(stabilizer_substep(0.0, 7), 0.0);
+    }
+
+    #[test]
+    fn speed_follows_raw_pointer_not_stabilized_trail() {
+        let dt = 1.0 / 120.0;
+        let a = 0.2975;
+        let target = (1000.0 * dt, 0.0);
+        let (smooth, speed) = sample_pointer(Some((0.0, 0.0)), Some((0.0, 0.0)), target, a, dt);
+        assert!(
+            smooth.0 < target.0 * 0.8,
+            "stabilizer should lag the pointer"
+        );
+        assert!(
+            (speed - 0.5).abs() < 0.01,
+            "raw 1000 px/s should map to half speed, got {speed}"
+        );
     }
 
     #[test]
@@ -11427,6 +11758,7 @@ mod tests {
         assert!(curve.push((10.0, 3.0)).is_some());
         let mut last = Some((6.0, 3.0));
         let mut leftover = 0.0;
+        let mut record = RecordedStroke::default();
         assert!(flush_stroke_tail(
             &mut doc,
             &paint,
@@ -11435,6 +11767,7 @@ mod tests {
             &mut last,
             DabDynamics::default(),
             &mut leftover,
+            &mut record,
         ));
         let i = ((3 * doc.w + 9) * 4) as usize;
         assert_eq!(&doc.layers[0].pixels[i..i + 3], &[255, 0, 0]);
@@ -11447,6 +11780,7 @@ mod tests {
             &mut last,
             DabDynamics::default(),
             &mut leftover,
+            &mut record,
         ));
     }
 
@@ -11457,6 +11791,7 @@ mod tests {
         let mut curve = StrokeCurve::new();
         let mut last = Some((4.0, 4.0));
         let mut leftover = 0.0;
+        let mut record = RecordedStroke::default();
         let before = doc.layers[0].pixels.clone();
         assert!(!flush_stroke_tail(
             &mut doc,
@@ -11466,8 +11801,121 @@ mod tests {
             &mut last,
             DabDynamics::default(),
             &mut leftover,
+            &mut record,
         ));
         assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
+    fn taper_replay_rewinds_the_live_stroke_and_fades_the_tail() {
+        let mut doc = Document::new(48, 12);
+        let brush = Brush {
+            size: 6.0,
+            opacity: 1.0,
+            softness: 0.0,
+            spacing: 0.25,
+            taper: Taper {
+                end: 1.0,
+                opacity: 1.0,
+                ..Taper::NONE
+            },
+            ..Default::default()
+        };
+        let color = Color::rgb(255, 0, 0);
+        let dyn_ = DabDynamics::default();
+        doc.checkpoint();
+        let mut record = RecordedStroke::default();
+        let mut last = None;
+        let mut leftover = 0.0;
+        for x in [6.0, 14.0, 22.0, 30.0, 38.0, 46.0] {
+            let (l, lo) = doc.stroke_to_dyn(&brush, color, last, dyn_, (x, 6.0), dyn_, leftover);
+            record.push(last, dyn_, (x, 6.0), dyn_);
+            last = l;
+            leftover = lo;
+        }
+        assert!(taper_replay(&mut doc, &brush, color, &record));
+        let alpha = |x: u32| doc.layers[0].pixels[((6 * doc.w + x) * 4 + 3) as usize];
+        assert!(alpha(6) > 200, "head alpha {}", alpha(6));
+        assert!(alpha(46) < 40, "tail alpha {}", alpha(46));
+        assert!(alpha(20) < alpha(6));
+    }
+
+    #[test]
+    fn screenshot_taper_replay_closes_both_tips() {
+        let mut doc = Document::new(144, 36);
+        let brush = Brush {
+            size: 40.0,
+            opacity: 1.0,
+            softness: 0.0,
+            spacing: 0.10,
+            taper: Taper {
+                start: 0.04,
+                end: 0.05,
+                size: 0.46,
+                shape: 1.0,
+                opacity: 0.0,
+                pressure: 0.0,
+            },
+            ..Default::default()
+        };
+        let color = Color::rgb(20, 20, 20);
+        let points = brush_preview_path();
+        let progress = preview_path_progress(&points);
+        doc.checkpoint();
+        let mut record = RecordedStroke::default();
+        let mut last = None;
+        let mut leftover = 0.0;
+        for (idx, &to) in points.iter().enumerate() {
+            let angle = if idx > 0 {
+                let from = points[idx - 1];
+                (to.1 - from.1).atan2(to.0 - from.0)
+            } else {
+                let next = points[1];
+                (next.1 - to.1).atan2(next.0 - to.0)
+            };
+            let from_u = if idx == 0 { 0.0 } else { progress[idx - 1] };
+            let from_dyn = DabDynamics {
+                angle,
+                taper: brush.taper.factor_at(from_u),
+                ..Default::default()
+            };
+            let to_dyn = DabDynamics {
+                angle,
+                taper: brush.taper.factor_at(progress[idx]),
+                ..Default::default()
+            };
+            let (l, lo) = doc.stroke_to_dyn(&brush, color, last, from_dyn, to, to_dyn, leftover);
+            record.push(last, from_dyn, to, to_dyn);
+            last = l;
+            leftover = lo;
+        }
+        assert!(taper_replay(&mut doc, &brush, color, &record));
+        let alpha = |x: u32, y: u32| doc.layers[0].pixels[((y * doc.w + x) * 4 + 3) as usize];
+        assert!(alpha(8, 18) > 0, "start tip alpha {}", alpha(8, 18));
+        assert!(alpha(136, 18) > 0, "end tip alpha {}", alpha(136, 18));
+    }
+
+    #[test]
+    fn preview_stroke_renders_taper() {
+        let mut doc = Document::new(144, 36);
+        let brush = Brush {
+            size: 6.0,
+            opacity: 1.0,
+            softness: 0.0,
+            spacing: 0.25,
+            taper: Taper {
+                start: 0.2,
+                end: 0.2,
+                size: 1.0,
+                ..Taper::NONE
+            },
+            ..Default::default()
+        };
+        paint_preview_stroke(&mut doc, &brush, Color::rgb(255, 0, 0));
+        let alpha = |x: u32| doc.layers[0].pixels[((18 * doc.w + x) * 4 + 3) as usize];
+        assert!(alpha(72) > 100, "mid alpha {}", alpha(72));
+        assert!(alpha(8) < alpha(72), "head alpha {}", alpha(8));
+        assert!(alpha(136) < alpha(72), "tail alpha {}", alpha(136));
     }
 
     #[test]
@@ -11619,7 +12067,7 @@ mod tests {
         assert!((drag_size(100.0, 120.0) - 125.0).abs() < 1e-3);
         assert!((drag_size(100.0, -120.0) - 80.0).abs() < 1e-3);
         assert_eq!(drag_size(2.0, -10_000.0), 1.0);
-        assert_eq!(drag_size(150.0, 10_000.0), 200.0);
+        assert_eq!(drag_size(150.0, 10_000.0), 400.0);
         // Zero travel = the untouched base size.
         assert_eq!(drag_size(50.0, 0.0), 50.0);
     }

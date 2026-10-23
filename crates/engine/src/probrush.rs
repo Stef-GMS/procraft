@@ -5,9 +5,12 @@
 //! clean error, never silent garbage. Every format degrades to the same two
 //! things ProCraft understands: parametric settings and a grayscale stamp tip.
 
-use super::brush::{Brush, BrushTip, MAX_LIBRARY_BRUSHES, MAX_TIP_SIDE};
+use super::brush::{Brush, BrushTip, Taper, MAX_LIBRARY_BRUSHES, MAX_TIP_SIDE};
 use crate::brush::open_brush_library;
+use std::collections::HashSet;
 
+mod brush_archive;
+mod bundled;
 mod csp;
 
 /// One imported brush: display name plus ready-to-paint settings.
@@ -17,9 +20,23 @@ pub struct ImportedBrush {
     pub brush: Brush,
 }
 
+/// Result of importing a file: usable brushes plus anything that was skipped.
+#[derive(Clone, Debug, Default)]
+pub struct ImportOutcome {
+    pub brushes: Vec<ImportedBrush>,
+    pub warnings: Vec<String>,
+    pub skipped: usize,
+}
+
 /// Hard caps: files above this are rejected before parsing.
 const MAX_FILE_BYTES: usize = 200 * 1024 * 1024;
 const MAX_ZIP_UNPACKED: u64 = 200 * 1024 * 1024;
+
+/// Third-party brushes start at the scale of ProCraft's largest built-in
+/// default (64 px). A batch is scaled uniformly so its relative size
+/// hierarchy survives. ProCraft's own `.pcbrush` files keep their authored
+/// sizes instead, so re-exporting a brush never changes it.
+const IMPORTED_BRUSH_DEFAULT_MAX: f32 = 64.0;
 
 fn read_capped(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
@@ -77,7 +94,56 @@ fn fit_tip(w: u32, h: u32, mask: Vec<u8>) -> (u32, u32, Vec<u8>) {
     (nw, nh, out)
 }
 
+/// Trim fully transparent rows and columns around a mask.
+fn trim_mask(w: u32, h: u32, mask: Vec<u8>) -> Result<(u32, u32, Vec<u8>), String> {
+    if w == 0 || h == 0 || mask.len() != (w * h) as usize {
+        return Err("brush tip has corrupt pixels".to_string());
+    }
+    let (mut min_x, mut min_y) = (w, h);
+    let (mut max_x, mut max_y) = (0, 0);
+    for y in 0..h {
+        for x in 0..w {
+            if mask[(y * w + x) as usize] > 0 {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if min_x > max_x || min_y > max_y {
+        return Err("tip image is empty".to_string());
+    }
+    let (nw, nh) = (max_x - min_x + 1, max_y - min_y + 1);
+    let mut out = vec![0u8; (nw * nh) as usize];
+    for y in 0..nh {
+        let src = ((min_y + y) * w + min_x) as usize;
+        let dst = (y * nw) as usize;
+        out[dst..dst + nw as usize].copy_from_slice(&mask[src..src + nw as usize]);
+    }
+    Ok((nw, nh, out))
+}
+
 /// Build the stamp brush every importer converges on.
+const DEFAULT_PROCREATE_TIP_SIDE: u32 = 256;
+
+fn procedural_round_tip(side: u32) -> (u32, u32, Vec<u8>) {
+    let side = side.max(2);
+    let radius = side as f32 * 0.5;
+    let feather = 1.5 / radius;
+    let mut mask = Vec::with_capacity((side * side) as usize);
+    for y in 0..side {
+        for x in 0..side {
+            let dx = x as f32 + 0.5 - radius;
+            let dy = y as f32 + 0.5 - radius;
+            let d = (dx * dx + dy * dy).sqrt() / radius;
+            let alpha = ((1.0 - d) / feather).clamp(0.0, 1.0);
+            mask.push((alpha * 255.0).round() as u8);
+        }
+    }
+    (side, side, mask)
+}
+
 fn stamp_brush(
     name: String,
     w: u32,
@@ -133,6 +199,11 @@ fn cap_list(mut list: Vec<ImportedBrush>) -> Result<Vec<ImportedBrush>, String> 
 /// `.pcbrush`/`.json`, `.abr`, `.brush`/`.brushset`, `.kpp`/`.bundle`,
 /// `.sut`, `.gbr`, or tip images (png/jpg/webp/bmp/gif/tiff).
 pub fn import_brush_file(path: &std::path::Path) -> Result<Vec<ImportedBrush>, String> {
+    import_brush_file_report(path).map(|outcome| outcome.brushes)
+}
+
+/// Like [`import_brush_file`], but keeps warnings and skipped-entry counts.
+pub fn import_brush_file_report(path: &std::path::Path) -> Result<ImportOutcome, String> {
     let bytes = read_capped(path)?;
     if bytes.is_empty() {
         return Err("brush file is empty".to_string());
@@ -143,28 +214,66 @@ pub fn import_brush_file(path: &std::path::Path) -> Result<Vec<ImportedBrush>, S
         .unwrap_or("")
         .to_ascii_lowercase();
     let stem = file_stem(path);
-    match ext.as_str() {
+    let mut outcome = match ext.as_str() {
         "pcbrush" | "json" => {
             let libs = open_brush_library(path)?;
-            cap_list(
+            let total = libs.len();
+            let brushes = cap_list(
                 libs.into_iter()
                     .map(|p| ImportedBrush {
                         name: p.name,
                         brush: p.brush,
                     })
                     .collect(),
-            )
+            )?;
+            let mut warnings = Vec::new();
+            let skipped = total.saturating_sub(brushes.len());
+            if skipped > 0 {
+                warnings.push(format!(
+                    "Skipped {skipped} presets after the {MAX_LIBRARY_BRUSHES} brush limit."
+                ));
+            }
+            // ProCraft-authored libraries round-trip exactly.
+            return Ok(ImportOutcome {
+                brushes,
+                warnings,
+                skipped,
+            });
         }
-        "abr" => import_abr(&bytes),
-        "brush" | "brushset" => import_procreate(&bytes, &stem),
-        "kpp" => import_kpp(path, &bytes, &stem),
-        "bundle" => import_krita_bundle(&bytes),
-        "sut" => csp::import_sut(&bytes, &stem),
-        "gbr" => import_gbr(&bytes, &stem),
+        "abr" => import_abr_report(&bytes)?,
+        "brush" | "brushset" => outcome_from_brushes(import_procreate(&bytes, &stem)?),
+        "kpp" => outcome_from_brushes(import_kpp(path, &bytes, &stem)?),
+        "bundle" => import_krita_bundle_report(&bytes)?,
+        "sut" => outcome_from_brushes(csp::import_sut(&bytes, &stem)?),
+        "gbr" => outcome_from_brushes(import_gbr(&bytes, &stem)?),
         "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "tif" | "tiff" => {
-            import_image_tip(&bytes, &stem)
+            outcome_from_brushes(import_image_tip(&bytes, &stem)?)
         }
-        _ => Err(format!("unsupported brush file type '.{ext}'")),
+        _ => return Err(format!("unsupported brush file type '.{ext}'")),
+    };
+    normalize_imported_sizes(&mut outcome.brushes);
+    Ok(outcome)
+}
+
+fn outcome_from_brushes(brushes: Vec<ImportedBrush>) -> ImportOutcome {
+    ImportOutcome {
+        brushes,
+        warnings: Vec::new(),
+        skipped: 0,
+    }
+}
+
+fn normalize_imported_sizes(brushes: &mut [ImportedBrush]) {
+    let max = brushes
+        .iter()
+        .map(|imported| imported.brush.size)
+        .fold(0.0_f32, f32::max);
+    if !max.is_finite() || max <= IMPORTED_BRUSH_DEFAULT_MAX {
+        return;
+    }
+    let scale = IMPORTED_BRUSH_DEFAULT_MAX / max;
+    for imported in brushes {
+        imported.brush.size = (imported.brush.size * scale).clamp(1.0, IMPORTED_BRUSH_DEFAULT_MAX);
     }
 }
 
@@ -331,7 +440,8 @@ fn import_gbr(bytes: &[u8], stem: &str) -> Result<Vec<ImportedBrush>, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Plain tip images (PNG/JPG/WebP/BMP/GIF/TIFF): luminance x alpha as mask.
+// Plain tip images (PNG/JPG/WebP/BMP/GIF/TIFF): alpha shape, otherwise
+// luminance with polarity inferred from the border.
 // ---------------------------------------------------------------------------
 
 fn import_image_tip(bytes: &[u8], stem: &str) -> Result<Vec<ImportedBrush>, String> {
@@ -341,11 +451,33 @@ fn import_image_tip(bytes: &[u8], stem: &str) -> Result<Vec<ImportedBrush>, Stri
     if w == 0 || h == 0 || w > 4096 || h > 4096 {
         return Err("tip image has bad dimensions".to_string());
     }
+    let has_alpha = rgba.pixels().any(|p| p[3] < 250);
+    let (mut min_luma, mut max_luma) = (255u32, 0u32);
+    let (mut border_sum, mut border_n) = (0u64, 0u64);
+    for y in 0..h {
+        for x in 0..w {
+            let p = rgba.get_pixel(x, y);
+            let luma = (299u32 * p[0] as u32 + 587 * p[1] as u32 + 114 * p[2] as u32) / 1000;
+            min_luma = min_luma.min(luma);
+            max_luma = max_luma.max(luma);
+            if x == 0 || y == 0 || x + 1 == w || y + 1 == h {
+                border_sum += luma as u64;
+                border_n += 1;
+            }
+        }
+    }
+    let light_border = border_n > 0 && border_sum / border_n >= 128;
+    let invert = !has_alpha && light_border && max_luma.saturating_sub(min_luma) > 8;
     let mut mask = Vec::with_capacity((w * h) as usize);
     for p in rgba.pixels() {
-        let luma = (299u32 * p[0] as u32 + 587 * p[1] as u32 + 114 * p[2] as u32) / 1000;
-        mask.push(((luma * p[3] as u32) / 255) as u8);
+        if has_alpha {
+            mask.push(p[3]);
+        } else {
+            let luma = (299u32 * p[0] as u32 + 587 * p[1] as u32 + 114 * p[2] as u32) / 1000;
+            mask.push(if invert { 255 - luma as u8 } else { luma as u8 });
+        }
     }
+    let (w, h, mask) = trim_mask(w, h, mask)?;
     cap_list(vec![stamp_brush(
         clean_name(stem, "Image tip"),
         w,
@@ -372,6 +504,28 @@ fn decode_png_mask(png: &[u8], white_is_ink: bool) -> Result<(u32, u32, Vec<u8>)
     Ok((w, h, mask))
 }
 
+/// Decode a generic image (PNG/JPG/WebP/BMP/GIF/TIFF) into a grayscale mask.
+/// `white_is_ink` determines whether white pixels (255) are treated as ink or as transparency.
+pub(super) fn decode_image_mask(
+    bytes: &[u8],
+    white_is_ink: bool,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    let img = image::load_from_memory(bytes)
+        .map_err(|_| "embedded image is unreadable".to_string())?
+        .to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+        return Err("embedded image has bad dimensions".to_string());
+    }
+    let mut mask = Vec::with_capacity((w * h) as usize);
+    for p in img.pixels() {
+        let luma = (299u32 * p[0] as u32 + 587 * p[1] as u32 + 114 * p[2] as u32) / 1000;
+        let ink = if white_is_ink { luma } else { 255 - luma };
+        mask.push(((ink * p[3] as u32) / 255) as u8);
+    }
+    Ok((w, h, mask))
+}
+
 // ---------------------------------------------------------------------------
 // Procreate .brush / .brushset: plain ZIPs; Shape.png is the tip, white ink.
 // ---------------------------------------------------------------------------
@@ -380,6 +534,20 @@ fn zip_names(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -> Vec<Strin
     (0..archive.len())
         .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
         .collect()
+}
+
+fn is_procreate_junk(name: &str) -> bool {
+    let path = name.replace('\\', "/");
+    if path
+        .split('/')
+        .any(|part| part.eq_ignore_ascii_case("__MACOSX"))
+    {
+        return true;
+    }
+    path.rsplit('/')
+        .next()
+        .map(|file| file.starts_with("._") || file.eq_ignore_ascii_case(".DS_Store"))
+        .unwrap_or(false)
 }
 
 fn brush_name_from_entry(entry: &str, fallback: &str) -> String {
@@ -392,6 +560,287 @@ fn brush_name_from_entry(entry: &str, fallback: &str) -> String {
         }
     }
     clean_name(fallback, "Procreate brush")
+}
+
+fn brush_archive_sibling(names: &[String], shape_name: &str, file: &str) -> Option<String> {
+    let shape = shape_name.replace('\\', "/");
+    let dir = shape.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let want = if dir.is_empty() {
+        file.to_ascii_lowercase()
+    } else {
+        format!("{}/{}", dir.to_ascii_lowercase(), file.to_ascii_lowercase())
+    };
+    names
+        .iter()
+        .find(|name| name.replace('\\', "/").to_ascii_lowercase() == want)
+        .cloned()
+}
+
+fn find_bundle_tip(names: &[String], requested: &str) -> Option<String> {
+    let want = requested
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_ascii_lowercase();
+    if want.is_empty() {
+        return None;
+    }
+    let normalized: Vec<(String, &String)> = names
+        .iter()
+        .map(|name| (name.replace('\\', "/").to_ascii_lowercase(), name))
+        .collect();
+    if let Some((_, name)) = normalized.iter().find(|(lower, _)| *lower == want) {
+        return Some((*name).clone());
+    }
+    let suffix = format!("/{want}");
+    if let Some((_, name)) = normalized
+        .iter()
+        .find(|(lower, _)| lower.ends_with(&suffix))
+    {
+        return Some((*name).clone());
+    }
+    let base = want.rsplit('/').next().unwrap_or(&want);
+    let mut matches = normalized
+        .iter()
+        .filter(|(lower, _)| lower.rsplit('/').next() == Some(base))
+        .map(|(_, name)| (*name).clone());
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
+/// Load a bundled Procreate asset that the `.brushset` happens to ship.
+///
+/// Most sets only name the asset (`bundledGrainPath`), because it lives inside
+/// the Procreate app. A few include a copy next to the brush; when the exact
+/// file is there it beats any approximation, so decode it instead.
+fn read_bundled_asset(
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    names: &[String],
+    requested: &str,
+    white_is_ink: bool,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let entry = find_bundle_tip(names, requested)?;
+    let bytes = read_zip_entry(archive, &entry)?;
+    decode_image_mask(&bytes, white_is_ink).ok()
+}
+
+fn read_zip_entry(
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    name: &str,
+) -> Option<Vec<u8>> {
+    let mut file = archive.by_name(name).ok()?;
+    if file.size() > MAX_ZIP_UNPACKED {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    file.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+fn brush_archive_spacing(raw: f32) -> Option<f32> {
+    if !raw.is_finite() || raw <= 0.0 {
+        return None;
+    }
+    let percent = (72.943 * raw.clamp(0.0, 2.0).powf(0.4558)).round();
+    Some((percent / 100.0).clamp(0.01, 2.0))
+}
+
+fn brush_archive_grain_scale(raw: f32) -> Option<f32> {
+    if !raw.is_finite() || raw < 0.0 {
+        return None;
+    }
+    // Procreate exposes grain scale as round(25 * sqrt(raw)) over 0..=16;
+    // map that GUI percentage onto the engine's 0.25 (fine) ..= 4.0 (coarse).
+    let gui = 25.0 * raw.clamp(0.0, 16.0).sqrt() / 100.0;
+    Some((0.25 + gui * 3.75).clamp(0.25, 4.0))
+}
+
+/// Attach a grain texture to a Procreate brush.
+///
+/// The brush's own `Grain.png` wins. Otherwise the archive may name a
+/// Procreate built-in grain (`bundledGrainPath`); those assets ship with the
+/// app rather than the brush, so they are reproduced clean-room.
+fn attach_procreate_grain(
+    imported: &mut ImportedBrush,
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    names: &[String],
+    entry: &str,
+    settings: Option<&brush_archive::BrushArchiveSettings>,
+) {
+    if let Some(grain_name) = brush_archive_sibling(names, entry, "Grain.png") {
+        if let Some(png) = read_zip_entry(archive, &grain_name) {
+            if let Ok((gw, gh, gmask)) = decode_png_mask(&png, true) {
+                let (gw, gh, gmask) = fit_tip(gw, gh, gmask);
+                if let Ok(grain) = BrushTip::from_mask(gw, gh, gmask) {
+                    imported.brush.grain_tip = Some(grain);
+                    return;
+                }
+            }
+        }
+    }
+    if imported.brush.grain_tip.is_some() {
+        return;
+    }
+    let Some(settings) = settings else {
+        return;
+    };
+    let Some(grain_path) = settings.string("bundledGrainPath") else {
+        return;
+    };
+    if grain_path.is_empty() || grain_path == "$null" {
+        return;
+    }
+    if let Some((gw, gh, gmask)) = read_bundled_asset(archive, names, grain_path, true) {
+        let (gw, gh, gmask) = fit_tip(gw, gh, gmask);
+        if let Ok(grain) = BrushTip::from_mask(gw, gh, gmask) {
+            imported.brush.grain_tip = Some(grain);
+            return;
+        }
+    }
+    let (gw, gh, gmask) = bundled::bundled_grain(grain_path, DEFAULT_PROCREATE_TIP_SIDE, 1.0);
+    if let Ok(grain) = BrushTip::from_mask(gw, gh, gmask) {
+        imported.brush.grain_tip = Some(grain);
+    }
+}
+
+fn apply_brush_archive_settings(
+    imported: &mut ImportedBrush,
+    settings: &brush_archive::BrushArchiveSettings,
+) {
+    imported.brush.pressure_size = 0.0;
+    imported.brush.pressure_opacity = 0.0;
+    imported.brush.velocity_size = 0.0;
+    imported.brush.velocity_opacity = 0.0;
+    if let Some(name) = settings.string("name") {
+        imported.name = clean_name(name.trim_start_matches('/'), &imported.name);
+    }
+    if let Some(raw) = settings.f32("plotSpacing") {
+        if let Some(spacing) = brush_archive_spacing(raw) {
+            imported.brush.spacing = spacing;
+        }
+    }
+    // Procreate stores paintSize as a fraction of its 256 px Shape canvas;
+    // maxSize is only the slider's UI limit, not the current size.
+    if let Some(value) = settings.f32("paintSize") {
+        if value.is_finite() && value > 0.0 {
+            imported.brush.size = (DEFAULT_PROCREATE_TIP_SIDE as f32 * value).clamp(1.0, 400.0);
+        }
+    }
+    if let Some(value) = settings.f32("paintOpacity") {
+        imported.brush.opacity = value.clamp(0.0, 1.0);
+    }
+    if let Some(value) = settings.f32("maxOpacity") {
+        imported.brush.opacity = (imported.brush.opacity * value.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    }
+    if let Some(value) = settings.f32("shapeRoundness") {
+        imported.brush.roundness = value.clamp(0.1, 1.0);
+    }
+    let roundness_jitter = settings
+        .f32("jitterShapeRoundness")
+        .unwrap_or(0.0)
+        .max(settings.f32("jitterShapeRoundnessX").unwrap_or(0.0))
+        .clamp(0.0, 1.0);
+    if roundness_jitter > 0.0 {
+        imported.brush.roundness_jitter = roundness_jitter;
+    }
+    if let Some(value) = settings.f32("dynamicsJitterSize") {
+        imported.brush.size_jitter = value.clamp(0.0, 1.0);
+    }
+    if let Some(value) = settings.f32("dynamicsJitterOpacity") {
+        imported.brush.opacity_jitter = value.clamp(0.0, 1.0);
+    }
+    if let Some(value) = settings.f32("shapeRotation") {
+        imported.brush.shape_rotation = value.clamp(-1.0, 1.0);
+    }
+    if let Some(value) = settings.f32("shapeScatter") {
+        imported.brush.scatter = value.clamp(0.0, 1.0);
+        imported.brush.angle_scatter = (value * 0.5).clamp(0.0, 1.0);
+    }
+    if let Some(value) = settings.f32("shapeCount") {
+        imported.brush.shape_count = (value * 16.0).round().clamp(1.0, 16.0) as u8;
+    }
+    if let Some(value) = settings.f32("shapeCountJitter") {
+        imported.brush.shape_count_jitter = value.clamp(0.0, 1.0);
+    }
+    // Procreate's "Shape Randomise" shuffles which shape is stamped when the
+    // brush carries several shapes. With a single tip it has no effect, so
+    // only single-out a rotation jitter when there are shapes to shuffle.
+    if settings.bool("shapeRandomise").unwrap_or(false)
+        && imported.brush.shape_count > 1
+        && imported.brush.angle_scatter < 1.0
+    {
+        imported.brush.angle_scatter = 1.0;
+    }
+    if let Some(value) = settings.f32("wetEdgesAmount") {
+        imported.brush.wet_edge = value.clamp(0.0, 1.0);
+    }
+    if let Some(value) = settings.f32("grainDepth") {
+        if imported.brush.grain_tip.is_some() {
+            imported.brush.grain = value.clamp(0.0, 1.0);
+        }
+    }
+    // Grain textures are attached by `attach_procreate_grain` before these
+    // settings are applied, so `grainDepth` above is authoritative.
+    if let Some(raw) = settings.f32("textureScale") {
+        if let Some(scale) = brush_archive_grain_scale(raw) {
+            imported.brush.grain_scale = scale;
+        }
+    }
+    if let Some(zoom) = settings.f32("textureZoom") {
+        imported.brush.grain_scale = (imported.brush.grain_scale * zoom).clamp(0.25, 16.0);
+    }
+    let taper_start = settings
+        .f32("taperStartLength")
+        .unwrap_or(0.0)
+        .max(settings.f32("pencilTaperStartLength").unwrap_or(0.0));
+    let taper_end = settings
+        .f32("taperEndLength")
+        .unwrap_or(0.0)
+        .max(settings.f32("pencilTaperEndLength").unwrap_or(0.0));
+    let taper_shape = settings
+        .f32("taperShape")
+        .filter(|value| *value > 0.0)
+        .or_else(|| settings.f32("pencilTaperShape"))
+        .unwrap_or(0.0);
+    let taper_size = match (settings.f32("taperSize"), settings.f32("pencilTaperSize")) {
+        (Some(touch), Some(pencil)) => touch.max(pencil),
+        (Some(value), None) | (None, Some(value)) => value,
+        (None, None) => 1.0,
+    };
+    let taper_opacity = settings
+        .f32("taperOpacity")
+        .unwrap_or(0.0)
+        .max(settings.f32("pencilTaperOpacity").unwrap_or(0.0));
+    let taper_pressure = settings.f32("taperPressure").unwrap_or(0.0);
+    imported.brush.taper = Taper {
+        start: taper_start.clamp(0.0, 1.0),
+        end: taper_end.clamp(0.0, 1.0),
+        size: taper_size.clamp(0.0, 1.0),
+        shape: taper_shape.clamp(0.0, 1.0),
+        opacity: taper_opacity.clamp(0.0, 1.0),
+        pressure: taper_pressure.clamp(0.0, 1.0),
+    };
+    if let Some(value) = settings.f32("dynamicsPressureSize") {
+        imported.brush.pressure_size = value.clamp(-1.0, 1.0);
+    }
+    if let Some(value) = settings.f32("dynamicsPressureOpacity") {
+        imported.brush.pressure_opacity = value.clamp(-1.0, 1.0);
+    }
+    if let Some(value) = settings.f32("dynamicsSpeedSize") {
+        imported.brush.velocity_size = value.clamp(0.0, 1.0);
+    }
+    if let Some(value) = settings.f32("dynamicsSpeedOpacity") {
+        imported.brush.velocity_opacity = value.clamp(0.0, 1.0);
+    }
+    if let Some(curve) = settings.pressure_size_curve() {
+        imported.brush.pressure_curve = Some(curve);
+    }
+    if let Some(curve) = settings.pressure_opacity_curve() {
+        imported.brush.pressure_opacity_curve = Some(curve);
+    }
 }
 
 fn import_procreate(bytes: &[u8], stem: &str) -> Result<Vec<ImportedBrush>, String> {
@@ -414,8 +863,12 @@ fn import_procreate_recursive(
     }
     let names = zip_names(&mut archive);
     let mut list = Vec::new();
+    let mut seen = HashSet::new();
     for name in &names {
         let lower = name.to_ascii_lowercase().replace('\\', "/");
+        if is_procreate_junk(&lower) || !seen.insert(lower.clone()) {
+            continue;
+        }
         let is_shape = lower
             .rsplit('/')
             .next()
@@ -433,9 +886,74 @@ fn import_procreate_recursive(
             f.read_to_end(&mut png)
                 .map_err(|_| "brush archive is corrupt".to_string())?;
             drop(f);
-            let (w, h, mask) = decode_png_mask(&png, true)?;
+            let archive_name = brush_archive_sibling(&names, name, "Brush.archive");
+            let settings = archive_name.as_deref().and_then(|archive_name| {
+                read_zip_entry(&mut archive, archive_name)
+                    .and_then(|bytes| brush_archive::BrushArchiveSettings::parse(&bytes).ok())
+            });
+            let white_is_ink = !settings
+                .as_ref()
+                .and_then(|settings| settings.bool("shapeInverted"))
+                .unwrap_or(false);
+            let (w, h, mask) = decode_png_mask(&png, white_is_ink)?;
             let brush_name = brush_name_from_entry(name, stem);
-            list.push(stamp_brush(brush_name, w, h, mask, 0.15)?);
+            let mut imported = stamp_brush(brush_name, w, h, mask, 0.15)?;
+            attach_procreate_grain(&mut imported, &mut archive, &names, name, settings.as_ref());
+            if let Some(settings) = settings.as_ref() {
+                apply_brush_archive_settings(&mut imported, settings);
+            }
+            list.push(imported);
+            if list.len() >= MAX_LIBRARY_BRUSHES {
+                break;
+            }
+            continue;
+        }
+        // Procreate brushes without a Shape.png use Brush.archive settings and
+        // the bundled preset shape; fall back to a procedural round tip.
+        let is_archive = lower.rsplit('/').next() == Some("brush.archive")
+            && !lower.split('/').any(|part| part == "reset");
+        if is_archive {
+            if brush_archive_sibling(&names, name, "Shape.png").is_some() {
+                continue;
+            }
+            let Some(archive_bytes) = read_zip_entry(&mut archive, name) else {
+                continue;
+            };
+            let settings = brush_archive::BrushArchiveSettings::parse(&archive_bytes).ok();
+            let brush_name = settings
+                .as_ref()
+                .and_then(|settings| settings.string("name"))
+                .map(|name| clean_name(name, "Procreate brush"))
+                .unwrap_or_else(|| brush_name_from_entry(name, stem));
+            let inverted = settings
+                .as_ref()
+                .and_then(|settings| settings.bool("shapeInverted"))
+                .unwrap_or(false);
+            let (w, h, mask) = match settings
+                .as_ref()
+                .and_then(|settings| settings.string("bundledShapePath"))
+            {
+                Some(path) => match read_bundled_asset(&mut archive, &names, path, !inverted) {
+                    Some(asset) => asset,
+                    None => {
+                        let (w, h, mut mask) =
+                            bundled::bundled_shape(path, DEFAULT_PROCREATE_TIP_SIDE);
+                        if inverted {
+                            for value in &mut mask {
+                                *value = 255 - *value;
+                            }
+                        }
+                        (w, h, mask)
+                    }
+                },
+                None => procedural_round_tip(DEFAULT_PROCREATE_TIP_SIDE),
+            };
+            let mut imported = stamp_brush(brush_name, w, h, mask, 0.15)?;
+            attach_procreate_grain(&mut imported, &mut archive, &names, name, settings.as_ref());
+            if let Some(settings) = settings.as_ref() {
+                apply_brush_archive_settings(&mut imported, settings);
+            }
+            list.push(imported);
             if list.len() >= MAX_LIBRARY_BRUSHES {
                 break;
             }
@@ -688,6 +1206,21 @@ fn import_kpp_bytes(
     fallback: &str,
     dir: Option<&std::path::Path>,
 ) -> Result<Vec<ImportedBrush>, String> {
+    import_kpp_with_tip(bytes, fallback, |fname| {
+        let dir = dir?;
+        let raw = std::fs::read(dir.join(fname.trim())).ok()?;
+        (raw.len() <= MAX_FILE_BYTES).then_some(raw)
+    })
+}
+
+fn import_kpp_with_tip<F>(
+    bytes: &[u8],
+    fallback: &str,
+    mut resolve_tip: F,
+) -> Result<Vec<ImportedBrush>, String>
+where
+    F: FnMut(&str) -> Option<Vec<u8>>,
+{
     let chunks = png_text_chunks(bytes)?;
     let xml_bytes = chunks
         .iter()
@@ -714,16 +1247,11 @@ fn import_kpp_bytes(
     // Stamp brush referenced by file (e.g. masking/texture tips): resolve
     // against the .kpp's own directory when possible.
     if let Some(fname) = tag_attr(&xml, "Brush", "filename") {
-        if let Some(d) = dir {
-            let cand = d.join(fname.trim());
-            if let Ok(raw) = std::fs::read(&cand) {
-                if raw.len() <= MAX_FILE_BYTES {
-                    if let Ok((w, h, mask)) =
-                        decode_png_mask(&raw, true).or_else(|_| decode_png_mask(&raw, false))
-                    {
-                        return cap_list(vec![stamp_brush(name, w, h, mask, spacing)?]);
-                    }
-                }
+        if let Some(raw) = resolve_tip(fname.trim()) {
+            if let Ok((w, h, mask)) =
+                decode_png_mask(&raw, true).or_else(|_| decode_png_mask(&raw, false))
+            {
+                return cap_list(vec![stamp_brush(name, w, h, mask, spacing)?]);
             }
         }
     }
@@ -763,7 +1291,12 @@ fn import_kpp(
 }
 
 /// Krita `.bundle`: ZIP of many `.kpp` files under `paintoppresets/`.
+#[cfg(test)]
 fn import_krita_bundle(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
+    import_krita_bundle_report(bytes).map(|outcome| outcome.brushes)
+}
+
+fn import_krita_bundle_report(bytes: &[u8]) -> Result<ImportOutcome, String> {
     let cursor = std::io::Cursor::new(bytes);
     let mut archive =
         zip::ZipArchive::new(cursor).map_err(|_| "not a Krita bundle file".to_string())?;
@@ -771,15 +1304,25 @@ fn import_krita_bundle(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
         return Err("bundle lists too many files".to_string());
     }
     let names = zip_names(&mut archive);
+    let kpp_total = names
+        .iter()
+        .filter(|name| name.to_ascii_lowercase().ends_with(".kpp"))
+        .count();
     let mut list = Vec::new();
+    let mut warnings = Vec::new();
+    let mut skipped = 0usize;
+    let mut processed = 0usize;
     for name in &names {
         if !name.to_ascii_lowercase().ends_with(".kpp") {
             continue;
         }
+        processed += 1;
         let mut f = archive
             .by_name(name)
             .map_err(|_| "bundle is corrupt".to_string())?;
         if f.size() > MAX_ZIP_UNPACKED {
+            skipped += 1;
+            warnings.push(format!("Skipped '{name}': file is too large."));
             continue;
         }
         let mut raw = Vec::new();
@@ -797,18 +1340,37 @@ fn import_krita_bundle(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
             .strip_suffix(".kpp")
             .or_else(|| stem.strip_suffix(".KPP"))
             .unwrap_or(&stem);
-        match import_kpp_bytes(&raw, stem, None) {
+        let outcome = import_kpp_with_tip(&raw, stem, |fname| {
+            let candidate = find_bundle_tip(&names, fname)?;
+            let raw = read_zip_entry(&mut archive, &candidate)?;
+            (raw.len() <= MAX_FILE_BYTES).then_some(raw)
+        });
+        match outcome {
             Ok(mut inner) => list.append(&mut inner),
-            Err(_) => continue, // one bad preset must not sink the bundle
+            Err(err) => {
+                skipped += 1;
+                warnings.push(format!("Skipped '{stem}': {err}."));
+            }
         }
         if list.len() >= MAX_LIBRARY_BRUSHES {
+            let remaining = kpp_total.saturating_sub(processed);
+            if remaining > 0 {
+                skipped += remaining;
+                warnings.push(format!(
+                    "Skipped {remaining} presets after the {MAX_LIBRARY_BRUSHES} brush limit."
+                ));
+            }
             break;
         }
     }
     if list.is_empty() {
         return Err("no usable presets found in bundle".to_string());
     }
-    cap_list(list)
+    Ok(ImportOutcome {
+        brushes: cap_list(list)?,
+        warnings,
+        skipped,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -816,8 +1378,11 @@ fn import_krita_bundle(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
 // the public reverse-engineered v6 layout (38-byte `$`-UUID, subversion-sized
 // padding, bounds, 8/16-bit depth, raw/PackBits data); real brush names,
 // spacing and diameter come from the 'desc' descriptors via UUID linkage.
-// Anything off-spec is a clean error.
+// Oversized source tips are downscaled to MAX_TIP_SIDE. Anything off-spec is
+// a clean error.
 // ---------------------------------------------------------------------------
+
+const MAX_ABR_SOURCE_TIP_SIDE: u32 = MAX_TIP_SIDE * 16;
 
 /// Photoshop PackBits rows: `h` u16 row byte-counts, then PackBits streams.
 fn unpack_packbits(data: &[u8], w: u32, h: u32, sample_bytes: u32) -> Result<Vec<u8>, String> {
@@ -905,7 +1470,12 @@ fn norm_uuid(raw: &[u8]) -> String {
         .to_ascii_lowercase()
 }
 
+#[cfg(test)]
 fn import_abr(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
+    import_abr_report(bytes).map(|outcome| outcome.brushes)
+}
+
+fn import_abr_report(bytes: &[u8]) -> Result<ImportOutcome, String> {
     let mut c = Cursor::new(bytes);
     let version = c.u16be()?;
     if version != 6 && version != 7 && version != 9 && version != 10 {
@@ -922,6 +1492,7 @@ fn import_abr(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
     // Collect (uuid, tip) in file order plus descriptor entries for naming.
     let mut tips: Vec<(String, BrushTip)> = Vec::new();
     let mut descs: Vec<Vec<u8>> = Vec::new();
+    let mut limit_hit = false;
     while c.left() >= 12 {
         if c.take(4)? != b"8BIM" {
             return Err("ABR file is corrupt (bad block signature)".to_string());
@@ -932,13 +1503,14 @@ fn import_abr(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
             return Err("ABR file is truncated".to_string());
         }
         let data = c.take(len)?.to_vec();
-        // Blocks pad to a 4-byte boundary (verified on Photoshop 2026 files).
+        // Blocks pad to a 4-byte boundary, except a final block at EOF.
         let pad = (4 - len % 4) % 4;
-        if pad > 0 {
+        if pad > 0 && c.left() >= pad {
             c.take(pad)?;
         }
         if &key == b"samp" {
             let mut d = Cursor::new(&data);
+            let mut entry_no = 0usize;
             while d.left() > 4 + 38 + header_pad + 16 + 2 {
                 let entry_len = d.u32be()? as usize;
                 let entry_start = d.pos;
@@ -957,7 +1529,7 @@ fn import_abr(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
                 let right = d.i32be()?;
                 let w = right.saturating_sub(left) as u32;
                 let h = bottom.saturating_sub(top) as u32;
-                if w == 0 || h == 0 || w > MAX_TIP_SIDE * 2 || h > MAX_TIP_SIDE * 2 {
+                if w == 0 || h == 0 || w > MAX_ABR_SOURCE_TIP_SIDE || h > MAX_ABR_SOURCE_TIP_SIDE {
                     return Err("ABR tip has bad dimensions".to_string());
                 }
                 let depth = d.u16be()?;
@@ -991,7 +1563,11 @@ fn import_abr(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
                         if payload_len == 0 || d.left() < payload_len {
                             payload_len = d.left();
                         }
-                        let raw = unpack_packbits(d.take(payload_len)?, w, h, sample_bytes)?;
+                        let payload = d
+                            .take(payload_len)
+                            .map_err(|e| format!("ABR tip {entry_no} payload: {e}"))?;
+                        let raw = unpack_packbits(payload, w, h, sample_bytes)
+                            .map_err(|e| format!("ABR tip {entry_no} RLE: {e}"))?;
                         if sample_bytes == 1 {
                             raw
                         } else {
@@ -1010,10 +1586,13 @@ fn import_abr(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
                     d.take(4 - misalign)?;
                 }
                 let (w, h, mask) = fit_tip(w, h, mask);
-                tips.push((uuid, BrushTip::from_mask(w, h, mask)?));
-                if tips.len() >= MAX_LIBRARY_BRUSHES {
+                if tips.len() < MAX_LIBRARY_BRUSHES {
+                    tips.push((uuid, BrushTip::from_mask(w, h, mask)?));
+                } else {
+                    limit_hit = true;
                     break;
                 }
+                entry_no += 1;
             }
         } else if &key == b"desc" {
             // Descriptor data is a nested tree (version + BrshVlLs list +
@@ -1024,11 +1603,6 @@ fn import_abr(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
             // brush (sub-objects like dual-brush serialize later).
             descs.push(data);
         }
-    }
-    if tips.is_empty() {
-        return Err(
-            "no readable tips in ABR file (computed-only sets carry no bitmaps)".to_string(),
-        );
     }
     // Name/size/spacing from descriptors via UUID linkage.
     let mut names: Vec<Option<String>> = vec![None; tips.len()];
@@ -1078,6 +1652,57 @@ fn import_abr(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
             }
         }
     }
+    let mut warnings = Vec::new();
+    let mut skipped = 0usize;
+    if tips.is_empty() {
+        if found_names.is_empty() {
+            return Err("no readable tips or presets in ABR file".to_string());
+        }
+        let mut list = Vec::with_capacity(found_names.len());
+        for (n, name) in found_names.iter().enumerate() {
+            let dm = found_dmtrs
+                .get(n)
+                .copied()
+                .or(found_dmtrs.first().copied())
+                .unwrap_or(24.0) as f32;
+            let size = if dm.is_finite() && (1.0..=1024.0).contains(&dm) {
+                dm
+            } else {
+                24.0
+            };
+            let sp = found_spcns
+                .get(n)
+                .copied()
+                .or(found_spcns.first().copied())
+                .unwrap_or(25.0);
+            let sp = (sp / 100.0) as f32;
+            let spacing = if sp.is_finite() && sp > 0.0 && sp <= 2.0 {
+                sp
+            } else {
+                0.25
+            };
+            list.push(ImportedBrush {
+                name: name.clone(),
+                brush: Brush {
+                    size,
+                    opacity: 1.0,
+                    softness: 0.0,
+                    spacing,
+                    eraser: false,
+                    tip: None,
+                    ..Brush::default()
+                },
+            });
+        }
+        warnings.push("ABR has no sampled tips; imported parametric presets instead.".to_string());
+        let brushes = cap_list(list)?;
+        return Ok(ImportOutcome {
+            brushes,
+            warnings,
+            skipped,
+        });
+    }
+    let mut matched = vec![false; found_names.len()];
     for (n, name) in found_names.iter().enumerate() {
         let uuid = found_uuids.get(n);
         let slot = uuid
@@ -1096,6 +1721,7 @@ fn import_abr(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
             });
         if let Some(i) = slot {
             if i < tips.len() {
+                matched[n] = true;
                 names[i] = Some(name.clone());
                 let dm = found_dmtrs
                     .get(n)
@@ -1117,6 +1743,17 @@ fn import_abr(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
             }
         }
     }
+    for (n, name) in found_names.iter().enumerate() {
+        if !matched[n] {
+            skipped += 1;
+            warnings.push(format!("Skipped preset '{name}': no sampled tip."));
+        }
+    }
+    if limit_hit {
+        warnings.push(format!(
+            "Stopped after {MAX_LIBRARY_BRUSHES} tips; later tips were skipped."
+        ));
+    }
     let mut list = Vec::with_capacity(tips.len());
     for (i, (uuid, tip)) in tips.into_iter().enumerate() {
         let _ = uuid;
@@ -1135,7 +1772,11 @@ fn import_abr(bytes: &[u8]) -> Result<Vec<ImportedBrush>, String> {
             },
         });
     }
-    cap_list(list)
+    Ok(ImportOutcome {
+        brushes: cap_list(list)?,
+        warnings,
+        skipped,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,6 +1910,55 @@ mod tests {
         assert!(import_gbr(&bad, "stem").is_err());
     }
 
+    fn png_from(img: &image::RgbaImage) -> Vec<u8> {
+        let mut buf = Vec::new();
+        use image::ImageEncoder;
+        image::codecs::png::PngEncoder::new(&mut buf)
+            .write_image(
+                img.as_raw(),
+                img.width(),
+                img.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn image_tip_trims_transparent_padding() {
+        let mut img = image::RgbaImage::from_pixel(10, 10, image::Rgba([0, 0, 0, 0]));
+        for y in 4..6 {
+            for x in 4..6 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let list = import_image_tip(&png_from(&img), "Padded").unwrap();
+        let tip = list[0].brush.tip.as_ref().unwrap();
+        assert_eq!((tip.w, tip.h), (2, 2));
+        assert_eq!(tip.mask, vec![255; 4]);
+    }
+
+    #[test]
+    fn image_tip_infers_dark_ink_on_a_light_border() {
+        let mut img = image::RgbaImage::from_pixel(6, 6, image::Rgba([255, 255, 255, 255]));
+        for y in 2..4 {
+            for x in 2..4 {
+                img.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+            }
+        }
+        let list = import_image_tip(&png_from(&img), "Ink").unwrap();
+        let tip = list[0].brush.tip.as_ref().unwrap();
+        assert_eq!((tip.w, tip.h), (2, 2));
+        assert_eq!(tip.mask, vec![255; 4]);
+    }
+
+    #[test]
+    fn image_tip_rejects_an_empty_png() {
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 0]));
+        let err = import_image_tip(&png_from(&img), "Empty").unwrap_err();
+        assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
     #[test]
     fn image_tip_imports_png() {
         let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([200, 100, 50, 255]));
@@ -1311,6 +2001,116 @@ mod tests {
         buf
     }
 
+    fn procreate_archive(entries: &[(&str, plist::Value)]) -> Vec<u8> {
+        let mut root = plist::Dictionary::new();
+        for (key, value) in entries {
+            root.insert((*key).to_string(), value.clone());
+        }
+        let mut top = plist::Dictionary::new();
+        top.insert("root".to_string(), plist::Value::Uid(plist::Uid::new(1)));
+        let mut archive = plist::Dictionary::new();
+        archive.insert(
+            "$archiver".to_string(),
+            plist::Value::String("NSKeyedArchiver".to_string()),
+        );
+        archive.insert("$version".to_string(), plist::Value::from(100000u64));
+        archive.insert("$top".to_string(), plist::Value::Dictionary(top));
+        archive.insert(
+            "$objects".to_string(),
+            plist::Value::Array(vec![
+                plist::Value::String("$null".to_string()),
+                plist::Value::Dictionary(root),
+            ]),
+        );
+        let mut bytes = Vec::new();
+        plist::to_writer_binary(&mut bytes, &plist::Value::Dictionary(archive)).unwrap();
+        bytes
+    }
+
+    fn png_black_center() -> Vec<u8> {
+        let mut img = image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 255, 255, 255]));
+        for y in 4..12 {
+            for x in 4..12 {
+                img.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+            }
+        }
+        let mut buf = Vec::new();
+        use image::ImageEncoder;
+        image::codecs::png::PngEncoder::new(&mut buf)
+            .write_image(&img, 16, 16, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn procreate_shape_uses_archive_size_and_inversion() {
+        let archive = procreate_archive(&[
+            ("name", plist::Value::String("Ink".to_string())),
+            ("paintSize", plist::Value::Real(0.25)),
+            ("dynamicsSpeedSize", plist::Value::Real(0.5)),
+            ("dynamicsSpeedOpacity", plist::Value::Real(0.25)),
+            ("shapeInverted", plist::Value::Boolean(true)),
+        ]);
+        let bytes = zip_with(&[
+            ("Ink/Shape.png", png_black_center()),
+            ("Ink/Brush.archive", archive),
+        ]);
+        let list = import_procreate(&bytes, "Set").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Ink");
+        assert!((list[0].brush.size - 64.0).abs() < 0.01);
+        assert!((list[0].brush.velocity_size - 0.5).abs() < 1e-6);
+        assert!((list[0].brush.velocity_opacity - 0.25).abs() < 1e-6);
+        let tip = list[0].brush.tip.as_ref().unwrap();
+        assert_eq!((tip.w, tip.h), (16, 16));
+        assert!(tip.mask[8 * 16 + 8] > 240);
+        assert!(tip.mask[0] < 15);
+    }
+
+    #[test]
+    fn procreate_archive_without_shape_uses_round_tip() {
+        let archive = procreate_archive(&[
+            ("name", plist::Value::String("Pencil".to_string())),
+            ("paintSize", plist::Value::Real(0.25)),
+            ("grainDepth", plist::Value::Real(1.0)),
+        ]);
+        let bytes = zip_with(&[
+            ("Pencil/Brush.archive", archive.clone()),
+            ("Pencil/Reset/Brush.archive", archive),
+        ]);
+        let list = import_procreate(&bytes, "Set").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Pencil");
+        assert!((list[0].brush.size - 64.0).abs() < 0.01);
+        assert_eq!(list[0].brush.grain, 0.0);
+        assert!(list[0].brush.grain_tip.is_none());
+        let tip = list[0].brush.tip.as_ref().unwrap();
+        assert_eq!(
+            (tip.w, tip.h),
+            (DEFAULT_PROCREATE_TIP_SIDE, DEFAULT_PROCREATE_TIP_SIDE)
+        );
+        let center = (tip.w * tip.h / 2 + tip.w / 2) as usize;
+        assert!(tip.mask[center] > 240);
+        assert!(tip.mask[0] < 15);
+    }
+
+    #[test]
+    fn procreate_grain_depth_requires_grain_texture() {
+        let archive = procreate_archive(&[
+            ("name", plist::Value::String("Chalk".to_string())),
+            ("grainDepth", plist::Value::Real(0.5)),
+        ]);
+        let bytes = zip_with(&[
+            ("Chalk/Shape.png", png_black_center()),
+            ("Chalk/Grain.png", png_black_center()),
+            ("Chalk/Brush.archive", archive),
+        ]);
+        let list = import_procreate(&bytes, "Set").unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].brush.grain_tip.is_some());
+        assert!((list[0].brush.grain - 0.5).abs() < 1e-6);
+    }
+
     #[test]
     fn procreate_brush_and_set_import() {
         let shape = png_of([255, 255, 255, 255], 6, 6);
@@ -1330,10 +2130,27 @@ mod tests {
         let mut names: Vec<String> = list.iter().map(|b| b.name.clone()).collect();
         names.sort();
         assert_eq!(names, vec!["Chalk".to_string(), "Ink".to_string()]);
+        let ink = list.iter().find(|b| b.name == "Ink").unwrap();
+        assert!(ink.brush.grain_tip.is_some());
         // No shape at all.
         let bytes = zip_with(&[("Grain.png", shape)]);
         assert!(import_procreate(&bytes, "Empty").is_err());
         assert!(import_procreate(b"not a zip", "x").is_err());
+    }
+
+    #[test]
+    fn procreate_ignores_mac_metadata_and_duplicate_shapes() {
+        let shape = png_of([255, 255, 255, 255], 6, 6);
+        let bytes = zip_with(&[
+            ("Ink/Shape.png", shape.clone()),
+            ("Ink/Shape.PNG", shape.clone()),
+            ("__MACOSX/Ink/Shape.png", shape.clone()),
+            ("__MACOSX/Ink/._Shape.png", shape.clone()),
+            (".DS_Store", b"junk".to_vec()),
+        ]);
+        let list = import_procreate(&bytes, "Set").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Ink");
     }
 
     fn kpp_bytes(xml: &str) -> Vec<u8> {
@@ -1396,6 +2213,40 @@ mod tests {
     }
 
     #[test]
+    fn krita_bundle_reports_skipped_presets() {
+        let xml = r#"<Preset paintopid="paintbrush" name="Good"><Brush spacing="0.2" type="auto_brush"/></Preset>"#;
+        let bundle = zip_with(&[
+            ("paintoppresets/Good.kpp", kpp_bytes(xml)),
+            ("paintoppresets/Bad.kpp", b"not a preset".to_vec()),
+        ]);
+        let outcome = import_krita_bundle_report(&bundle).unwrap();
+        assert_eq!(outcome.brushes.len(), 1);
+        assert_eq!(outcome.skipped, 1);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.contains("Bad") && w.contains("Skipped")),
+            "warnings: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn krita_bundle_resolves_external_tip_files() {
+        let xml = r#"<Preset name="Textured"><Brush spacing="0.2" type="predefined_brush" filename="brushes/soft.png"><MaskGenerator diameter="20"/></Brush></Preset>"#;
+        let tip = png_of([255, 255, 255, 255], 4, 4);
+        let bundle = zip_with(&[
+            ("paintoppresets/Textured.kpp", kpp_bytes(xml)),
+            ("paintoppresets/brushes/soft.png", tip),
+        ]);
+        let list = import_krita_bundle(&bundle).unwrap();
+        assert_eq!(list.len(), 1);
+        let tip = list[0].brush.tip.as_ref().expect("external tip");
+        assert_eq!((tip.w, tip.h), (4, 4));
+    }
+
+    #[test]
     fn kpp_embedded_tip_import() {
         use base64::Engine;
         // 48x48 gradient PNG embedded as base64 CDATA in the XML.
@@ -1449,6 +2300,42 @@ mod tests {
             samp.extend_from_slice(&vec![0u8; (4 - item.len() % 4) % 4]);
         }
         abr_wrap(&samp)
+    }
+
+    /// v10 subv2 layout: 4-byte length | 38-byte ID | 263-byte pad |
+    /// bounds | depth | compression | data.
+    fn abr_file_v2(tips: &[AbrTip]) -> Vec<u8> {
+        let mut samp = Vec::new();
+        for (uuid, w, h, depth, compression, data) in tips {
+            let mut item = Vec::new();
+            let mut id = vec![b'$'];
+            id.extend_from_slice(uuid);
+            id.push(0);
+            assert_eq!(id.len(), 38);
+            item.extend_from_slice(&id);
+            item.extend_from_slice(&[0u8; 263]);
+            item.extend_from_slice(&0i32.to_be_bytes());
+            item.extend_from_slice(&0i32.to_be_bytes());
+            item.extend_from_slice(&(*h as i32).to_be_bytes());
+            item.extend_from_slice(&(*w as i32).to_be_bytes());
+            item.extend_from_slice(&depth.to_be_bytes());
+            item.push(*compression);
+            item.extend_from_slice(data);
+            samp.extend_from_slice(&(item.len() as u32).to_be_bytes());
+            samp.extend_from_slice(&item);
+            samp.extend_from_slice(&vec![0u8; (4 - item.len() % 4) % 4]);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&10u16.to_be_bytes());
+        out.extend_from_slice(&2u16.to_be_bytes());
+        out.extend_from_slice(b"8BIM");
+        out.extend_from_slice(b"samp");
+        out.extend_from_slice(&(samp.len() as u32).to_be_bytes());
+        out.extend_from_slice(&samp);
+        if samp.len() % 2 == 1 {
+            out.push(0);
+        }
+        out
     }
 
     fn abr_wrap(samp: &[u8]) -> Vec<u8> {
@@ -1596,6 +2483,129 @@ mod tests {
         out.extend_from_slice(b"samp");
         out.extend_from_slice(&0u32.to_be_bytes());
         assert!(import_abr(&out).is_err());
+    }
+
+    #[test]
+    fn abr_allows_unpadded_final_block() {
+        let uuid = b"cccccccc-dddd-eeee-ffff-000000000000".to_vec();
+        let mut bytes = abr_file(&[(uuid, 2, 2, 8, 0, vec![128; 4])]);
+        bytes.extend_from_slice(b"8BIM");
+        bytes.extend_from_slice(b"phry");
+        bytes.extend_from_slice(&3u32.to_be_bytes());
+        bytes.extend_from_slice(&[1, 2, 3]);
+        let list = import_abr(&bytes).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].brush.tip.as_ref().unwrap().mask, vec![128; 4]);
+    }
+
+    #[test]
+    fn abr_v10_large_tip_downscales_instead_of_erroring() {
+        let uuid = b"bbbbbbbb-cccc-dddd-eeee-ffffffffffff".to_vec();
+        let bytes = abr_file_v2(&[(uuid, 600, 600, 8, 0, vec![200; 360_000])]);
+        let list = import_abr(&bytes).unwrap();
+        let tip = list[0].brush.tip.as_ref().unwrap();
+        assert_eq!((tip.w, tip.h), (256, 256));
+        assert!(tip.mask.iter().all(|&b| b == 200));
+    }
+
+    #[test]
+    fn abr_without_tips_reports_parametric_fallback() {
+        let full = abr_file_with_desc();
+        let desc_pos = full.windows(4).position(|w| w == b"desc").unwrap();
+        let desc_len =
+            u32::from_be_bytes(full[desc_pos + 4..desc_pos + 8].try_into().unwrap()) as usize;
+        let desc = &full[desc_pos + 8..desc_pos + 8 + desc_len];
+        let mut out = Vec::new();
+        out.extend_from_slice(&6u16.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(b"8BIM");
+        out.extend_from_slice(b"desc");
+        out.extend_from_slice(&(desc.len() as u32).to_be_bytes());
+        out.extend_from_slice(desc);
+        if desc.len() % 2 == 1 {
+            out.push(0);
+        }
+        let outcome = import_abr_report(&out).unwrap();
+        assert_eq!(outcome.brushes.len(), 1);
+        assert_eq!(outcome.brushes[0].name, "Soft Round");
+        assert_eq!(outcome.brushes[0].brush.size, 33.0);
+        assert!((outcome.brushes[0].brush.spacing - 0.5).abs() < 0.001);
+        assert!(outcome.brushes[0].brush.tip.is_none());
+        assert!(
+            outcome.warnings.iter().any(|w| w.contains("parametric")),
+            "warnings: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn imported_size_normalization_preserves_ratios() {
+        let mut brushes: Vec<ImportedBrush> = [600.0, 300.0, 100.0]
+            .into_iter()
+            .map(|size| ImportedBrush {
+                name: format!("Brush {size}"),
+                brush: Brush {
+                    size,
+                    ..Brush::default()
+                },
+            })
+            .collect();
+        normalize_imported_sizes(&mut brushes);
+        assert!((brushes[0].brush.size - 64.0).abs() < 1e-4);
+        assert!((brushes[1].brush.size - 32.0).abs() < 1e-4);
+        assert!((brushes[2].brush.size - (64.0 / 6.0)).abs() < 1e-4);
+
+        let mut small = vec![
+            ImportedBrush {
+                name: "Small".to_string(),
+                brush: Brush {
+                    size: 50.0,
+                    ..Brush::default()
+                },
+            },
+            ImportedBrush {
+                name: "Tiny".to_string(),
+                brush: Brush {
+                    size: 10.0,
+                    ..Brush::default()
+                },
+            },
+        ];
+        normalize_imported_sizes(&mut small);
+        assert_eq!(small[0].brush.size, 50.0);
+        assert_eq!(small[1].brush.size, 10.0);
+    }
+
+    #[test]
+    fn external_imports_are_capped_but_pcbrush_keeps_its_size() {
+        let dir = std::env::temp_dir();
+        let brushset = dir.join("procraft-size-normalize.brushset");
+        let bytes = zip_with(&[(
+            "Big/Brush.archive",
+            procreate_archive(&[
+                ("name", plist::Value::String("Big".to_string())),
+                ("paintSize", plist::Value::Real(0.5)),
+            ]),
+        )]);
+        std::fs::write(&brushset, bytes).unwrap();
+        let outcome = import_brush_file_report(&brushset).unwrap();
+        let _ = std::fs::remove_file(&brushset);
+        assert_eq!(outcome.brushes.len(), 1);
+        assert!((outcome.brushes[0].brush.size - 64.0).abs() < 0.01);
+
+        let pcbrush = dir.join("procraft-size-roundtrip.pcbrush");
+        let libs = vec![BrushPreset {
+            name: "Big".to_string(),
+            brush: Brush {
+                size: 300.0,
+                ..Brush::default()
+            },
+        }];
+        super::super::brush::save_brush_library(&pcbrush, &libs).unwrap();
+        let outcome = import_brush_file_report(&pcbrush).unwrap();
+        let _ = std::fs::remove_file(&pcbrush);
+        assert_eq!(outcome.brushes.len(), 1);
+        assert!((outcome.brushes[0].brush.size - 300.0).abs() < 0.01);
     }
 
     #[test]

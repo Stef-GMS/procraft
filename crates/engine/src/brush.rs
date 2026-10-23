@@ -62,6 +62,8 @@ pub struct DabDynamics {
     pub speed_norm: f32,
     /// Stroke direction in radians (`atan2(dy, dx)`).
     pub angle: f32,
+    /// Stroke-length taper fraction, 0.0..=1.0 (1.0 = full size).
+    pub taper: f32,
 }
 
 impl Default for DabDynamics {
@@ -70,7 +72,80 @@ impl Default for DabDynamics {
             pressure: 1.0,
             speed_norm: 0.0,
             angle: 0.0,
+            taper: 1.0,
         }
+    }
+}
+
+/// Stroke start/end taper settings, normalized to the whole stroke length.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Taper {
+    #[serde(default)]
+    pub start: f32,
+    #[serde(default)]
+    pub end: f32,
+    #[serde(default = "def_taper_size")]
+    pub size: f32,
+    #[serde(default)]
+    pub shape: f32,
+    #[serde(default)]
+    pub opacity: f32,
+    #[serde(default)]
+    pub pressure: f32,
+}
+
+impl Default for Taper {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl Taper {
+    pub const NONE: Self = Self {
+        start: 0.0,
+        end: 0.0,
+        size: 1.0,
+        shape: 0.0,
+        opacity: 0.0,
+        pressure: 0.0,
+    };
+
+    /// Shape-only taper fraction at normalized stroke position `u`
+    /// (0 = start, 1 = end). Size and pressure scaling are applied by
+    /// [`Taper::size_factor`].
+    pub fn factor_at(&self, u: f32) -> f32 {
+        let start = clamp01(self.start);
+        let end = clamp01(self.end);
+        let sum = start + end;
+        let (start, end) = if sum > 1.0 {
+            (start / sum, end / sum)
+        } else {
+            (start, end)
+        };
+        let u = clamp01(u);
+        let rise = if start > 0.0 {
+            (u / start).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let fall = if end > 0.0 {
+            ((1.0 - u) / end).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let f = rise.min(fall);
+        let smooth = f * f * (3.0 - 2.0 * f);
+        f + (smooth - f) * clamp01(self.shape)
+    }
+
+    /// Scale a shape-only taper factor by the Size and Pressure settings.
+    /// Size controls how far the taper can narrow; Pressure makes low
+    /// pressure narrow further inside the tapered ends.
+    pub fn size_factor(&self, taper: f32, pressure: f32) -> f32 {
+        let f = clamp01(taper);
+        let pressure = clamp01(self.pressure) * (1.0 - clamp01(pressure)) * (1.0 - f);
+        let f = f * (1.0 - pressure);
+        1.0 - clamp01(self.size) * (1.0 - f)
     }
 }
 
@@ -98,6 +173,9 @@ fn def_grain() -> f32 {
 fn def_grain_scale() -> f32 {
     1.0
 }
+fn def_taper_size() -> f32 {
+    1.0
+}
 fn def_roundness() -> f32 {
     1.0
 }
@@ -112,6 +190,15 @@ fn def_stabilizer() -> f32 {
 }
 fn def_dual_scale() -> f32 {
     0.5
+}
+fn def_shape_count() -> u8 {
+    1
+}
+fn def_shape_rotation() -> f32 {
+    0.0
+}
+fn def_angle_scatter() -> f32 {
+    0.0
 }
 
 /// Deterministic 0.0..=1.0 hash for scatter offsets and grain. Position
@@ -134,6 +221,35 @@ fn grain_at(px: u32, py: u32, scale: f32) -> f32 {
     hash01((px / cell) as i32, (py / cell) as i32)
 }
 
+/// Grain sample 0.0..=1.0: an imported grayscale texture tiled across the
+/// canvas when present, otherwise the procedural noise above. The texture is
+/// magnified by `grain_scale` (larger = coarser), so imported Procreate grain
+/// stays deterministic and canvas-anchored instead of following each dab.
+fn grain_sample(brush: &Brush, px: u32, py: u32) -> f32 {
+    let scale = brush.grain_scale.clamp(0.25, 4.0);
+    if let Some(tip) = brush.grain_tip.as_ref() {
+        if tip.w > 0 && tip.h > 0 && tip.mask.len() == (tip.w * tip.h) as usize {
+            let (sx, sy) = if brush.grain_angle == 0.0 {
+                (px as f64, py as f64)
+            } else {
+                let (sin, cos) = brush.grain_angle.sin_cos();
+                let (sin, cos) = (sin as f64, cos as f64);
+                (
+                    px as f64 * cos - py as f64 * sin,
+                    px as f64 * sin + py as f64 * cos,
+                )
+            };
+            let scale = scale as f64;
+            let tw = tip.w as usize;
+            let th = tip.h as usize;
+            let tx = ((sx / scale).rem_euclid(tw as f64) as usize).min(tw - 1);
+            let ty = ((sy / scale).rem_euclid(th as f64) as usize).min(th - 1);
+            return tip.mask[ty * tw + tx] as f32 / 255.0;
+        }
+    }
+    grain_at(px, py, scale)
+}
+
 /// M39 dual-tip multiplier 0.0..=1.0 at canvas offset (`ox`, `oy`) from
 /// the dab center, for a secondary tip spanning `size * dual_scale` px
 /// (nearest-neighbor, unrotated, like the primary stamp path). Absent or
@@ -145,7 +261,7 @@ fn dual_factor(dual: &Option<BrushTip>, dual_scale: f32, size: f32, ox: f32, oy:
     if tip.w == 0 || tip.h == 0 || tip.mask.len() != (tip.w * tip.h) as usize {
         return 1.0;
     }
-    let span = (size * dual_scale.clamp(0.1, 2.0)).max(1.0);
+    let span = (size * dual_scale.clamp(0.1, 4.0)).max(1.0);
     let scale = span / tip.w as f32;
     let (half_w, half_h) = (span * 0.5, tip.h as f32 * scale * 0.5);
     let tx = ((ox + half_w) / scale) as i32;
@@ -210,28 +326,66 @@ pub struct Brush {
     /// Optional imported stamp tip (absent in `.pcbrush` files from v9).
     #[serde(default)]
     pub tip: Option<BrushTip>,
-    /// How much light pressure shrinks the dab, 0.0 (no-op) ..= 1.0 (full).
-    /// Effective size scales as `size * (1 - pressure_size * (1 - p))`.
+    /// Pressure size response, -1.0 (light pressure grows) ..= 1.0 (light
+    /// pressure shrinks). Effective size is
+    /// `size * (1 - pressure_size * (1 - p))`.
     #[serde(default = "def_pressure_size")]
     pub pressure_size: f32,
-    /// How much light pressure fades the dab, 0.0..=1.0 (same curve).
+    /// Pressure opacity response, -1.0 ..= 1.0 (same curve).
     #[serde(default = "def_pressure_opacity")]
     pub pressure_opacity: f32,
+    /// Optional transfer curve remapping raw pressure before the size/opacity
+    /// responses, as `[[input, output], ..]` points sorted by input.
+    #[serde(default)]
+    pub pressure_curve: Option<Vec<[f32; 2]>>,
+    /// Optional opacity-only pressure transfer curve. When present it
+    /// replaces `pressure_curve` for opacity, so size and opacity can follow
+    /// different pressure responses. Absent falls back to `pressure_curve`.
+    #[serde(default)]
+    pub pressure_opacity_curve: Option<Vec<[f32; 2]>>,
     /// How much speed thins the dab, 0.0..=1.0 (weight 0.6, as M7 dynamics).
     #[serde(default = "def_velocity_size")]
     pub velocity_size: f32,
     /// How much speed fades the dab, 0.0..=1.0 (weight 0.4, as M7 dynamics).
     #[serde(default = "def_velocity_opacity")]
     pub velocity_opacity: f32,
+    /// Optional size transfer curve remapping normalized speed before the
+    /// velocity response. When present it replaces `velocity_size`.
+    #[serde(default)]
+    pub velocity_size_curve: Option<Vec<[f32; 2]>>,
+    /// Optional opacity-only speed transfer curve. When present it replaces
+    /// `velocity_opacity`, so size and opacity can follow different speed
+    /// responses. Absent falls back to `velocity_opacity`.
+    #[serde(default)]
+    pub velocity_opacity_curve: Option<Vec<[f32; 2]>>,
     /// Procedural grain strength, 0.0 (off) ..= 1.0 (heavy chalk).
     #[serde(default = "def_grain")]
     pub grain: f32,
     /// Grain cell scale, 0.25 (fine) ..= 4.0 (coarse).
     #[serde(default = "def_grain_scale")]
     pub grain_scale: f32,
+    /// Optional imported grain texture (tiled canvas-anchored); None keeps
+    /// the procedural grain.
+    #[serde(default)]
+    pub grain_tip: Option<BrushTip>,
+    /// Rotation of the grain texture in radians, canvas-anchored.
+    #[serde(default)]
+    pub grain_angle: f32,
     /// Dab roundness, 0.1 (flat calligraphy) ..= 1.0 (circle).
     #[serde(default = "def_roundness")]
     pub roundness: f32,
+    /// Random vertical shape compression per dab, 0.0 (fixed) ..= 1.0.
+    #[serde(default)]
+    pub roundness_jitter: f32,
+    /// Random dab-size reduction per stamp, 0.0 (fixed) ..= 1.0.
+    #[serde(default)]
+    pub size_jitter: f32,
+    /// Random dab-opacity reduction per stamp, 0.0 (fixed) ..= 1.0.
+    #[serde(default)]
+    pub opacity_jitter: f32,
+    /// Fixed dab rotation in radians, applied before stroke steering.
+    #[serde(default)]
+    pub angle: f32,
     /// Steer the dab's long axis along the stroke direction.
     #[serde(default = "def_angle_follow")]
     pub angle_follow: bool,
@@ -252,9 +406,25 @@ pub struct Brush {
     /// texture; None = single tip). Imported via "dual tip" in the app.
     #[serde(default)]
     pub dual_tip: Option<BrushTip>,
-    /// Secondary tip span as a fraction of `size`, 0.1 ..= 2.0.
+    /// Secondary tip span as a fraction of `size`, 0.1 ..= 4.0.
     #[serde(default = "def_dual_scale")]
     pub dual_scale: f32,
+    /// Shape rotation relative to the stroke direction, -1.0 (inverse) ..
+    /// 1.0 (follows the stroke). Only used when `angle_follow` is false.
+    #[serde(default = "def_shape_rotation")]
+    pub shape_rotation: f32,
+    /// Random shape rotation per stamp, 0.0 (upright) ..= 1.0 (full turn).
+    #[serde(default = "def_angle_scatter")]
+    pub angle_scatter: f32,
+    /// Shapes stamped per dab, 1 ..= 16.
+    #[serde(default = "def_shape_count")]
+    pub shape_count: u8,
+    /// Random reduction of `shape_count` per dab, 0.0 (fixed) ..= 1.0.
+    #[serde(default)]
+    pub shape_count_jitter: f32,
+    /// Stroke start/end taper (Procreate Taper panel).
+    #[serde(default)]
+    pub taper: Taper,
 }
 
 impl Default for Brush {
@@ -268,11 +438,21 @@ impl Default for Brush {
             tip: None,
             pressure_size: def_pressure_size(),
             pressure_opacity: def_pressure_opacity(),
+            pressure_curve: None,
+            pressure_opacity_curve: None,
             velocity_size: def_velocity_size(),
             velocity_opacity: def_velocity_opacity(),
+            velocity_size_curve: None,
+            velocity_opacity_curve: None,
             grain: def_grain(),
             grain_scale: def_grain_scale(),
+            grain_tip: None,
+            grain_angle: 0.0,
             roundness: def_roundness(),
+            roundness_jitter: 0.0,
+            size_jitter: 0.0,
+            opacity_jitter: 0.0,
+            angle: 0.0,
             angle_follow: def_angle_follow(),
             scatter: def_scatter(),
             stabilizer: def_stabilizer(),
@@ -280,6 +460,11 @@ impl Default for Brush {
             wet_edge: 0.0,
             dual_tip: None,
             dual_scale: def_dual_scale(),
+            shape_rotation: def_shape_rotation(),
+            angle_scatter: def_angle_scatter(),
+            shape_count: def_shape_count(),
+            shape_count_jitter: 0.0,
+            taper: Taper::NONE,
         }
     }
 }
@@ -288,20 +473,74 @@ impl Brush {
     /// Effective dab diameter for a pressure/speed sample. At full pressure
     /// and zero speed this returns exactly `size` (old behavior preserved).
     pub fn resolve_size(&self, pressure: f32, speed_norm: f32) -> f32 {
-        let p = clamp01(self.pressure_size);
-        let v = clamp01(self.velocity_size);
-        let sized = self.size * (1.0 - p * (1.0 - clamp01(pressure)));
-        (sized * (1.0 - 0.6 * clamp01(speed_norm) * v)).max(0.0)
+        let pressure = self.curved_pressure(pressure);
+        let p = self.pressure_size.clamp(-1.0, 1.0);
+        let sized = self.size * (1.0 - p * (1.0 - pressure));
+        (sized * self.curved_velocity_size(speed_norm)).max(0.0)
     }
 
     /// Effective per-dab opacity for a pressure/speed sample. At full
     /// pressure and zero speed this returns exactly `opacity`.
     pub fn resolve_opacity(&self, pressure: f32, speed_norm: f32) -> f32 {
-        let p = clamp01(self.pressure_opacity);
-        let v = clamp01(self.velocity_opacity);
-        let op = self.opacity * (1.0 - p * (1.0 - clamp01(pressure)));
-        (op * (1.0 - 0.4 * clamp01(speed_norm) * v)).clamp(0.0, 1.0)
+        let pressure = self.curved_opacity_pressure(pressure);
+        let p = self.pressure_opacity.clamp(-1.0, 1.0);
+        let op = self.opacity * (1.0 - p * (1.0 - pressure));
+        (op * self.curved_velocity_opacity(speed_norm)).clamp(0.0, 1.0)
     }
+
+    fn curved_pressure(&self, pressure: f32) -> f32 {
+        let Some(curve) = self.pressure_curve.as_deref() else {
+            return clamp01(pressure);
+        };
+        sample_curve(curve, pressure)
+    }
+
+    fn curved_opacity_pressure(&self, pressure: f32) -> f32 {
+        let Some(curve) = self.pressure_opacity_curve.as_deref() else {
+            return self.curved_pressure(pressure);
+        };
+        sample_curve(curve, pressure)
+    }
+
+    fn curved_velocity_size(&self, speed_norm: f32) -> f32 {
+        let speed = clamp01(speed_norm);
+        let Some(curve) = self.velocity_size_curve.as_deref() else {
+            return 1.0 - 0.6 * speed * clamp01(self.velocity_size);
+        };
+        sample_curve(curve, speed)
+    }
+
+    fn curved_velocity_opacity(&self, speed_norm: f32) -> f32 {
+        let speed = clamp01(speed_norm);
+        let Some(curve) = self.velocity_opacity_curve.as_deref() else {
+            return 1.0 - 0.4 * speed * clamp01(self.velocity_opacity);
+        };
+        sample_curve(curve, speed)
+    }
+}
+
+/// Piecewise-linear lookup through a sorted pressure curve.
+fn sample_curve(curve: &[[f32; 2]], pressure: f32) -> f32 {
+    let pressure = clamp01(pressure);
+    let Some(first) = curve.first() else {
+        return pressure;
+    };
+    if pressure <= first[0] {
+        return clamp01(first[1]);
+    }
+    for pair in curve.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if pressure <= b[0] {
+            let span = b[0] - a[0];
+            let t = if span > f32::EPSILON {
+                (pressure - a[0]) / span
+            } else {
+                0.0
+            };
+            return clamp01(a[1] + (b[1] - a[1]) * t);
+        }
+    }
+    clamp01(curve[curve.len() - 1][1])
 }
 
 impl Document {
@@ -342,6 +581,8 @@ impl Document {
             .mirrored_points(self.symmetry_segments, ccx, ccy, x, y);
         let mut done: Vec<(f32, f32)> = Vec::with_capacity(4);
         let target = self.paint_target;
+        let orientation = dab_orientation(brush, angle);
+        let count = shape_count_for(brush, x, y);
         for (mx, my) in pts {
             if done
                 .iter()
@@ -350,12 +591,16 @@ impl Document {
                 continue;
             }
             done.push((mx, my));
-            match target {
-                super::document::PaintTarget::Color => {
-                    self.dab_one_resolved(brush, color, mx, my, size, opacity, angle)
-                }
-                super::document::PaintTarget::Mask => {
-                    self.dab_mask_resolved(brush, color, mx, my, size, opacity, angle)
+            for index in 0..count {
+                let a = orientation + angle_jitter(brush, mx, my, index);
+                let (dab_size, dab_opacity) = jittered_dab(brush, mx, my, index, size, opacity);
+                match target {
+                    super::document::PaintTarget::Color => {
+                        self.dab_one_resolved(brush, color, mx, my, dab_size, dab_opacity, a)
+                    }
+                    super::document::PaintTarget::Mask => {
+                        self.dab_mask_resolved(brush, color, mx, my, dab_size, dab_opacity, a)
+                    }
                 }
             }
         }
@@ -379,8 +624,8 @@ impl Document {
         }
         let (w_u32, h_u32) = (self.w, self.h);
         let radius = (size * 0.5).max(0.5);
-        let strength = opacity.clamp(0.0, 1.0);
-        if strength <= 0.0 || self.layers.get(self.active).is_none() {
+        let strength = (opacity * size.min(1.0)).clamp(0.0, 1.0);
+        if strength <= 0.0 || size <= 0.0 || self.layers.get(self.active).is_none() {
             return;
         }
         // Fully outside: a complete no-op (no mask, no dirty rect).
@@ -423,10 +668,9 @@ impl Document {
         // Layer offset (Move tool): canvas pixel -> buffer slot.
         let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
         let bh = h_u32 as i32;
-        let round = brush.roundness.clamp(0.1, 1.0);
+        let round = dab_roundness(brush, x, y);
         let (cos_a, sin_a) = (angle.cos(), angle.sin());
         let grain = clamp01(brush.grain);
-        let grain_scale = brush.grain_scale;
         let Some(layer_mask) = self.layers[active].mask.as_mut() else {
             return;
         };
@@ -459,7 +703,7 @@ impl Document {
                     (falloff.clamp(0.0, 1.0) * strength * Document::sel_k(sel_mask, w, px, py))
                         .clamp(0.0, 1.0);
                 if grain > 0.0 {
-                    a *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
+                    a *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
                 }
                 if a <= 0.0 {
                     continue;
@@ -499,7 +743,7 @@ impl Document {
             return;
         }
         let (w_u32, h_u32) = (self.w, self.h);
-        let strength = opacity.clamp(0.0, 1.0);
+        let strength = (opacity * size.min(1.0)).clamp(0.0, 1.0);
         if strength <= 0.0 || size <= 0.0 || self.layers.get(self.active).is_none() {
             return;
         }
@@ -507,7 +751,8 @@ impl Document {
         let th = (tip.h as f32 * scale).max(1.0);
         // A steered stamp sweeps its corners: bound the circumscribed
         // circle so rotation never clips. Unsteered keeps the old box.
-        let (ex, ey) = if brush.angle_follow {
+        let follow = brush.angle_follow || angle != 0.0 || brush.angle != 0.0;
+        let (ex, ey) = if follow {
             let r = (size * size + th * th).sqrt() * 0.5;
             (r, r)
         } else {
@@ -543,14 +788,12 @@ impl Document {
             let c = color.0;
             (299.0 * c[0] as f32 + 587.0 * c[1] as f32 + 114.0 * c[2] as f32) / 1000.0
         };
-        let round = brush.roundness.clamp(0.1, 1.0);
+        let round = dab_roundness(brush, x, y);
         // Layer offset (Move tool): canvas pixel -> buffer slot.
         let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
         let bh = h_u32 as i32;
-        let follow = brush.angle_follow;
         let (cos_a, sin_a) = (angle.cos(), angle.sin());
         let grain = clamp01(brush.grain);
-        let grain_scale = brush.grain_scale;
         let half_w = size * 0.5;
         let half_h = th * 0.5;
         let Some(layer_mask) = self.layers[active].mask.as_mut() else {
@@ -587,7 +830,7 @@ impl Document {
                     * Document::sel_k(sel_mask, w, px, py))
                 .clamp(0.0, 1.0);
                 if grain > 0.0 {
-                    a *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
+                    a *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
                 }
                 if a <= 0.0 {
                     continue;
@@ -623,8 +866,8 @@ impl Document {
         let (w_u32, h_u32) = (self.w, self.h);
         let (w, h) = (w_u32 as f32, h_u32 as f32);
         let radius = (size * 0.5).max(0.5);
-        let strength = opacity.clamp(0.0, 1.0);
-        if strength <= 0.0 || self.layers.get(self.active).is_none() {
+        let strength = (opacity * size.min(1.0)).clamp(0.0, 1.0);
+        if strength <= 0.0 || size <= 0.0 || self.layers.get(self.active).is_none() {
             return;
         }
         let x0 = (x - radius).floor().max(0.0) as u32;
@@ -662,10 +905,9 @@ impl Document {
                 }
                 // 1.0 inside the hard core, linear fade across the soft edge.
                 let edge = brush.softness.clamp(0.0, 1.0);
-                let round = brush.roundness.clamp(0.1, 1.0);
+                let round = dab_roundness(brush, x, y);
                 let (cos_a, sin_a) = (angle.cos(), angle.sin());
                 let grain = clamp01(brush.grain);
-                let grain_scale = brush.grain_scale;
                 // Dab-frame coords (see mask dab): roundness 1.0 keeps the
                 // old circular falloff bit-for-bit.
                 let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
@@ -683,7 +925,7 @@ impl Document {
                     (falloff.clamp(0.0, 1.0) * strength * Document::sel_k(mask, w, px, py))
                         .clamp(0.0, 1.0);
                 if grain > 0.0 {
-                    fa *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
+                    fa *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
                 }
                 // M39 depth: dual-tip texture, then wet-edge fringe boost.
                 if brush.dual_tip.is_some() {
@@ -737,7 +979,7 @@ impl Document {
         }
         let (w_u32, h_u32) = (self.w, self.h);
         let (w, h) = (w_u32 as f32, h_u32 as f32);
-        let strength = opacity.clamp(0.0, 1.0);
+        let strength = (opacity * size.min(1.0)).clamp(0.0, 1.0);
         if strength <= 0.0 || size <= 0.0 || self.layers.get(self.active).is_none() {
             return;
         }
@@ -745,7 +987,8 @@ impl Document {
         let th = (tip.h as f32 * scale).max(1.0);
         // Steered stamps sweep their corners: bound the circumscribed
         // circle so rotation never clips. Unsteered keeps the old box.
-        let (ex, ey) = if brush.angle_follow {
+        let follow = brush.angle_follow || angle != 0.0 || brush.angle != 0.0;
+        let (ex, ey) = if follow {
             let r = (size * size + th * th).sqrt() * 0.5;
             (r, r)
         } else {
@@ -768,15 +1011,13 @@ impl Document {
         }
         let mask = self.selection_mask.as_deref();
         let w = w_u32;
-        let round = brush.roundness.clamp(0.1, 1.0);
+        let round = dab_roundness(brush, x, y);
         // Layer offset (Move tool): canvas pixel -> buffer slot.
         let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
         let bh = h_u32 as i32;
         let layer = &mut self.layers[active];
-        let follow = brush.angle_follow;
         let (cos_a, sin_a) = (angle.cos(), angle.sin());
         let grain = clamp01(brush.grain);
-        let grain_scale = brush.grain_scale;
         let half_w = size * 0.5;
         let half_h = th * 0.5;
         for py in y0..=y1 {
@@ -810,7 +1051,7 @@ impl Document {
                     * Document::sel_k(mask, w, px, py))
                 .clamp(0.0, 1.0);
                 if grain > 0.0 {
-                    fa *= 1.0 - grain * (1.0 - grain_at(px, py, grain_scale));
+                    fa *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
                 }
                 // M39 depth: dual-tip texture, then wet-edge fringe boost.
                 if brush.dual_tip.is_some() {
@@ -861,6 +1102,7 @@ impl Document {
             pressure: 1.0,
             speed_norm: 0.0,
             angle,
+            taper: 1.0,
         };
         self.stroke_to_dyn(brush, color, from, dyn_, to, dyn_, leftover)
     }
@@ -883,8 +1125,11 @@ impl Document {
         leftover: f32,
     ) -> (Option<(f32, f32)>, f32) {
         let Some((sx, sy)) = from else {
-            let size = brush.resolve_size(to_dyn.pressure, to_dyn.speed_norm);
-            let opacity = brush.resolve_opacity(to_dyn.pressure, to_dyn.speed_norm);
+            let taper = clamp01(to_dyn.taper);
+            let size = brush.resolve_size(to_dyn.pressure, to_dyn.speed_norm)
+                * brush.taper.size_factor(taper, to_dyn.pressure);
+            let opacity = brush.resolve_opacity(to_dyn.pressure, to_dyn.speed_norm)
+                * (1.0 - clamp01(brush.taper.opacity) * (1.0 - taper));
             let (ox, oy) = scatter_offset(brush, to.0, to.1, size);
             self.dab_dyn(
                 brush,
@@ -902,29 +1147,35 @@ impl Document {
         if dist <= 0.0 {
             return (from, leftover);
         }
-        // Step from the midpoint size so tapered strokes keep even dabs.
-        let mid_size = brush.resolve_size(
-            (from_dyn.pressure + to_dyn.pressure) * 0.5,
-            (from_dyn.speed_norm + to_dyn.speed_norm) * 0.5,
-        );
-        let step = (mid_size * brush.spacing).max(1.0);
         // Lerp direction as unit vectors (stable across +/-PI).
         let (fx, fy) = (from_dyn.angle.cos(), from_dyn.angle.sin());
         let (tx, ty) = (to_dyn.angle.cos(), to_dyn.angle.sin());
-        let mut travelled = leftover;
-        while travelled <= dist {
-            let t = travelled / dist;
+        let mut stamp_at = |t: f32| {
             let pressure = from_dyn.pressure + (to_dyn.pressure - from_dyn.pressure) * t;
             let speed = from_dyn.speed_norm + (to_dyn.speed_norm - from_dyn.speed_norm) * t;
             let vx = fx + (tx - fx) * t;
             let vy = fy + (ty - fy) * t;
             let angle = vy.atan2(vx);
-            let size = brush.resolve_size(pressure, speed);
-            let opacity = brush.resolve_opacity(pressure, speed);
+            let taper = clamp01(from_dyn.taper + (to_dyn.taper - from_dyn.taper) * t);
+            let size =
+                brush.resolve_size(pressure, speed) * brush.taper.size_factor(taper, pressure);
+            let opacity = brush.resolve_opacity(pressure, speed)
+                * (1.0 - clamp01(brush.taper.opacity) * (1.0 - taper));
             let (x, y) = (sx + dx * t, sy + dy * t);
             let (ox, oy) = scatter_offset(brush, x, y, size);
             self.dab_dyn(brush, color, x + ox, y + oy, size, opacity, angle);
-            travelled += step;
+            size
+        };
+        let mut travelled = leftover;
+        let mut last_dab = None;
+        while travelled <= dist {
+            let size = stamp_at(travelled / dist);
+            last_dab = Some(travelled);
+            travelled += (size * brush.spacing).max(1.0);
+        }
+        let endpoint_painted = last_dab.map(|last| dist - last <= 0.5).unwrap_or(false);
+        if !endpoint_painted {
+            let _ = stamp_at(1.0);
         }
         (Some(to), travelled - dist)
     }
@@ -1092,7 +1343,7 @@ impl Document {
         self.smudge_finger = Some(finger);
         // Deposit: lerp destination toward the finger under the falloff.
         let edge = brush.softness.clamp(0.0, 1.0);
-        let round = brush.roundness.clamp(0.1, 1.0);
+        let round = dab_roundness(brush, x, y);
         let layer = &mut self.layers[active];
         for py in y0..=y1 {
             for px in x0..=x1 {
@@ -1137,6 +1388,70 @@ impl Document {
             }
         }
     }
+}
+
+/// Orientation for one stamp: full stroke direction when `angle_follow`
+/// is on, otherwise the direction scaled by `shape_rotation` (-1 inverse,
+/// 0 upright, 1 follows).
+fn dab_orientation(brush: &Brush, stroke_angle: f32) -> f32 {
+    let follow = if brush.angle_follow {
+        stroke_angle
+    } else {
+        stroke_angle * brush.shape_rotation.clamp(-1.0, 1.0)
+    };
+    brush.angle + follow
+}
+
+/// Effective roundness for one dab, optionally compressed by deterministic
+/// per-position jitter.
+fn dab_roundness(brush: &Brush, x: f32, y: f32) -> f32 {
+    let roundness = brush.roundness.clamp(0.1, 1.0);
+    let jitter = brush.roundness_jitter.clamp(0.0, 1.0);
+    if jitter <= 0.0 {
+        return roundness;
+    }
+    let qx = (x * 2.0).round() as i32;
+    let qy = (y * 2.0).round() as i32;
+    let factor = 1.0 - jitter * hash01(qx ^ 0x6a09, qy ^ 0x3c6e);
+    (roundness * factor).max(0.1)
+}
+
+/// Size and opacity for one stamped shape after deterministic dynamics jitter.
+fn jittered_dab(brush: &Brush, x: f32, y: f32, index: u8, size: f32, opacity: f32) -> (f32, f32) {
+    let qx = (x * 2.0).round() as i32 ^ index as i32;
+    let qy = (y * 2.0).round() as i32;
+    let size_factor = 1.0 - brush.size_jitter.clamp(0.0, 1.0) * hash01(qx ^ 0x1f83, qy);
+    let opacity_factor =
+        1.0 - brush.opacity_jitter.clamp(0.0, 1.0) * hash01(qx ^ 0x5be0, qy ^ 0x2c1b);
+    (size * size_factor, opacity * opacity_factor)
+}
+
+/// Shapes for one dab after `shape_count_jitter`: a deterministic subset of
+/// the configured count, never below one.
+fn shape_count_for(brush: &Brush, x: f32, y: f32) -> u8 {
+    let base = brush.shape_count.clamp(1, 16);
+    let jitter = brush.shape_count_jitter.clamp(0.0, 1.0);
+    if jitter <= 0.0 || base <= 1 {
+        return base;
+    }
+    let qx = (x * 2.0).round() as i32;
+    let qy = (y * 2.0).round() as i32;
+    let factor = 1.0 - jitter * hash01(qx ^ 0x2c1b, qy ^ 0x7f4a);
+    ((base as f32 * factor).round() as u8).clamp(1, base)
+}
+
+/// Deterministic rotation offset for the `index`-th shape of a dab. The
+/// hash keeps replayed strokes identical while `angle_scatter` widens the
+/// offset from upright (0) to a full turn (1).
+fn angle_jitter(brush: &Brush, x: f32, y: f32, index: u8) -> f32 {
+    let sc = brush.angle_scatter.clamp(0.0, 1.0);
+    if sc <= 0.0 {
+        return 0.0;
+    }
+    let qx = (x * 2.0).round() as i32;
+    let qy = (y * 2.0).round() as i32;
+    let seed = (index as i32).wrapping_mul(0x9e37);
+    (hash01(qx ^ seed, qy ^ 0x17ab) * 2.0 - 1.0) * sc * std::f32::consts::PI
 }
 
 /// Deterministic scatter offset for a dab center: uniform in
@@ -1188,11 +1503,45 @@ fn check_preset(name: &str, brush: &Brush) -> Result<String, String> {
     if !(0.0 < brush.spacing && brush.spacing <= 2.0) {
         return Err(format!("brush '{clean}' has a bad spacing"));
     }
-    if !(0.0 <= brush.pressure_size && brush.pressure_size <= 1.0) {
+    if !(-1.0 <= brush.pressure_size && brush.pressure_size <= 1.0) {
         return Err(format!("brush '{clean}' has a bad pressure-size"));
     }
-    if !(0.0 <= brush.pressure_opacity && brush.pressure_opacity <= 1.0) {
+    if !(-1.0 <= brush.pressure_opacity && brush.pressure_opacity <= 1.0) {
         return Err(format!("brush '{clean}' has a bad pressure-opacity"));
+    }
+    if let Some(curve) = &brush.pressure_curve {
+        if !(2..=64).contains(&curve.len()) {
+            return Err(format!("brush '{clean}' has a bad pressure curve"));
+        }
+        let mut previous = f32::NEG_INFINITY;
+        for point in curve {
+            if !point[0].is_finite()
+                || !point[1].is_finite()
+                || !(0.0..=1.0).contains(&point[0])
+                || !(0.0..=1.0).contains(&point[1])
+                || point[0] <= previous
+            {
+                return Err(format!("brush '{clean}' has a bad pressure curve"));
+            }
+            previous = point[0];
+        }
+    }
+    if let Some(curve) = &brush.pressure_opacity_curve {
+        if !(2..=64).contains(&curve.len()) {
+            return Err(format!("brush '{clean}' has a bad pressure-opacity curve"));
+        }
+        let mut previous = f32::NEG_INFINITY;
+        for point in curve {
+            if !point[0].is_finite()
+                || !point[1].is_finite()
+                || !(0.0..=1.0).contains(&point[0])
+                || !(0.0..=1.0).contains(&point[1])
+                || point[0] <= previous
+            {
+                return Err(format!("brush '{clean}' has a bad pressure-opacity curve"));
+            }
+            previous = point[0];
+        }
     }
     if !(0.0 <= brush.velocity_size && brush.velocity_size <= 1.0) {
         return Err(format!("brush '{clean}' has a bad velocity-size"));
@@ -1200,17 +1549,81 @@ fn check_preset(name: &str, brush: &Brush) -> Result<String, String> {
     if !(0.0 <= brush.velocity_opacity && brush.velocity_opacity <= 1.0) {
         return Err(format!("brush '{clean}' has a bad velocity-opacity"));
     }
+    if let Some(curve) = &brush.velocity_size_curve {
+        if !(2..=64).contains(&curve.len()) {
+            return Err(format!("brush '{clean}' has a bad velocity-size curve"));
+        }
+        let mut previous = f32::NEG_INFINITY;
+        for point in curve {
+            if !point[0].is_finite()
+                || !point[1].is_finite()
+                || !(0.0..=1.0).contains(&point[0])
+                || !(0.0..=1.0).contains(&point[1])
+                || point[0] <= previous
+            {
+                return Err(format!("brush '{clean}' has a bad velocity-size curve"));
+            }
+            previous = point[0];
+        }
+    }
+    if let Some(curve) = &brush.velocity_opacity_curve {
+        if !(2..=64).contains(&curve.len()) {
+            return Err(format!("brush '{clean}' has a bad velocity-opacity curve"));
+        }
+        let mut previous = f32::NEG_INFINITY;
+        for point in curve {
+            if !point[0].is_finite()
+                || !point[1].is_finite()
+                || !(0.0..=1.0).contains(&point[0])
+                || !(0.0..=1.0).contains(&point[1])
+                || point[0] <= previous
+            {
+                return Err(format!("brush '{clean}' has a bad velocity-opacity curve"));
+            }
+            previous = point[0];
+        }
+    }
     if !(0.0 <= brush.grain && brush.grain <= 1.0) {
         return Err(format!("brush '{clean}' has a bad grain"));
     }
     if !(0.25 <= brush.grain_scale && brush.grain_scale <= 4.0) {
         return Err(format!("brush '{clean}' has a bad grain scale"));
     }
+    if !(0.0..=1.0).contains(&brush.taper.start)
+        || !(0.0..=1.0).contains(&brush.taper.end)
+        || !(0.0..=1.0).contains(&brush.taper.size)
+        || !(0.0..=1.0).contains(&brush.taper.shape)
+        || !(0.0..=1.0).contains(&brush.taper.opacity)
+        || !(0.0..=1.0).contains(&brush.taper.pressure)
+    {
+        return Err(format!("brush '{clean}' has bad taper settings"));
+    }
     if !(0.1 <= brush.roundness && brush.roundness <= 1.0) {
         return Err(format!("brush '{clean}' has a bad roundness"));
     }
+    if !(0.0 <= brush.roundness_jitter && brush.roundness_jitter <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad roundness jitter"));
+    }
+    if !(0.0 <= brush.size_jitter && brush.size_jitter <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad size jitter"));
+    }
+    if !(0.0 <= brush.opacity_jitter && brush.opacity_jitter <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad opacity jitter"));
+    }
     if !(0.0 <= brush.scatter && brush.scatter <= 1.0) {
         return Err(format!("brush '{clean}' has a bad scatter"));
+    }
+    if !(-1.0 <= brush.shape_rotation && brush.shape_rotation <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad shape rotation"));
+    }
+    if !(0.0 <= brush.angle_scatter && brush.angle_scatter <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad angle scatter"));
+    }
+    if !(1..=16).contains(&brush.shape_count) {
+        return Err(format!("brush '{clean}' has a bad shape count"));
+    }
+    if !(0.0 <= brush.shape_count_jitter && brush.shape_count_jitter <= 1.0) {
+        return Err(format!("brush '{clean}' has a bad shape count jitter"));
     }
     if !(0.0 <= brush.stabilizer && brush.stabilizer <= 1.0) {
         return Err(format!("brush '{clean}' has a bad stabilizer"));
@@ -1289,9 +1702,17 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 pressure_opacity: 0.7,
                 velocity_size: 0.5,
                 velocity_opacity: 0.4,
+                velocity_size_curve: None,
+                velocity_opacity_curve: None,
                 grain: 0.35,
                 grain_scale: 0.8,
+                grain_tip: None,
+                grain_angle: 0.0,
                 roundness: 1.0,
+                roundness_jitter: 0.0,
+                size_jitter: 0.0,
+                opacity_jitter: 0.0,
+                angle: 0.0,
                 angle_follow: false,
                 scatter: 0.05,
                 stabilizer: 0.25,
@@ -1299,6 +1720,13 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 wet_edge: 0.0,
                 dual_tip: None,
                 dual_scale: 0.5,
+                shape_rotation: 0.0,
+                angle_scatter: 0.0,
+                shape_count: 1,
+                shape_count_jitter: 0.0,
+                pressure_curve: None,
+                pressure_opacity_curve: None,
+                taper: Taper::NONE,
             },
         ),
         (
@@ -1314,9 +1742,17 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 pressure_opacity: 0.8,
                 velocity_size: 0.4,
                 velocity_opacity: 0.3,
+                velocity_size_curve: None,
+                velocity_opacity_curve: None,
                 grain: 0.0,
                 grain_scale: 1.0,
+                grain_tip: None,
+                grain_angle: 0.0,
                 roundness: 0.6,
+                roundness_jitter: 0.0,
+                size_jitter: 0.0,
+                opacity_jitter: 0.0,
+                angle: 0.0,
                 angle_follow: true,
                 scatter: 0.0,
                 stabilizer: 0.5,
@@ -1324,6 +1760,13 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 wet_edge: 0.0,
                 dual_tip: None,
                 dual_scale: 0.5,
+                shape_rotation: 0.0,
+                angle_scatter: 0.0,
+                shape_count: 1,
+                shape_count_jitter: 0.0,
+                pressure_curve: None,
+                pressure_opacity_curve: None,
+                taper: Taper::NONE,
             },
         ),
         (
@@ -1339,9 +1782,17 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 pressure_opacity: 0.6,
                 velocity_size: 0.6,
                 velocity_opacity: 0.6,
+                velocity_size_curve: None,
+                velocity_opacity_curve: None,
                 grain: 0.0,
                 grain_scale: 1.0,
+                grain_tip: None,
+                grain_angle: 0.0,
                 roundness: 1.0,
+                roundness_jitter: 0.0,
+                size_jitter: 0.0,
+                opacity_jitter: 0.0,
+                angle: 0.0,
                 angle_follow: false,
                 scatter: 0.0,
                 stabilizer: 0.35,
@@ -1349,6 +1800,13 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 wet_edge: 0.0,
                 dual_tip: None,
                 dual_scale: 0.5,
+                shape_rotation: 0.0,
+                angle_scatter: 0.0,
+                shape_count: 1,
+                shape_count_jitter: 0.0,
+                pressure_curve: None,
+                pressure_opacity_curve: None,
+                taper: Taper::NONE,
             },
         ),
         (
@@ -1364,9 +1822,17 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 pressure_opacity: 0.5,
                 velocity_size: 0.3,
                 velocity_opacity: 0.3,
+                velocity_size_curve: None,
+                velocity_opacity_curve: None,
                 grain: 0.0,
                 grain_scale: 1.0,
+                grain_tip: None,
+                grain_angle: 0.0,
                 roundness: 0.55,
+                roundness_jitter: 0.0,
+                size_jitter: 0.0,
+                opacity_jitter: 0.0,
+                angle: 0.0,
                 angle_follow: true,
                 scatter: 0.0,
                 stabilizer: 0.3,
@@ -1374,6 +1840,13 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 wet_edge: 0.0,
                 dual_tip: None,
                 dual_scale: 0.5,
+                shape_rotation: 0.0,
+                angle_scatter: 0.0,
+                shape_count: 1,
+                shape_count_jitter: 0.0,
+                pressure_curve: None,
+                pressure_opacity_curve: None,
+                taper: Taper::NONE,
             },
         ),
         (
@@ -1389,9 +1862,17 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 pressure_opacity: 0.9,
                 velocity_size: 0.2,
                 velocity_opacity: 0.3,
+                velocity_size_curve: None,
+                velocity_opacity_curve: None,
                 grain: 0.15,
                 grain_scale: 1.5,
+                grain_tip: None,
+                grain_angle: 0.0,
                 roundness: 1.0,
+                roundness_jitter: 0.0,
+                size_jitter: 0.0,
+                opacity_jitter: 0.0,
+                angle: 0.0,
                 angle_follow: false,
                 scatter: 0.0,
                 stabilizer: 0.4,
@@ -1399,6 +1880,13 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 wet_edge: 0.0,
                 dual_tip: None,
                 dual_scale: 0.5,
+                shape_rotation: 0.0,
+                angle_scatter: 0.0,
+                shape_count: 1,
+                shape_count_jitter: 0.0,
+                pressure_curve: None,
+                pressure_opacity_curve: None,
+                taper: Taper::NONE,
             },
         ),
         (
@@ -1414,9 +1902,17 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 pressure_opacity: 0.6,
                 velocity_size: 0.5,
                 velocity_opacity: 0.5,
+                velocity_size_curve: None,
+                velocity_opacity_curve: None,
                 grain: 0.55,
                 grain_scale: 0.7,
+                grain_tip: None,
+                grain_angle: 0.0,
                 roundness: 1.0,
+                roundness_jitter: 0.0,
+                size_jitter: 0.0,
+                opacity_jitter: 0.0,
+                angle: 0.0,
                 angle_follow: false,
                 scatter: 0.12,
                 stabilizer: 0.2,
@@ -1424,6 +1920,13 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 wet_edge: 0.0,
                 dual_tip: None,
                 dual_scale: 0.5,
+                shape_rotation: 0.0,
+                angle_scatter: 0.0,
+                shape_count: 1,
+                shape_count_jitter: 0.0,
+                pressure_curve: None,
+                pressure_opacity_curve: None,
+                taper: Taper::NONE,
             },
         ),
     ]
@@ -2693,6 +3196,23 @@ mod tests {
     }
 
     #[test]
+    fn pressure_curve_remaps_size_and_opacity() {
+        let brush = Brush {
+            size: 20.0,
+            opacity: 1.0,
+            pressure_size: 1.0,
+            pressure_opacity: 1.0,
+            velocity_size: 0.0,
+            velocity_opacity: 0.0,
+            pressure_curve: Some(vec![[0.0, 0.0], [1.0, 0.5]]),
+            ..Default::default()
+        };
+        assert!((brush.resolve_size(1.0, 0.0) - 10.0).abs() < 0.001);
+        assert!((brush.resolve_opacity(1.0, 0.0) - 0.5).abs() < 0.001);
+        assert!((sample_curve(&[[0.0, 0.0], [0.5, 1.0], [1.0, 1.0]], 0.25) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
     fn pressure_tapers_size_and_opacity() {
         let brush = Brush {
             size: 20.0,
@@ -2714,6 +3234,310 @@ mod tests {
         };
         assert_eq!(flat.resolve_size(0.0, 0.0), 20.0);
         assert_eq!(flat.resolve_opacity(0.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn taper_factor_ramps_start_and_end_lengths() {
+        assert_eq!(Taper::NONE.factor_at(0.0), 1.0);
+        assert_eq!(Taper::NONE.factor_at(1.0), 1.0);
+        let start = Taper {
+            start: 0.5,
+            ..Taper::NONE
+        };
+        assert_eq!(start.factor_at(0.0), 0.0);
+        assert!((start.factor_at(0.25) - 0.5).abs() < 0.001);
+        assert_eq!(start.factor_at(0.5), 1.0);
+        assert_eq!(start.factor_at(1.0), 1.0);
+        let end = Taper {
+            end: 1.0,
+            ..Taper::NONE
+        };
+        assert_eq!(end.factor_at(0.0), 1.0);
+        assert!((end.factor_at(0.5) - 0.5).abs() < 0.001);
+        assert_eq!(end.factor_at(1.0), 0.0);
+        // Overlapping lengths meet at the middle with a full-size peak.
+        let both = Taper {
+            start: 1.0,
+            end: 1.0,
+            ..Taper::NONE
+        };
+        assert!((both.factor_at(0.5) - 1.0).abs() < 0.001);
+        // Shape blends the linear ramp toward a smoothstep.
+        let shaped = Taper {
+            start: 1.0,
+            shape: 1.0,
+            ..Taper::NONE
+        };
+        assert!((shaped.factor_at(0.25) - 0.15625).abs() < 0.001);
+    }
+
+    #[test]
+    fn taper_size_and_pressure_scale_the_transition() {
+        let full = Taper {
+            start: 0.5,
+            size: 1.0,
+            ..Taper::NONE
+        };
+        assert_eq!(full.size_factor(0.0, 1.0), 0.0);
+        assert!((full.size_factor(0.5, 1.0) - 0.5).abs() < 0.001);
+        assert_eq!(full.size_factor(1.0, 1.0), 1.0);
+
+        let flat = Taper { size: 0.0, ..full };
+        assert_eq!(flat.size_factor(0.0, 1.0), 1.0);
+        assert_eq!(flat.size_factor(0.5, 1.0), 1.0);
+
+        let pressured = Taper {
+            pressure: 1.0,
+            ..full
+        };
+        assert!((pressured.size_factor(0.5, 1.0) - 0.5).abs() < 0.001);
+        assert!(pressured.size_factor(0.5, 0.0) < 0.5);
+        assert_eq!(pressured.size_factor(1.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn taper_size_zero_keeps_the_tip_full_width() {
+        let brush = Brush {
+            size: 6.0,
+            opacity: 1.0,
+            softness: 0.0,
+            spacing: 0.25,
+            taper: Taper {
+                start: 1.0,
+                size: 0.0,
+                ..Taper::NONE
+            },
+            ..Default::default()
+        };
+        let dyn0 = DabDynamics {
+            taper: 0.0,
+            ..Default::default()
+        };
+        let mut doc = Document::new(32, 12);
+        doc.stroke_to_dyn(
+            &brush,
+            Color::rgb(255, 0, 0),
+            None,
+            dyn0,
+            (6.0, 6.0),
+            dyn0,
+            0.0,
+        );
+        let alpha = doc.layers[0].pixels[((6 * doc.w + 6) * 4 + 3) as usize];
+        assert!(alpha > 0, "taper size 0 should keep the tip full width");
+    }
+
+    #[test]
+    fn stroke_taper_scales_size_and_opacity() {
+        let brush = Brush {
+            size: 6.0,
+            opacity: 1.0,
+            softness: 0.0,
+            spacing: 0.25,
+            taper: Taper {
+                opacity: 1.0,
+                ..Taper::NONE
+            },
+            ..Default::default()
+        };
+        let color = Color::rgb(255, 0, 0);
+        let mut doc = Document::new(32, 12);
+        let dyn0 = DabDynamics {
+            taper: 0.0,
+            ..Default::default()
+        };
+        doc.stroke_to_dyn(&brush, color, None, dyn0, (2.0, 6.0), dyn0, 0.0);
+        doc.stroke_to_dyn(
+            &brush,
+            color,
+            Some((2.0, 6.0)),
+            dyn0,
+            (16.0, 6.0),
+            dyn0,
+            0.0,
+        );
+        doc.stroke_to_dyn(
+            &brush,
+            color,
+            Some((16.0, 6.0)),
+            dyn0,
+            (30.0, 6.0),
+            DabDynamics::default(),
+            0.0,
+        );
+        let alpha = |x: u32| doc.layers[0].pixels[((6 * doc.w + x) * 4 + 3) as usize];
+        assert_eq!(alpha(3), 0);
+        assert!(alpha(30) > 200, "full-taper alpha {}", alpha(30));
+        assert!(alpha(20) > 0 && alpha(20) < alpha(30));
+    }
+
+    #[test]
+    fn subpixel_dab_fades_instead_of_painting_full_alpha() {
+        let brush = Brush {
+            size: 0.25,
+            opacity: 1.0,
+            softness: 0.0,
+            ..Default::default()
+        };
+        let mut doc = Document::new(8, 8);
+        doc.dab(&brush, Color::rgb(255, 0, 0), 4.5, 4.5);
+        let alpha = doc.layers[0].pixels[((4 * doc.w + 4) * 4 + 3) as usize];
+        assert!(alpha > 0 && alpha < 128, "subpixel alpha {alpha}");
+    }
+
+    #[test]
+    fn taper_width_profile_is_monotonic() {
+        let brush = Brush {
+            size: 40.0,
+            opacity: 1.0,
+            softness: 0.0,
+            spacing: 0.25,
+            taper: Taper {
+                start: 0.25,
+                end: 0.25,
+                size: 1.0,
+                ..Taper::NONE
+            },
+            ..Default::default()
+        };
+        let color = Color::rgb(255, 0, 0);
+        let mut doc = Document::new(240, 80);
+        let dyn0 = DabDynamics {
+            taper: 0.0,
+            ..Default::default()
+        };
+        let dyn_mid = DabDynamics {
+            taper: 1.0,
+            ..Default::default()
+        };
+        doc.stroke_to_dyn(&brush, color, None, dyn0, (20.0, 40.0), dyn0, 0.0);
+        doc.stroke_to_dyn(
+            &brush,
+            color,
+            Some((20.0, 40.0)),
+            dyn0,
+            (120.0, 40.0),
+            dyn_mid,
+            0.0,
+        );
+        doc.stroke_to_dyn(
+            &brush,
+            color,
+            Some((120.0, 40.0)),
+            dyn_mid,
+            (220.0, 40.0),
+            dyn0,
+            0.0,
+        );
+        let width = |x: u32| {
+            (0..doc.h)
+                .filter(|&y| doc.layers[0].pixels[((y * doc.w + x) * 4 + 3) as usize] > 0)
+                .count()
+        };
+        assert!(width(30) < width(60), "{} vs {}", width(30), width(60));
+        assert!(width(60) < width(100), "{} vs {}", width(60), width(100));
+        assert!(width(100) > width(180), "{} vs {}", width(100), width(180));
+        assert!(width(180) > width(200), "{} vs {}", width(180), width(200));
+        assert!(width(200) >= width(215), "{} vs {}", width(200), width(215));
+    }
+
+    #[test]
+    fn tapered_tail_has_no_gaps() {
+        let brush = Brush {
+            size: 40.0,
+            opacity: 1.0,
+            softness: 0.0,
+            spacing: 0.5,
+            taper: Taper {
+                end: 1.0,
+                size: 0.8,
+                ..Taper::NONE
+            },
+            ..Default::default()
+        };
+        let color = Color::rgb(255, 0, 0);
+        let head = DabDynamics::default();
+        let tail = DabDynamics {
+            taper: 0.0,
+            ..DabDynamics::default()
+        };
+        let mut doc = Document::new(260, 140);
+        doc.stroke_to_dyn(&brush, color, None, head, (20.0, 100.0), head, 0.0);
+        doc.stroke_to_dyn(
+            &brush,
+            color,
+            Some((20.0, 100.0)),
+            head,
+            (220.0, 100.0),
+            tail,
+            0.0,
+        );
+        let alpha = |x: u32| doc.layers[0].pixels[((100 * doc.w + x) * 4 + 3) as usize];
+        let gap = (20..=220).find(|&x| alpha(x) == 0);
+        assert_eq!(gap, None, "first tapered-tail gap at x={gap:?}");
+    }
+
+    #[test]
+    fn short_segment_stamps_its_endpoint() {
+        let brush = Brush {
+            size: 24.0,
+            opacity: 1.0,
+            softness: 0.0,
+            spacing: 1.0,
+            ..Default::default()
+        };
+        let color = Color::rgb(255, 0, 0);
+        let dyn_ = DabDynamics::default();
+        let mut doc = Document::new(64, 32);
+        doc.stroke_to_dyn(&brush, color, None, dyn_, (8.0, 16.0), dyn_, 0.0);
+        doc.stroke_to_dyn(
+            &brush,
+            color,
+            Some((8.0, 16.0)),
+            dyn_,
+            (28.0, 16.0),
+            dyn_,
+            0.0,
+        );
+        let alpha = doc.layers[0].pixels[((16 * doc.w + 28) * 4 + 3) as usize];
+        assert!(alpha > 0, "short segment endpoint alpha {alpha}");
+    }
+
+    #[test]
+    fn signed_pressure_dynamics_extend_beyond_full_pressure() {
+        let brush = Brush {
+            size: 20.0,
+            opacity: 0.5,
+            pressure_size: -0.5,
+            pressure_opacity: -0.5,
+            velocity_size: 0.0,
+            velocity_opacity: 0.0,
+            ..Default::default()
+        };
+        assert!((brush.resolve_size(0.0, 0.0) - 30.0).abs() < 0.001);
+        assert!((brush.resolve_size(1.0, 0.0) - 20.0).abs() < 0.001);
+        assert!((brush.resolve_opacity(0.0, 0.0) - 0.75).abs() < 0.001);
+        assert!((brush.resolve_opacity(1.0, 0.0) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn velocity_curves_replace_scalar_dynamics() {
+        let brush = Brush {
+            size: 20.0,
+            opacity: 1.0,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            velocity_size: 0.1,
+            velocity_opacity: 0.1,
+            velocity_size_curve: Some(vec![[0.0, 1.0], [0.5, 1.0], [0.8, 0.0], [1.0, 0.0]]),
+            velocity_opacity_curve: Some(vec![[0.0, 1.0], [1.0, 0.0]]),
+            ..Default::default()
+        };
+        assert!((brush.resolve_size(1.0, 0.0) - 20.0).abs() < 0.001);
+        assert!((brush.resolve_size(1.0, 0.4) - 20.0).abs() < 0.001);
+        assert!(brush.resolve_size(1.0, 0.8).abs() < 0.001);
+        assert!((brush.resolve_opacity(1.0, 0.5) - 0.5).abs() < 0.001);
+        assert!(brush.resolve_opacity(1.0, 1.0).abs() < 0.001);
     }
 
     #[test]
@@ -2740,6 +3564,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(libs[0].brush, want);
+    }
+
+    #[test]
+    fn old_taper_json_gets_full_size_and_no_pressure() {
+        let old = r#"[{"name":"Old","brush":{"size":10.0,"opacity":1.0,"softness":0.5,"spacing":0.2,"eraser":false,"taper":{"start":0.2,"end":0.2,"shape":0.0,"opacity":0.0}}}]"#;
+        let libs: Vec<BrushPreset> = serde_json::from_str(old).unwrap();
+        assert_eq!(libs[0].brush.taper.size, 1.0);
+        assert_eq!(libs[0].brush.taper.pressure, 0.0);
     }
 
     fn alpha_sum(doc: &Document) -> u64 {
@@ -2784,6 +3616,7 @@ mod tests {
                 pressure,
                 speed_norm: 0.0,
                 angle: 0.0,
+                taper: 1.0,
             };
             doc.stroke_to_dyn(
                 &brush,
@@ -2825,6 +3658,91 @@ mod tests {
         // Same footprint (grain never fully erases), different values.
         assert_eq!(painted_bbox(&g), painted_bbox(&c));
         assert_ne!(c.layers[0].pixels, g.layers[0].pixels);
+    }
+
+    #[test]
+    fn imported_grain_texture_breaks_up_the_dab() {
+        let clean = Brush {
+            size: 20.0,
+            softness: 0.0,
+            spacing: 0.5,
+            ..Default::default()
+        };
+        let texture = BrushTip::from_mask(2, 2, vec![255, 128, 128, 255]).unwrap();
+        let grained = Brush {
+            grain: 1.0,
+            grain_scale: 1.0,
+            grain_tip: Some(texture),
+            ..clean.clone()
+        };
+        let paint = |brush: &Brush| {
+            let mut doc = Document::new(48, 48);
+            doc.dab(brush, Color::rgb(255, 255, 255), 24.0, 24.0);
+            doc
+        };
+        let (c, g) = (paint(&clean), paint(&grained));
+        assert!(alpha_sum(&g) < alpha_sum(&c));
+        assert_eq!(painted_bbox(&g), painted_bbox(&c));
+        assert_ne!(c.layers[0].pixels, g.layers[0].pixels);
+    }
+
+    #[test]
+    fn static_angle_rotates_the_stamp() {
+        let tip = BrushTip::from_mask(8, 4, vec![255u8; 32]).unwrap();
+        let flat = Brush {
+            size: 8.0,
+            opacity: 1.0,
+            spacing: 2.0,
+            tip: Some(tip),
+            ..Default::default()
+        };
+        let turned = Brush {
+            angle: std::f32::consts::FRAC_PI_2,
+            ..flat.clone()
+        };
+        let bbox = |brush: &Brush| {
+            let mut doc = Document::new(48, 48);
+            doc.dab(brush, Color::rgb(255, 255, 255), 24.0, 24.0);
+            painted_bbox(&doc).unwrap()
+        };
+        let (fx0, fy0, fx1, fy1) = bbox(&flat);
+        let (tx0, ty0, tx1, ty1) = bbox(&turned);
+        assert!(fx1 - fx0 > fy1 - fy0);
+        assert!(ty1 - ty0 > tx1 - tx0);
+    }
+
+    #[test]
+    fn rotated_grain_texture_wraps_inside_the_mask() {
+        let tip = BrushTip::from_mask(256, 256, vec![128u8; 256 * 256]).unwrap();
+        let brush = Brush {
+            grain_tip: Some(tip),
+            grain_angle: 90f32.to_radians(),
+            grain_scale: 0.25,
+            ..Default::default()
+        };
+        for py in 0..512 {
+            for px in 0..512 {
+                let _ = grain_sample(&brush, px, py);
+            }
+        }
+    }
+
+    #[test]
+    fn rotated_grain_samples_stay_in_bounds() {
+        let tip = BrushTip::from_mask(256, 256, vec![255u8; 256 * 256]).unwrap();
+        let brush = Brush {
+            grain: 1.0,
+            grain_scale: 0.25,
+            grain_angle: std::f32::consts::FRAC_PI_2,
+            grain_tip: Some(tip),
+            ..Default::default()
+        };
+        for y in 0..512 {
+            for x in 0..512 {
+                let sample = grain_sample(&brush, x, y);
+                assert!((0.0..=1.0).contains(&sample));
+            }
+        }
     }
 
     #[test]
@@ -2906,6 +3824,7 @@ mod tests {
                 pressure: 1.0,
                 speed_norm: 0.0,
                 angle,
+                taper: 1.0,
             };
             // Short segment + wide spacing: exactly one dab at `from`.
             doc.stroke_to_dyn(&brush, Color::rgb(255, 255, 255), Some(from), d, to, d, 0.0);
@@ -2918,6 +3837,156 @@ mod tests {
     }
 
     #[test]
+    fn shape_count_builds_density_at_one_point() {
+        let single = Brush {
+            size: 20.0,
+            opacity: 0.25,
+            spacing: 2.0,
+            ..Default::default()
+        };
+        let multiple = Brush {
+            shape_count: 4,
+            ..single.clone()
+        };
+        let alpha = |brush: &Brush| {
+            let mut doc = Document::new(48, 48);
+            doc.dab(brush, Color::rgb(255, 0, 0), 24.0, 24.0);
+            doc.layers[0].pixels[(24 * 48 + 24) * 4 + 3]
+        };
+        assert!(alpha(&multiple) > alpha(&single));
+    }
+
+    #[test]
+    fn shape_count_jitter_stays_within_bounds_and_varies() {
+        let brush = Brush {
+            shape_count: 8,
+            shape_count_jitter: 1.0,
+            ..Default::default()
+        };
+        let counts: Vec<u8> = (0..64)
+            .map(|i| shape_count_for(&brush, i as f32 * 3.7, i as f32 * 1.9))
+            .collect();
+        assert!(counts.iter().all(|&count| (1..=8).contains(&count)));
+        assert!(counts.iter().any(|&count| count < 8));
+        let again: Vec<u8> = (0..64)
+            .map(|i| shape_count_for(&brush, i as f32 * 3.7, i as f32 * 1.9))
+            .collect();
+        assert_eq!(counts, again);
+        let fixed = Brush {
+            shape_count_jitter: 0.0,
+            ..brush
+        };
+        assert_eq!(shape_count_for(&fixed, 12.0, 9.0), 8);
+    }
+
+    #[test]
+    fn roundness_jitter_varies_per_dab_and_stays_in_range() {
+        let brush = Brush {
+            roundness: 1.0,
+            roundness_jitter: 1.0,
+            ..Default::default()
+        };
+        let values: Vec<f32> = (0..64)
+            .map(|i| dab_roundness(&brush, i as f32 * 3.7, i as f32 * 1.9))
+            .collect();
+        assert!(values.iter().all(|&value| (0.1..=1.0).contains(&value)));
+        assert!(values.iter().any(|&value| value < 1.0));
+        let again: Vec<f32> = (0..64)
+            .map(|i| dab_roundness(&brush, i as f32 * 3.7, i as f32 * 1.9))
+            .collect();
+        assert_eq!(values, again);
+        let fixed = Brush {
+            roundness_jitter: 0.0,
+            ..brush
+        };
+        assert_eq!(dab_roundness(&fixed, 12.0, 9.0), 1.0);
+    }
+
+    #[test]
+    fn size_and_opacity_jitter_vary_and_are_deterministic() {
+        let brush = Brush {
+            size_jitter: 1.0,
+            opacity_jitter: 1.0,
+            ..Default::default()
+        };
+        let values: Vec<(f32, f32)> = (0..64)
+            .map(|i| jittered_dab(&brush, i as f32 * 3.7, i as f32 * 1.9, 0, 10.0, 1.0))
+            .collect();
+        assert!(
+            values
+                .iter()
+                .all(|&(size, opacity)| (0.0..=10.0).contains(&size)
+                    && (0.0..=1.0).contains(&opacity))
+        );
+        assert!(values.iter().any(|&(size, _)| size < 10.0));
+        assert!(values.iter().any(|&(_, opacity)| opacity < 1.0));
+        let again: Vec<(f32, f32)> = (0..64)
+            .map(|i| jittered_dab(&brush, i as f32 * 3.7, i as f32 * 1.9, 0, 10.0, 1.0))
+            .collect();
+        assert_eq!(values, again);
+        let fixed = Brush {
+            size_jitter: 0.0,
+            opacity_jitter: 0.0,
+            ..brush
+        };
+        assert_eq!(jittered_dab(&fixed, 12.0, 9.0, 2, 10.0, 0.8), (10.0, 0.8));
+    }
+
+    #[test]
+    fn shape_rotation_follows_the_stroke_without_angle_follow() {
+        let tip = BrushTip::from_mask(8, 4, vec![255u8; 32]).unwrap();
+        let brush = Brush {
+            size: 8.0,
+            opacity: 1.0,
+            spacing: 2.0,
+            tip: Some(tip),
+            shape_rotation: 1.0,
+            ..Default::default()
+        };
+        let paint = |from: (f32, f32), to: (f32, f32), angle: f32| {
+            let mut doc = Document::new(48, 48);
+            let d = DabDynamics {
+                pressure: 1.0,
+                speed_norm: 0.0,
+                angle,
+                taper: 1.0,
+            };
+            doc.stroke_to_dyn(&brush, Color::rgb(255, 255, 255), Some(from), d, to, d, 0.0);
+            painted_bbox(&doc).unwrap()
+        };
+        let (hx0, hy0, hx1, hy1) = paint((24.0, 24.0), (32.0, 24.0), 0.0);
+        let (vx0, vy0, vx1, vy1) = paint((24.0, 24.0), (24.0, 32.0), std::f32::consts::FRAC_PI_2);
+        assert!(hx1 - hx0 > hy1 - hy0, "horizontal should be wide");
+        assert!(vy1 - vy0 > vx1 - vx0, "vertical should be tall");
+    }
+
+    #[test]
+    fn angle_scatter_rotates_the_stamp() {
+        let tip = BrushTip::from_mask(8, 4, vec![255u8; 32]).unwrap();
+        let brush = Brush {
+            size: 8.0,
+            opacity: 1.0,
+            spacing: 2.0,
+            tip: Some(tip),
+            angle_scatter: 1.0,
+            shape_count: 4,
+            ..Default::default()
+        };
+        let paint = |brush: &Brush| {
+            let mut doc = Document::new(48, 48);
+            doc.dab(brush, Color::rgb(255, 255, 255), 24.0, 24.0);
+            doc.layers[0].pixels.clone()
+        };
+        assert_ne!(
+            paint(&brush),
+            paint(&Brush {
+                angle_scatter: 0.0,
+                ..brush.clone()
+            })
+        );
+    }
+
+    #[test]
     fn validation_rejects_new_ranges() {
         let dir = std::env::temp_dir();
         let path = dir.join("procraft-lib-m14-range.pcbrush");
@@ -2927,7 +3996,7 @@ mod tests {
                 ..Default::default()
             },
             Brush {
-                pressure_opacity: -0.5,
+                pressure_opacity: -1.5,
                 ..Default::default()
             },
             Brush {
@@ -2947,7 +4016,65 @@ mod tests {
                 ..Default::default()
             },
             Brush {
+                taper: Taper {
+                    size: 1.5,
+                    ..Taper::NONE
+                },
+                ..Default::default()
+            },
+            Brush {
+                taper: Taper {
+                    pressure: -0.1,
+                    ..Taper::NONE
+                },
+                ..Default::default()
+            },
+            Brush {
+                roundness_jitter: 1.5,
+                ..Default::default()
+            },
+            Brush {
+                size_jitter: 1.5,
+                ..Default::default()
+            },
+            Brush {
+                opacity_jitter: -0.5,
+                ..Default::default()
+            },
+            Brush {
                 scatter: -1.0,
+                ..Default::default()
+            },
+            Brush {
+                shape_rotation: 2.0,
+                ..Default::default()
+            },
+            Brush {
+                angle_scatter: 1.5,
+                ..Default::default()
+            },
+            Brush {
+                shape_count: 0,
+                ..Default::default()
+            },
+            Brush {
+                shape_count_jitter: 1.5,
+                ..Default::default()
+            },
+            Brush {
+                pressure_curve: Some(vec![[0.0, 0.0]]),
+                ..Default::default()
+            },
+            Brush {
+                pressure_opacity_curve: Some(vec![[0.0, 0.0]]),
+                ..Default::default()
+            },
+            Brush {
+                velocity_size_curve: Some(vec![[0.0, 0.0]]),
+                ..Default::default()
+            },
+            Brush {
+                velocity_opacity_curve: Some(vec![[0.0, 0.0]]),
                 ..Default::default()
             },
             Brush {
@@ -2961,6 +4088,15 @@ mod tests {
             }];
             assert!(save_brush_library(&path, &libs).is_err());
         }
+        let signed = vec![BrushPreset {
+            name: "Signed".to_string(),
+            brush: Brush {
+                pressure_size: -0.5,
+                pressure_opacity: -0.5,
+                ..Default::default()
+            },
+        }];
+        save_brush_library(&path, &signed).unwrap();
         let _ = std::fs::remove_file(&path);
     }
 

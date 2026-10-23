@@ -24,7 +24,7 @@ pub use animation::{
 };
 pub use brush::{
     open_brush_library, presets, save_brush_library, Brush, BrushPreset, BrushTip, Color,
-    DabDynamics, ShapePoly, Stroke, MAX_LIBRARY_BRUSHES, MAX_TIP_SIDE,
+    DabDynamics, ShapePoly, Stroke, Taper, MAX_LIBRARY_BRUSHES, MAX_TIP_SIDE,
 };
 pub use document::{
     curves_lut, gallery_thumb, levels_lut, BlendMode, Document, Layer, LayerGroup, PaintTarget,
@@ -38,7 +38,9 @@ pub use palette::{
     MAX_IMAGE_COLORS, MAX_PALETTES, MAX_PALETTE_COLORS,
 };
 pub use pointer::{pan_offset, shift_wheel_remap, size_drag_factor, zoom_drag_factor};
-pub use probrush::{export_tip_png, import_brush_file, ImportedBrush};
+pub use probrush::{
+    export_tip_png, import_brush_file, import_brush_file_report, ImportOutcome, ImportedBrush,
+};
 pub use psd::{open_psd, save_psd};
 pub use settings::{Settings, SETTINGS_VERSION};
 pub use shortcuts::{

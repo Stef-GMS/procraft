@@ -1,10 +1,14 @@
 //! Clip Studio Paint `.sut` import. A `.sut` is a SQLite database: `Node`
 //! names the brush, `Variant` holds its settings and `MaterialFile` carries
 //! tip imagery (usually a tar of PNGs). Only the settings that map cleanly
-//! onto a ProCraft brush are imported; CSP dynamics curves are not.
+//! onto a ProCraft brush are imported. Pressure curves from the size and
+//! opacity effectors are imported when CSP marks pressure as active. CSP's
+//! second effector curve is tilt, not speed, so it is left unmapped along with
+//! taper and the remaining effector curves.
 
 use super::{
-    cap_list, clamp_spacing, clean_name, decode_png_mask, stamp_brush, Brush, ImportedBrush,
+    cap_list, clamp_spacing, clean_name, decode_png_mask, fit_tip, stamp_brush, Brush, BrushTip,
+    ImportedBrush,
 };
 
 const MAX_ROW_BYTES: usize = 64 * 1024 * 1024;
@@ -29,19 +33,25 @@ pub(super) fn import_sut(bytes: &[u8], stem: &str) -> Result<Vec<ImportedBrush>,
             node_variant = int_value(table, row, "NodeVariantID").unwrap_or(0);
         }
     }
+    let variant_row = variant.as_ref().and_then(|table| {
+        table
+            .rows
+            .iter()
+            .find(|row| int_value(table, row, "VariantID") == Some(node_variant))
+            .or_else(|| table.rows.first())
+    });
     let (settings, pattern_key) = variant
         .as_ref()
-        .and_then(|table| {
-            let row = table
-                .rows
-                .iter()
-                .find(|row| int_value(table, row, "VariantID") == Some(node_variant))
-                .or_else(|| table.rows.first())?;
-            Some((Settings::read(table, row), pattern_reference(table, row)))
+        .zip(variant_row)
+        .map(|(table, row)| {
+            (
+                Settings::read(table, row),
+                image_reference(table, row, "BrushPatternImageArray"),
+            )
         })
         .unwrap_or_default();
 
-    let mut brush = if let Some((w, h, mask)) = material_tip(&db, pattern_key.as_deref()) {
+    let mut brush = if let Some((w, h, mask)) = material_image(&db, pattern_key.as_deref()) {
         stamp_brush(name.clone(), w, h, mask, settings.spacing)?.brush
     } else {
         Brush {
@@ -63,7 +73,21 @@ pub(super) fn import_sut(bytes: &[u8], stem: &str) -> Result<Vec<ImportedBrush>,
     brush.spacing = settings.spacing;
     brush.roundness = settings.roundness;
     brush.scatter = settings.scatter;
-
+    brush.angle = settings.angle;
+    brush.angle_scatter = settings.angle_scatter;
+    brush.wet_edge = settings.wet_edge;
+    if let Some(curve) = settings.pressure_curve {
+        brush.pressure_curve = Some(curve);
+        brush.pressure_size = 1.0;
+    }
+    if let Some(curve) = settings.pressure_opacity_curve {
+        brush.pressure_opacity_curve = Some(curve);
+        brush.pressure_opacity = 1.0;
+    }
+    if let (Some(table), Some(row)) = (variant.as_ref(), variant_row) {
+        apply_texture(&mut brush, &db, table, row);
+        apply_dual(&mut brush, &db, table, row);
+    }
     cap_list(vec![ImportedBrush { name, brush }])
 }
 
@@ -75,6 +99,11 @@ struct Settings {
     spacing: f32,
     roundness: f32,
     scatter: f32,
+    angle: f32,
+    angle_scatter: f32,
+    wet_edge: f32,
+    pressure_curve: Option<Vec<[f32; 2]>>,
+    pressure_opacity_curve: Option<Vec<[f32; 2]>>,
 }
 
 impl Default for Settings {
@@ -87,6 +116,11 @@ impl Default for Settings {
             spacing: 0.15,
             roundness: 1.0,
             scatter: 0.0,
+            angle: 0.0,
+            angle_scatter: 0.0,
+            wet_edge: 0.0,
+            pressure_curve: None,
+            pressure_opacity_curve: None,
         }
     }
 }
@@ -132,17 +166,166 @@ impl Settings {
             let spray = number(table, row, "BrushSpraySize").unwrap_or(size * 0.3);
             s.scatter = (spray / size).clamp(0.0, 1.0) as f32;
         }
+        if let Some(v) = number(table, row, "BrushRotation") {
+            if v.is_finite() {
+                s.angle = v.to_radians() as f32;
+            }
+        }
+        if let Some(v) = number(table, row, "BrushRotationRandomScale") {
+            if v.is_finite() {
+                s.angle_scatter = (v / 100.0).clamp(0.0, 1.0) as f32;
+            }
+        }
+        if int_value(table, row, "BrushUseWaterEdge").unwrap_or(0) != 0 {
+            s.wet_edge = 1.0;
+        }
+        s.pressure_curve = effector_pressure_curve(table, row, "BrushSizeEffector");
+        s.pressure_opacity_curve = effector_pressure_curve(table, row, "BrushOpacityEffector");
         s
     }
 }
 
-fn pattern_reference(table: &Table, row: &[Value]) -> Option<String> {
-    let Value::Blob(blob) = value(table, row, "BrushPatternImageArray")? else {
+fn effector_pressure_curve(table: &Table, row: &[Value], name: &str) -> Option<Vec<[f32; 2]>> {
+    let Value::Blob(blob) = value(table, row, name)? else {
+        return None;
+    };
+    pressure_curve_from_effector(blob)
+}
+
+fn pressure_curve_from_effector(blob: &[u8]) -> Option<Vec<[f32; 2]>> {
+    const PRESSURE: u32 = 0x10;
+    const CURVE_KIND: u32 = 12;
+    const CURVE_STRIDE: usize = 16;
+
+    let header = be32(blob, 0)? as usize;
+    if !(40..=48).contains(&header) || !header.is_multiple_of(4) || header > blob.len() {
+        return None;
+    }
+    if be32(blob, 8)? & PRESSURE == 0 {
+        return None;
+    }
+    let slots = (header == 44 || header == 48)
+        .then(|| Some([be32(blob, 32)? as usize, be32(blob, 36)? as usize]))
+        .flatten();
+
+    let mut curves = Vec::new();
+    let mut offset = header;
+    while curves.len() < 4 && offset.checked_add(12)? <= blob.len() {
+        let kind = be32(blob, offset)?;
+        let count = be32(blob, offset + 4)? as usize;
+        let stride = be32(blob, offset + 8)? as usize;
+        if kind != CURVE_KIND || stride != CURVE_STRIDE || !(2..=64).contains(&count) {
+            break;
+        }
+        let start = offset.checked_add(12)?;
+        let end = start.checked_add(count.checked_mul(stride)?)?;
+        if end > blob.len() {
+            break;
+        }
+        let mut curve = Vec::with_capacity(count);
+        for point in 0..count {
+            let at = start + point * stride;
+            let x = f64::from_be_bytes(blob.get(at..at + 8)?.try_into().ok()?);
+            let y = f64::from_be_bytes(blob.get(at + 8..at + 16)?.try_into().ok()?);
+            if !x.is_finite() || !y.is_finite() {
+                return None;
+            }
+            curve.push([x.clamp(0.0, 1.0) as f32, y.clamp(0.0, 1.0) as f32]);
+        }
+        curve.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        curve.dedup_by(|a, b| (a[0] - b[0]).abs() < 1e-6);
+        if curve.len() >= 2 {
+            curves.push(curve);
+        }
+        offset = end;
+    }
+
+    let curve = match slots {
+        Some([pressure, tilt]) => {
+            let mut next = 0usize;
+            let mut pressure_index = None;
+            for (slot, bytes) in [pressure, tilt].into_iter().enumerate() {
+                if bytes == 0 {
+                    continue;
+                }
+                let curve = curves.get(next)?;
+                if 12 + CURVE_STRIDE * curve.len() != bytes {
+                    return None;
+                }
+                if slot == 0 {
+                    pressure_index = Some(next);
+                }
+                next += 1;
+            }
+            pressure_index.and_then(|index| curves.get(index).cloned())
+        }
+        None => curves.first().cloned(),
+    };
+    curve
+}
+
+fn image_reference(table: &Table, row: &[Value], column: &str) -> Option<String> {
+    let Value::Blob(blob) = value(table, row, column)? else {
         return None;
     };
     utf16_strings(blob)
         .into_iter()
         .find(|text| text.contains(":data:") && text.len() >= 8)
+}
+
+fn apply_texture(brush: &mut Brush, db: &Db, table: &Table, row: &[Value]) {
+    let Some(key) = image_reference(table, row, "TextureImage") else {
+        return;
+    };
+    let Some((w, h, mask)) = material_image(db, Some(&key)) else {
+        return;
+    };
+    let density = number(table, row, "TextureDensity")
+        .unwrap_or(0.0)
+        .clamp(0.0, 100.0) as f32
+        / 100.0;
+    if density <= 0.0 {
+        return;
+    }
+    let (tw, th, mut mask) = fit_tip(w, h, mask);
+    if int_value(table, row, "TextureReverseDensity").unwrap_or(0) != 0 {
+        for value in &mut mask {
+            *value = 255 - *value;
+        }
+    }
+    let Ok(tip) = BrushTip::from_mask(tw, th, mask) else {
+        return;
+    };
+    let original = w.max(h) as f32;
+    let resized = tw.max(th) as f32;
+    let scale = number(table, row, "TextureScale2").unwrap_or(100.0) as f32 / 100.0;
+    let angle = number(table, row, "TextureRotate").unwrap_or(0.0) as f32;
+    brush.grain = density;
+    brush.grain_tip = Some(tip);
+    brush.grain_scale = (original / resized * scale).clamp(0.25, 4.0);
+    brush.grain_angle = angle.to_radians();
+}
+
+fn apply_dual(brush: &mut Brush, db: &Db, table: &Table, row: &[Value]) {
+    if int_value(table, row, "UseDualBrush").unwrap_or(0) == 0 {
+        return;
+    }
+    let Some(key) = image_reference(table, row, "DualPatternImageArray") else {
+        return;
+    };
+    let Some((w, h, mask)) = material_image(db, Some(&key)) else {
+        return;
+    };
+    let (tw, th, mask) = fit_tip(w, h, mask);
+    let Ok(tip) = BrushTip::from_mask(tw, th, mask) else {
+        return;
+    };
+    let main = number(table, row, "BrushSize")
+        .unwrap_or(brush.size as f64)
+        .max(1.0);
+    let dual = number(table, row, "DualSize").unwrap_or(main);
+    brush.dual_tip = Some(tip);
+    brush.dual_scale = (dual / main).clamp(0.1, 4.0) as f32;
 }
 
 fn utf16_strings(bytes: &[u8]) -> Vec<String> {
@@ -176,7 +359,7 @@ fn row_contains_tag(row: &[Value], tag: &[u8]) -> bool {
         .any(|value| matches!(value, Value::Blob(blob) if find_bytes(blob, 0, tag).is_some()))
 }
 
-fn material_tip(db: &Db, pattern_key: Option<&str>) -> Option<(u32, u32, Vec<u8>)> {
+fn material_image(db: &Db, pattern_key: Option<&str>) -> Option<(u32, u32, Vec<u8>)> {
     let table = db.table("MaterialFile")?;
     let file_column = column_index(&table, "FileData");
     let mut rows: Vec<&Vec<Value>> = Vec::new();
@@ -701,6 +884,71 @@ fn number(table: &Table, row: &[Value], name: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
+    fn effector_blob(
+        header: usize,
+        flags: u32,
+        slots: [usize; 2],
+        curves: &[&[[f32; 2]]],
+    ) -> Vec<u8> {
+        let mut ints = vec![0u32; header / 4];
+        ints[0] = header as u32;
+        ints[2] = flags;
+        if header >= 44 {
+            ints[8] = slots[0] as u32;
+            ints[9] = slots[1] as u32;
+        }
+        let mut blob = Vec::new();
+        for word in ints {
+            blob.extend_from_slice(&word.to_be_bytes());
+        }
+        for curve in curves {
+            blob.extend_from_slice(&12u32.to_be_bytes());
+            blob.extend_from_slice(&(curve.len() as u32).to_be_bytes());
+            blob.extend_from_slice(&16u32.to_be_bytes());
+            for point in *curve {
+                blob.extend_from_slice(&(point[0] as f64).to_be_bytes());
+                blob.extend_from_slice(&(point[1] as f64).to_be_bytes());
+            }
+        }
+        blob
+    }
+
+    #[test]
+    fn effector_uses_the_pressure_slot_not_the_tilt_slot() {
+        let pressure = [[0.0, 0.0], [1.0, 1.0]];
+        let tilt = [[0.0, 1.0], [1.0, 0.0]];
+        let blob = effector_blob(48, 0x30, [44, 44], &[&pressure, &tilt]);
+        assert_eq!(
+            pressure_curve_from_effector(&blob).as_deref(),
+            Some(&pressure[..])
+        );
+    }
+
+    #[test]
+    fn effector_does_not_use_a_tilt_only_curve_as_pressure() {
+        let tilt = [[0.0, 1.0], [1.0, 0.0]];
+        let blob = effector_blob(48, 0x20, [0, 44], &[&tilt]);
+        assert_eq!(pressure_curve_from_effector(&blob), None);
+    }
+
+    #[test]
+    fn effector_ignores_curves_when_pressure_is_inactive() {
+        let pressure = [[0.0, 0.0], [1.0, 1.0]];
+        let blob = effector_blob(48, 0x20, [44, 0], &[&pressure]);
+        assert_eq!(pressure_curve_from_effector(&blob), None);
+    }
+
+    #[test]
+    fn effector_reads_a_44_byte_header_and_ignores_extra_speed_curve() {
+        let pressure = [[0.0, 0.0], [1.0, 1.0]];
+        let speed = [[0.0, 1.0], [1.0, 0.0]];
+        let blob = effector_blob(44, 0x50, [44, 0], &[&pressure, &speed]);
+        assert_eq!(
+            pressure_curve_from_effector(&blob).as_deref(),
+            Some(&pressure[..])
+        );
+    }
+
     #[test]
     fn sut_reads_name_settings_and_embedded_tip() {
         let bytes = include_bytes!("../../testdata/csp_sample.sut");
@@ -717,6 +965,45 @@ mod tests {
         assert_eq!((tip.w, tip.h), (8, 8));
         assert!(tip.mask[3 * 8 + 3] > 200);
         assert_eq!(tip.mask[0], 0);
+    }
+
+    #[test]
+    fn sut_imports_size_pressure_curve() {
+        let bytes = include_bytes!("../../testdata/csp_pressure_sample.sut");
+        let brushes = import_sut(bytes, "sample").expect("import");
+        let brush = &brushes[0].brush;
+        assert_eq!(brush.pressure_size, 1.0);
+        assert_eq!(
+            brush.pressure_curve.as_deref(),
+            Some(&[[0.0, 0.0], [0.5, 0.35], [1.0, 1.0]][..])
+        );
+        assert!((brush.resolve_size(0.5, 0.0) - 14.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn sut_imports_opacity_pressure_curve() {
+        let bytes = include_bytes!("../../testdata/csp_pressure_sample.sut");
+        let brushes = import_sut(bytes, "sample").expect("import");
+        let brush = &brushes[0].brush;
+        assert_eq!(brush.pressure_opacity, 1.0);
+        assert_eq!(
+            brush.pressure_opacity_curve.as_deref(),
+            Some(&[[0.0, 0.0], [0.25, 0.1], [0.75, 0.8], [1.0, 1.0]][..])
+        );
+        assert!((brush.resolve_opacity(0.5, 0.0) - 0.45).abs() < 0.001);
+    }
+
+    #[test]
+    fn sut_does_not_import_tilt_as_velocity() {
+        let bytes = include_bytes!("../../testdata/csp_pressure_sample.sut");
+        let brushes = import_sut(bytes, "sample").expect("import");
+        let brush = &brushes[0].brush;
+        assert_eq!(brush.velocity_size_curve, None);
+        assert_eq!(brush.velocity_opacity_curve, None);
+        for speed in [0.25, 0.5, 0.8, 1.0] {
+            assert!(brush.resolve_size(1.0, speed) > 0.0);
+            assert!(brush.resolve_opacity(1.0, speed) > 0.0);
+        }
     }
 
     #[test]
@@ -746,6 +1033,27 @@ mod tests {
         assert_eq!((tip.w, tip.h), (16, 16));
         assert!(tip.mask[8 * 16 + 8] > 200);
         assert_eq!(tip.mask[0], 0);
+    }
+
+    #[test]
+    fn sut_imports_texture_image_as_grain() {
+        let bytes = include_bytes!("../../testdata/csp_texture_sample.sut");
+        let brushes = import_sut(bytes, "sample").expect("import");
+        let brush = &brushes[0].brush;
+        let grain = brush.grain_tip.as_ref().expect("texture grain");
+        assert_eq!((grain.w, grain.h), (8, 8));
+        assert_eq!(grain.mask[0], 255);
+        assert!(grain.mask[7] < 40);
+        assert!((brush.grain - 0.6).abs() < 0.01);
+        assert!((brush.grain_scale - 0.5).abs() < 0.01);
+        assert!((brush.grain_angle - std::f32::consts::FRAC_PI_2).abs() < 0.001);
+        assert!((brush.angle - 30f32.to_radians()).abs() < 0.001);
+        assert!((brush.angle_scatter - 0.2).abs() < 0.01);
+        assert!((brush.wet_edge - 1.0).abs() < 0.01);
+        let dual = brush.dual_tip.as_ref().expect("dual tip");
+        assert_eq!((dual.w, dual.h), (16, 16));
+        assert!(dual.mask[8 * 16 + 8] > 200);
+        assert!((brush.dual_scale - 1.6).abs() < 0.01);
     }
 
     #[test]

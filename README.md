@@ -6,8 +6,6 @@
   </a>
 </p>
 
-[![Discord](https://img.shields.io/badge/Discord-Join%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/eaxeQGzgtt)
-
 By [surfrpt1](https://github.com/surfrpt1).
 
 An open-source, clean-room raster painting studio in pure Rust: layered

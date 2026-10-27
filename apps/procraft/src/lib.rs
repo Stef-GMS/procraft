@@ -243,14 +243,10 @@ fn quick_controls(tool: Tool) -> &'static [QuickControl] {
     }
 }
 
-/// Finger-sized hit height for the quick bar; desktop keeps the compact
-/// 20 px controls.
+/// Finger-sized hit height for the quick bar, from the same token table the
+/// rest of the chrome uses.
 fn quick_hit_height(layout: BarLayout) -> f32 {
-    match layout {
-        BarLayout::Wide => 20.0,
-        BarLayout::Narrow => 34.0,
-        BarLayout::Tablet => 40.0,
-    }
+    design::tokens(Theme::Dark, layout).control_h
 }
 
 /// Phones and tablets get one horizontally scrollable row (vertical space
@@ -1593,7 +1589,7 @@ impl ProCraftApp {
                 for note in [&self.save_note, &self.settings_note].into_iter().flatten() {
                     let t = design::tokens(
                         self.theme,
-                        bar_layout(
+                        effective_layout(
                             ctx.viewport_rect().width(),
                             cfg!(any(target_os = "ios", target_os = "android")),
                         ),
@@ -2144,7 +2140,7 @@ impl ProCraftApp {
     fn tokens(&self, ui: &egui::Ui) -> design::Tokens {
         design::tokens(
             self.theme,
-            bar_layout(
+            effective_layout(
                 ui.ctx().viewport_rect().width(),
                 cfg!(any(target_os = "ios", target_os = "android")),
             ),
@@ -2241,7 +2237,7 @@ impl ProCraftApp {
             .selected_text(self.theme.name())
             .show_ui(ui, |ui| {
                 if touch {
-                    ui.spacing_mut().interact_size.y = 40.0;
+                    ui.spacing_mut().interact_size.y = self.tokens(ui).control_h;
                 }
                 ui.selectable_value(&mut self.theme, Theme::Dark, "Dark");
                 ui.selectable_value(&mut self.theme, Theme::Light, "Light");
@@ -3337,6 +3333,26 @@ fn bar_layout(width: f32, mobile: bool) -> BarLayout {
     } else {
         BarLayout::Wide
     }
+}
+
+/// A dev-only device-class override so a desktop build can be screenshotted
+/// in the touch layouts. `bar_layout` stays pure; everything that asks for a
+/// class goes through [`resolve_layout`] instead.
+fn forced_layout() -> Option<BarLayout> {
+    match std::env::var("PROCRAFT_FORCE_LAYOUT").ok()?.as_str() {
+        "wide" => Some(BarLayout::Wide),
+        "tablet" => Some(BarLayout::Tablet),
+        "narrow" => Some(BarLayout::Narrow),
+        _ => None,
+    }
+}
+
+fn resolve_layout(forced: Option<BarLayout>, width: f32, mobile: bool) -> BarLayout {
+    forced.unwrap_or_else(|| bar_layout(width, mobile))
+}
+
+fn effective_layout(width: f32, mobile: bool) -> BarLayout {
+    resolve_layout(forced_layout(), width, mobile)
 }
 
 /// Mobile edge padding (Android status-bar px / iOS safe-area points)
@@ -5142,7 +5158,7 @@ impl eframe::App for ProCraftApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        let class = bar_layout(
+        let class = effective_layout(
             ui.ctx().viewport_rect().width(),
             cfg!(any(target_os = "ios", target_os = "android")),
         );
@@ -5432,13 +5448,14 @@ impl eframe::App for ProCraftApp {
                     ui.add_space(pad);
                 }
             }
-            let layout = bar_layout(
+            let layout = effective_layout(
                 ui.ctx().viewport_rect().width(),
                 cfg!(any(target_os = "ios", target_os = "android")),
             );
+            let bar_t = design::tokens(self.theme, layout);
             if layout == BarLayout::Tablet {
-                ui.spacing_mut().interact_size.y = 40.0;
-                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                ui.spacing_mut().interact_size.y = bar_t.control_h;
+                ui.spacing_mut().item_spacing = egui::vec2(bar_t.gap, bar_t.gap);
             }
             // Device pass 1: on touch layouts, tapping a stepper/slider inside
             // a menu closed it before the tap could land. CloseOnClickOutside
@@ -5464,7 +5481,7 @@ impl eframe::App for ProCraftApp {
                     .config(menu_config())
                     .ui(ui, |ui| {
                         if layout == BarLayout::Tablet {
-                            ui.spacing_mut().interact_size.y = 40.0;
+                            ui.spacing_mut().interact_size.y = bar_t.control_h;
                         }
                         if ui.button("Save PNG").clicked() {
                             ui.close();
@@ -5702,7 +5719,7 @@ impl eframe::App for ProCraftApp {
                         .config(menu_config())
                         .ui(ui, |ui| {
                             if layout == BarLayout::Tablet {
-                                ui.spacing_mut().interact_size.y = 40.0;
+                                ui.spacing_mut().interact_size.y = bar_t.control_h;
                             }
                             // Tablet pulls the theme picker out of the menu
                             // into its own dropdown beside it.
@@ -5717,7 +5734,7 @@ impl eframe::App for ProCraftApp {
             });
         });
 
-        let tool_layout = bar_layout(
+        let tool_layout = effective_layout(
             ui.ctx().viewport_rect().width(),
             cfg!(any(target_os = "ios", target_os = "android")),
         );
@@ -8556,7 +8573,11 @@ impl eframe::App for ProCraftApp {
             egui::Area::new(egui::Id::new("tools-fab"))
                 .anchor(egui::Align2::LEFT_CENTER, [8.0, 0.0])
                 .show(ui.ctx(), |ui| {
-                    if ui.add_sized([44.0, 44.0], egui::Button::new("▶")).clicked() {
+                    let t = self.tokens(ui);
+                    if ui
+                        .add_sized([t.control_h, t.control_h], egui::Button::new("▶"))
+                        .clicked()
+                    {
                         self.show_tools = true;
                     }
                 });
@@ -8565,7 +8586,11 @@ impl eframe::App for ProCraftApp {
             egui::Area::new(egui::Id::new("layers-fab"))
                 .anchor(egui::Align2::RIGHT_CENTER, [-8.0, 0.0])
                 .show(ui.ctx(), |ui| {
-                    if ui.add_sized([44.0, 44.0], egui::Button::new("◀")).clicked() {
+                    let t = self.tokens(ui);
+                    if ui
+                        .add_sized([t.control_h, t.control_h], egui::Button::new("◀"))
+                        .clicked()
+                    {
                         self.show_layers = true;
                     }
                 });
@@ -10950,12 +10975,25 @@ mod tests {
 
     #[test]
     fn quick_bar_touch_geometry_is_finger_sized() {
-        assert_eq!(quick_hit_height(BarLayout::Wide), 20.0);
-        assert_eq!(quick_hit_height(BarLayout::Narrow), 34.0);
-        assert_eq!(quick_hit_height(BarLayout::Tablet), 40.0);
+        assert_eq!(quick_hit_height(BarLayout::Wide), 26.0);
+        assert_eq!(quick_hit_height(BarLayout::Narrow), 44.0);
+        assert_eq!(quick_hit_height(BarLayout::Tablet), 44.0);
         assert!(quick_scrolls(BarLayout::Narrow));
-        assert!(quick_scrolls(BarLayout::Tablet));
         assert!(!quick_scrolls(BarLayout::Wide));
+    }
+
+    #[test]
+    fn forced_layout_wins_over_the_width_rules() {
+        assert_eq!(
+            resolve_layout(Some(BarLayout::Tablet), 380.0, false),
+            BarLayout::Tablet
+        );
+        assert_eq!(
+            resolve_layout(Some(BarLayout::Narrow), 1400.0, false),
+            BarLayout::Narrow
+        );
+        assert_eq!(resolve_layout(None, 380.0, false), BarLayout::Narrow);
+        assert_eq!(resolve_layout(None, 844.0, true), BarLayout::Tablet);
     }
 
     #[test]

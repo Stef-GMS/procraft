@@ -81,12 +81,28 @@ pub(crate) fn tokens(theme: Theme, class: BarLayout) -> Tokens {
             ),
         };
 
-    let (control_h, gap, pad_x, pad_y, pad_x_card, pad_y_card, radius_control, radius_card, slider_track, type_body, type_small, type_heading) =
-        match class {
-            BarLayout::Wide => (26.0, 6.0, 10.0, 6.0, 6.0, 8.0, 8, 10, 6.0, 14.0, 12.0, 15.0),
-            BarLayout::Tablet => (44.0, 8.0, 14.0, 10.0, 8.0, 10.0, 12, 14, 10.0, 15.0, 13.0, 16.0),
-            BarLayout::Narrow => (44.0, 6.0, 10.0, 8.0, 8.0, 10.0, 12, 14, 10.0, 15.0, 13.0, 16.0),
-        };
+    let (
+        control_h,
+        gap,
+        pad_x,
+        pad_y,
+        pad_x_card,
+        pad_y_card,
+        radius_control,
+        radius_card,
+        slider_track,
+        type_body,
+        type_small,
+        type_heading,
+    ) = match class {
+        BarLayout::Wide => (26.0, 6.0, 10.0, 6.0, 6.0, 8.0, 8, 10, 6.0, 14.0, 12.0, 15.0),
+        BarLayout::Tablet => (
+            44.0, 8.0, 14.0, 10.0, 8.0, 10.0, 12, 14, 10.0, 15.0, 13.0, 16.0,
+        ),
+        BarLayout::Narrow => (
+            44.0, 6.0, 10.0, 8.0, 8.0, 10.0, 12, 14, 10.0, 15.0, 13.0, 16.0,
+        ),
+    };
 
     Tokens {
         class,
@@ -280,6 +296,67 @@ pub(crate) fn pill_button(ui: &mut egui::Ui, t: &Tokens, spec: PillSpec<'_>) -> 
     }
 }
 
+/// Inner padding of a section card: vertical padding always, horizontal only
+/// when the card is not `flush` (the swatch grid needs every pixel).
+pub(crate) fn card_pad(t: &Tokens, flush: bool) -> egui::Vec2 {
+    egui::vec2(if flush { 0.0 } else { t.pad_x_card }, t.pad_y_card)
+}
+
+/// Content width a card can offer inside a panel of `panel_width`
+/// (`16.0` is the panel's own ~8 px margin on each side).
+pub(crate) fn card_available_width(panel_width: f32, t: &Tokens, flush: bool) -> f32 {
+    panel_width - 16.0 - 2.0 * card_pad(t, flush).x
+}
+
+/// A surface panel section: one rounded, stroked card per existing top-level
+/// heading. Cards only wrap what was already there — they never re-cut it.
+pub(crate) fn section_card(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    title: Option<&str>,
+    flush: bool,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    section_card_actions(ui, t, title, flush, |_| {}, add);
+}
+
+/// A card whose title row also carries one or more right-aligned controls
+/// (the panel collapse buttons), so a card does not spend a whole row on a
+/// lone arrow.
+pub(crate) fn section_card_actions(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    title: Option<&str>,
+    flush: bool,
+    title_actions: impl FnOnce(&mut egui::Ui),
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::NONE
+        .fill(t.surface_2)
+        .stroke(Stroke::new(1.0, t.stroke))
+        .corner_radius(CornerRadius::same(t.radius_card))
+        .inner_margin(egui::Margin::from(card_pad(t, flush)))
+        .show(ui, |ui| {
+            // Cards are one column: keep every card as wide as the panel.
+            ui.set_width(ui.available_width());
+            if let Some(title) = title {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(title.to_uppercase())
+                            .font(FontId::proportional(t.type_small))
+                            .color(t.text_lo),
+                    );
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        title_actions,
+                    );
+                });
+                ui.add_space(6.0);
+            }
+            add(ui);
+        });
+}
+
 fn luminance_channel(c: u8) -> f32 {
     let c = c as f32 / 255.0;
     if c <= 0.04045 {
@@ -355,6 +432,15 @@ mod tests {
         let w = tokens(Theme::Dark, BarLayout::Wide);
         assert_eq!(pill_width(&w, 0.0), 26.0);
         assert_eq!(pill_radius(&w), 13);
+    }
+
+    #[test]
+    fn flush_cards_leave_the_swatch_grid_its_full_224px() {
+        let t = tokens(Theme::Dark, BarLayout::Wide);
+        assert_eq!(card_pad(&t, false).x, 6.0);
+        assert_eq!(card_pad(&t, true).x, 0.0);
+        assert_eq!(card_available_width(240.0, &t, true), 224.0);
+        assert!(card_available_width(240.0, &t, false) < 224.0);
     }
 
     #[test]

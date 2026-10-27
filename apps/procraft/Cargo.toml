@@ -21,8 +21,13 @@ egui = "0.36"
 image = "0.25"
 
 # Desktop windowing + dialogs.
+# `persistence` is required: `build_options` points eframe at
+# %APPDATA%\procraft\ui.json for window rect + panel widths, and M49's
+# seed-once marker (`m49_seeded`) is written through `Frame::storage_mut`.
+# Without this feature `cc.storage` is always None on desktop, so the
+# marker never lands and the legacy migration never runs.
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
-eframe = "0.36"
+eframe = { version = "0.36", features = ["persistence"] }
 rfd = "0.17"
 
 # iOS: glutin (eframe's glow backend) has no iOS support, so the iOS build

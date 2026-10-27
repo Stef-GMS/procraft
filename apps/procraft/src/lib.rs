@@ -26,6 +26,7 @@ use procraft_engine::{ext_matches, file_size_label};
 #[cfg(any(target_os = "ios", target_os = "android"))]
 use rfd_shim as rfd;
 
+mod design;
 mod settings;
 
 /// Every extension `import_brush_file` can dispatch.
@@ -415,8 +416,8 @@ struct TapTrack {
     moved: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Theme {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Theme {
     Dark,
     Light,
     Paper,
@@ -440,20 +441,6 @@ enum PendingOpen {
 }
 
 impl Theme {
-    fn visuals(self) -> egui::Visuals {
-        match self {
-            Theme::Dark => egui::Visuals::dark(),
-            Theme::Light => egui::Visuals::light(),
-            Theme::Paper => {
-                let mut v = egui::Visuals::light();
-                v.window_fill = Color32::from_rgb(250, 246, 238);
-                v.panel_fill = Color32::from_rgb(244, 238, 228);
-                v.faint_bg_color = Color32::from_rgb(238, 230, 218);
-                v
-            }
-        }
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             Theme::Dark => "dark",
@@ -776,7 +763,7 @@ struct ProCraftApp {
     color: [u8; 3],
     tool: Tool,
     theme: Theme,
-    theme_applied: Option<Theme>,
+    theme_applied: Option<(Theme, BarLayout)>,
     /// True when the system symbol font loaded (desktop Windows): UI
     /// strings may use icon glyphs. iPad has no such font, so the same
     /// strings fall back to plain words (see `tool_label`).
@@ -1604,7 +1591,14 @@ impl ProCraftApp {
             .collapsible(false)
             .show(ctx, |ui| {
                 for note in [&self.save_note, &self.settings_note].into_iter().flatten() {
-                    ui.colored_label(egui::Color32::from_rgb(200, 120, 40), note);
+                    let t = design::tokens(
+                        self.theme,
+                        bar_layout(
+                            ctx.viewport_rect().width(),
+                            cfg!(any(target_os = "ios", target_os = "android")),
+                        ),
+                    );
+                    ui.colored_label(t.danger, note);
                 }
                 if self.save_note.is_some() || self.settings_note.is_some() {
                     ui.separator();
@@ -3298,7 +3292,7 @@ fn liquify_step(from: (f32, f32), to: (f32, f32), max_step: f32) -> ((f32, f32),
 /// stepper to a character-wide column); mobile at/above it is Tablet
 /// (same fold, finger-sized controls); desktop stays unchanged.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BarLayout {
+pub(crate) enum BarLayout {
     Wide,
     Narrow,
     Tablet,
@@ -5119,9 +5113,30 @@ impl eframe::App for ProCraftApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        if self.theme_applied != Some(self.theme) {
-            ui.ctx().set_visuals(self.theme.visuals());
-            self.theme_applied = Some(self.theme);
+        let class = bar_layout(
+            ui.ctx().viewport_rect().width(),
+            cfg!(any(target_os = "ios", target_os = "android")),
+        );
+        if self.theme_applied != Some((self.theme, class)) {
+            let t = design::tokens(self.theme, class);
+            // egui 0.36 keeps two style slots (dark/light) plus a
+            // preference; it has no single active style to overwrite.
+            // Dark maps to the dark slot, Light and Paper share the light
+            // slot, and the preference is pinned so an OS theme change
+            // can't swap in an unstyled slot mid-session.
+            let slot = if self.theme == Theme::Dark {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            };
+            let base = ui.ctx().style_of(slot);
+            ui.ctx().set_style_of(slot, t.apply(&base));
+            ui.ctx().set_theme(if self.theme == Theme::Dark {
+                egui::ThemePreference::Dark
+            } else {
+                egui::ThemePreference::Light
+            });
+            self.theme_applied = Some((self.theme, class));
         }
         // M49: the seed marker lands here — eframe 0.36's
         // `CreationContext::storage` is read-only, `Frame::storage_mut`

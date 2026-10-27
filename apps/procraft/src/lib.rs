@@ -2247,19 +2247,20 @@ impl ProCraftApp {
 
     fn tool_options_bar(&mut self, ui: &mut egui::Ui, layout: BarLayout) {
         let hit = quick_hit_height(layout);
+        let t = design::tokens(self.theme, layout);
         if layout != BarLayout::Wide {
             ui.spacing_mut().interact_size.y = hit;
         }
         if quick_scrolls(layout) {
             egui::ScrollArea::horizontal().show(ui, |ui| {
-                ui.horizontal(|ui| self.quick_controls_ui(ui, hit));
+                ui.horizontal(|ui| self.quick_controls_ui(ui, hit, &t));
             });
         } else {
-            ui.horizontal_wrapped(|ui| self.quick_controls_ui(ui, hit));
+            ui.horizontal_wrapped(|ui| self.quick_controls_ui(ui, hit, &t));
         }
     }
 
-    fn quick_controls_ui(&mut self, ui: &mut egui::Ui, hit: f32) {
+    fn quick_controls_ui(&mut self, ui: &mut egui::Ui, hit: f32, t: &design::Tokens) {
         ui.strong(tool_label(self.tool, self.has_symbols));
         ui.separator();
         if quick_controls(self.tool).is_empty() {
@@ -2272,16 +2273,22 @@ impl ProCraftApp {
             return;
         }
         for control in quick_controls(self.tool) {
-            self.quick_control_ui(ui, *control, hit);
+            self.quick_control_ui(ui, *control, hit, t);
         }
     }
 
-    fn quick_control_ui(&mut self, ui: &mut egui::Ui, control: QuickControl, hit: f32) {
+    fn quick_control_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        control: QuickControl,
+        hit: f32,
+        t: &design::Tokens,
+    ) {
         let has_selection = self.doc.selection.is_some() || self.doc.selection_mask.is_some();
         match control {
             QuickControl::Size => {
                 if self.tool == Tool::Liquify {
-                    quick_slider(ui, &mut self.liquify_size, 8.0..=512.0, 1.0, "Size", hit);
+                    quick_slider(ui, &mut self.liquify_size, 8.0..=512.0, 1.0, "Size", t);
                 } else {
                     quick_slider(
                         ui,
@@ -2289,41 +2296,26 @@ impl ProCraftApp {
                         BRUSH_SIZE_MIN..=BRUSH_SIZE_MAX,
                         1.0,
                         "Size",
-                        hit,
+                        t,
                     );
                 }
             }
-            QuickControl::Opacity => quick_slider(
-                ui,
-                &mut self.brush.opacity,
-                0.05..=1.0,
-                0.05,
-                "Opacity",
-                hit,
-            ),
-            QuickControl::Softness => quick_slider(
-                ui,
-                &mut self.brush.softness,
-                0.0..=1.0,
-                0.05,
-                "Softness",
-                hit,
-            ),
-            QuickControl::Spacing => quick_slider(
-                ui,
-                &mut self.brush.spacing,
-                0.05..=1.0,
-                0.05,
-                "Spacing",
-                hit,
-            ),
+            QuickControl::Opacity => {
+                quick_slider(ui, &mut self.brush.opacity, 0.05..=1.0, 0.05, "Opacity", t)
+            }
+            QuickControl::Softness => {
+                quick_slider(ui, &mut self.brush.softness, 0.0..=1.0, 0.05, "Softness", t)
+            }
+            QuickControl::Spacing => {
+                quick_slider(ui, &mut self.brush.spacing, 0.05..=1.0, 0.05, "Spacing", t)
+            }
             QuickControl::Stabilizer => quick_slider(
                 ui,
                 &mut self.brush.stabilizer,
                 0.0..=1.0,
                 0.05,
                 "Stabilizer",
-                hit,
+                t,
             ),
             QuickControl::Strength => {
                 if self.tool == Tool::Smudge {
@@ -2333,7 +2325,7 @@ impl ProCraftApp {
                         0.0..=1.0,
                         0.05,
                         "Strength",
-                        hit,
+                        t,
                     );
                 } else {
                     quick_slider(
@@ -2342,29 +2334,29 @@ impl ProCraftApp {
                         0.05..=1.0,
                         0.05,
                         "Strength",
-                        hit,
+                        t,
                     );
                 }
             }
             QuickControl::Tolerance => {
                 let before = self.fill_tolerance;
-                quick_slider(ui, &mut self.fill_tolerance, 0..=255, 1.0, "Tolerance", hit);
+                quick_slider(ui, &mut self.fill_tolerance, 0..=255, 1.0, "Tolerance", t);
                 if self.fill_tolerance != before && self.fill_preview.is_some() {
                     self.reapply_live_fill();
                 }
             }
             QuickControl::Grow => {
                 let before = self.fill_grow;
-                quick_slider(ui, &mut self.fill_grow, 0..=16, 1.0, "Grow", hit);
+                quick_slider(ui, &mut self.fill_grow, 0..=16, 1.0, "Grow", t);
                 if self.fill_grow != before && self.fill_preview.is_some() {
                     self.reapply_live_fill();
                 }
             }
             QuickControl::PickerPx => {
-                quick_slider(ui, &mut self.picker_size, 140.0..=420.0, 5.0, "Picker", hit)
+                quick_slider(ui, &mut self.picker_size, 140.0..=420.0, 5.0, "Picker", t)
             }
             QuickControl::Feather => {
-                quick_slider(ui, &mut self.sel_feather, 0..=32, 1.0, "Feather", hit);
+                quick_slider(ui, &mut self.sel_feather, 0..=32, 1.0, "Feather", t);
                 if ui
                     .add_enabled(has_selection, egui::Button::new("Apply"))
                     .clicked()
@@ -2379,7 +2371,7 @@ impl ProCraftApp {
                 }
             }
             QuickControl::SelGrow => {
-                quick_slider(ui, &mut self.sel_grow, -32..=32, 1.0, "Grow", hit);
+                quick_slider(ui, &mut self.sel_grow, -32..=32, 1.0, "Grow", t);
                 if ui
                     .add_enabled(has_selection, egui::Button::new("Apply"))
                     .clicked()
@@ -2393,7 +2385,7 @@ impl ProCraftApp {
                 }
             }
             QuickControl::OpaqueThreshold => {
-                quick_slider(ui, &mut self.sel_opaque_t, 0..=255, 1.0, "Opaque >", hit);
+                quick_slider(ui, &mut self.sel_opaque_t, 0..=255, 1.0, "Opaque >", t);
                 if ui
                     .add_enabled(has_selection, egui::Button::new("Select"))
                     .clicked()
@@ -2408,7 +2400,7 @@ impl ProCraftApp {
                 }
             }
             QuickControl::OutlinePx => {
-                quick_slider(ui, &mut self.sel_stroke_w, 1..=16, 1.0, "Outline", hit);
+                quick_slider(ui, &mut self.sel_stroke_w, 1..=16, 1.0, "Outline", t);
                 if ui
                     .add_enabled(
                         has_selection && !self.text_paint_blocked(),
@@ -2484,7 +2476,7 @@ impl ProCraftApp {
             }
             QuickControl::ShapeSides => {
                 if self.shape_kind == ShapeKind::Polygon {
-                    quick_slider(ui, &mut self.shape_sides, 3..=12, 1.0, "Sides", hit);
+                    quick_slider(ui, &mut self.shape_sides, 3..=12, 1.0, "Sides", t);
                 }
             }
             QuickControl::CropApply => match self.crop_rect {
@@ -2516,7 +2508,7 @@ impl ProCraftApp {
                 MIN_TEXT_PX..=128.0,
                 1.0,
                 "Size px",
-                hit,
+                t,
             ),
             QuickControl::TextLeading => quick_slider(
                 ui,
@@ -2524,7 +2516,7 @@ impl ProCraftApp {
                 -MAX_TEXT_SPACING..=MAX_TEXT_SPACING,
                 1.0,
                 "Leading",
-                hit,
+                t,
             ),
             QuickControl::TextTracking => quick_slider(
                 ui,
@@ -2532,7 +2524,7 @@ impl ProCraftApp {
                 -MAX_TEXT_SPACING..=MAX_TEXT_SPACING,
                 1.0,
                 "Tracking",
-                hit,
+                t,
             ),
             QuickControl::TextOutline => {
                 ui.checkbox(&mut self.text_outline, "Outline");
@@ -3179,38 +3171,25 @@ fn stepped_slider_inner<Num: egui::emath::Numeric>(
     });
 }
 
-/// Horizontal-bar slider: "Name value [-][bar][+]" in one run, sized for
-/// the quick bar (`hit` is the touch height map from `quick_hit_height`).
+/// Horizontal-bar slider: "Name value [−][rail][+]" in one run, sized for
+/// the quick bar. The rail is the thick B2 primitive; the numeric type stays
+/// generic so callers keep their `i32`/`f32` fields.
 fn quick_slider<Num: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     value: &mut Num,
     range: std::ops::RangeInclusive<Num>,
     step: f64,
     text: &str,
-    hit: f32,
+    t: &design::Tokens,
 ) {
-    let lo = range.start().to_f64();
-    let hi = range.end().to_f64();
-    let v = value.to_f64();
-    let num = if v.fract() == 0.0 {
-        format!("{v:.0}")
-    } else {
-        format!("{v:.2}")
-    };
-    let slider_w = if hit > 20.0 { 96.0 } else { 84.0 };
-    let btn_w = if hit > 20.0 { hit } else { 24.0 };
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        ui.spacing_mut().slider_width = slider_w;
-        ui.label(format!("{text} {num}"));
-        if ui.add_sized([btn_w, hit], egui::Button::new("−")).clicked() {
-            *value = Num::from_f64((value.to_f64() - step).clamp(lo, hi));
-        }
-        ui.add(egui::Slider::new(value, range).show_value(false));
-        if ui.add_sized([btn_w, hit], egui::Button::new("+")).clicked() {
-            *value = Num::from_f64((value.to_f64() + step).clamp(lo, hi));
-        }
-    });
+    let lo = range.start().to_f64() as f32;
+    let hi = range.end().to_f64() as f32;
+    let mut v = value.to_f64() as f32;
+    // Double-click resets to the low end, matching the old stock slider's
+    // "no default" behaviour without inventing a per-control default.
+    let default = lo;
+    design::thick_slider(ui, t, &mut v, lo..=hi, step, text, default);
+    *value = Num::from_f64(v as f64);
 }
 
 /// Swatch grid at full height (never an inner scroller — the panel's own

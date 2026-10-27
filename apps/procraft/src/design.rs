@@ -357,6 +357,104 @@ pub(crate) fn section_card_actions(
         });
 }
 
+/// Horizontal extent of a thick slider's rail: narrow enough that a bar of
+/// controls still fits on desktop, wide enough for a finger to land on.
+pub(crate) fn slider_track_width(t: &Tokens) -> f32 {
+    if t.class == BarLayout::Wide {
+        t.slider_width_wide
+    } else {
+        t.slider_width_touch
+    }
+}
+
+/// Value at `x` px along a `width` px rail, clamped to the range. A
+/// degenerate range (`lo == hi`) or a zero-width rail has one possible value.
+pub(crate) fn value_from_track(x: f32, width: f32, range: &std::ops::RangeInclusive<f32>) -> f32 {
+    let (lo, hi) = (*range.start(), *range.end());
+    if hi <= lo || width <= 0.0 {
+        return lo;
+    }
+    let frac = (x / width).clamp(0.0, 1.0);
+    lo + frac * (hi - lo)
+}
+
+/// How much of the rail the accent fill covers, 0..=1.
+pub(crate) fn fill_fraction(v: f32, range: &std::ops::RangeInclusive<f32>) -> f32 {
+    let (lo, hi) = (*range.start(), *range.end());
+    if hi <= lo {
+        return 0.0;
+    }
+    ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
+}
+
+/// A thick rail slider for the quick bar: label + value, `−`, the rail, `+`.
+/// Only the rail is hit-tested, so the two steppers keep their own taps.
+pub(crate) fn thick_slider(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    step: f64,
+    label: &str,
+    default: f32,
+) -> egui::Response {
+    let (lo, hi) = (*range.start(), *range.end());
+    let value_text = if step.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    };
+    let btn_w = if t.class == BarLayout::Wide {
+        24.0
+    } else {
+        t.control_h
+    };
+    let mut track: Option<egui::Response> = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        ui.label(format!("{label} {value_text}"));
+        if ui
+            .add_sized([btn_w, t.control_h], egui::Button::new("−"))
+            .clicked()
+        {
+            *value = (*value - step as f32).clamp(lo, hi);
+        }
+
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(slider_track_width(t), t.control_h),
+            egui::Sense::click_and_drag(),
+        );
+        let radius = CornerRadius::same((t.slider_track / 2.0) as u8);
+        let painter = ui.painter();
+        painter.rect_filled(rect, radius, t.surface_3);
+        let filled = rect.width() * fill_fraction(*value, &range);
+        if filled > 0.0 {
+            let fill = egui::Rect::from_min_size(rect.min, egui::vec2(filled, rect.height()));
+            painter.rect_filled(fill, radius, t.accent);
+        }
+        if resp.clicked() || resp.dragged() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                *value = value_from_track(pos.x - rect.left(), rect.width(), &range);
+            }
+        }
+        if resp.double_clicked() {
+            *value = default;
+        }
+        resp.widget_info(|| {
+            egui::WidgetInfo::slider(true, *value as f64, format!("{label} {value_text}"))
+        });
+        track = Some(resp);
+
+        if ui
+            .add_sized([btn_w, t.control_h], egui::Button::new("+"))
+            .clicked()
+        {
+            *value = (*value + step as f32).clamp(lo, hi);
+        }
+    });
+    track.expect("thick_slider always allocates its rail")
+}
+
 fn luminance_channel(c: u8) -> f32 {
     let c = c as f32 / 255.0;
     if c <= 0.04045 {
@@ -441,6 +539,27 @@ mod tests {
         assert_eq!(card_pad(&t, true).x, 0.0);
         assert_eq!(card_available_width(240.0, &t, true), 224.0);
         assert!(card_available_width(240.0, &t, false) < 224.0);
+    }
+
+    #[test]
+    fn track_position_maps_to_the_range_and_clamps() {
+        let r = 0.0..=100.0;
+        assert_eq!(value_from_track(0.0, 200.0, &r), 0.0);
+        assert_eq!(value_from_track(100.0, 200.0, &r), 50.0);
+        assert_eq!(value_from_track(200.0, 200.0, &r), 100.0);
+        assert_eq!(value_from_track(-40.0, 200.0, &r), 0.0);
+        assert_eq!(value_from_track(999.0, 200.0, &r), 100.0);
+        assert_eq!(fill_fraction(25.0, &r), 0.25);
+        assert_eq!(fill_fraction(500.0, &r), 1.0);
+    }
+
+    #[test]
+    fn slider_hit_area_is_only_the_track() {
+        let wide = tokens(Theme::Dark, BarLayout::Wide);
+        let tablet = tokens(Theme::Dark, BarLayout::Tablet);
+        assert_eq!(slider_track_width(&wide), 110.0);
+        assert_eq!(slider_track_width(&tablet), 130.0);
+        assert!(slider_track_width(&tablet) < tablet.control_h * 7.0);
     }
 
     #[test]

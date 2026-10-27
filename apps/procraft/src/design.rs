@@ -211,6 +211,75 @@ impl Tokens {
     }
 }
 
+/// What a pill shows and how it behaves.
+pub(crate) struct PillSpec<'a> {
+    pub(crate) glyph: Option<&'a str>,
+    pub(crate) label: Option<&'a str>,
+    pub(crate) selected: bool,
+    pub(crate) enabled: bool,
+}
+
+/// Pill width: the text plus padding, but never shorter than one control,
+/// so icon-only pills stay square rather than collapsing to a stub.
+pub(crate) fn pill_width(t: &Tokens, text_width: f32) -> f32 {
+    (text_width + 2.0 * t.pad_x).max(t.control_h)
+}
+
+/// True pill: fully rounded ends.
+pub(crate) fn pill_radius(t: &Tokens) -> u8 {
+    (t.control_h * 0.5).round() as u8
+}
+
+/// A pill button. The hit rect is the painted rect, so nothing is clickable
+/// outside what is drawn.
+pub(crate) fn pill_button(ui: &mut egui::Ui, t: &Tokens, spec: PillSpec<'_>) -> egui::Response {
+    let shown = spec.glyph.or(spec.label).unwrap_or("");
+    let font = FontId::proportional(t.type_body);
+    let ink = if spec.enabled { t.text_hi } else { t.text_lo };
+    let galley = ui.painter().layout_no_wrap(shown.to_owned(), font, ink);
+    let width = pill_width(t, galley.size().x);
+
+    let sense = if spec.enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, t.control_h), sense);
+    let radius = CornerRadius::same(pill_radius(t));
+    let hovered = spec.enabled && response.hovered();
+    let fill = if spec.selected {
+        t.accent
+    } else if hovered {
+        t.surface_3
+    } else {
+        t.surface_2
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, radius, fill);
+    if hovered || spec.selected {
+        painter.rect_stroke(
+            rect,
+            radius,
+            Stroke::new(1.0, t.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let text_color = if spec.selected { Color32::WHITE } else { ink };
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        shown,
+        FontId::proportional(t.type_body),
+        text_color,
+    );
+
+    // Icon-only pills carry their name in a tooltip.
+    match (spec.glyph, spec.label) {
+        (Some(_), Some(label)) => response.on_hover_text(label),
+        _ => response,
+    }
+}
+
 fn luminance_channel(c: u8) -> f32 {
     let c = c as f32 / 255.0;
     if c <= 0.04045 {
@@ -270,6 +339,22 @@ mod tests {
         let tablet = tokens(Theme::Dark, BarLayout::Tablet);
         assert_ne!(wide.control_h, tablet.control_h);
         assert_ne!(wide.pad_x, tablet.pad_x);
+    }
+
+    #[test]
+    fn pill_is_at_least_one_control_tall_and_half_height_rounded() {
+        let t = tokens(Theme::Dark, BarLayout::Tablet);
+        assert_eq!(pill_width(&t, 0.0), 44.0);
+        // 8 px of label plus 14 px padding a side still fits inside the
+        // touch-height floor, so short labels keep a square pill.
+        assert_eq!(pill_width(&t, 8.0), 44.0);
+        assert!(pill_width(&t, 80.0) >= 80.0 + 2.0 * t.pad_x);
+        assert_eq!(pill_radius(&t), 22);
+
+        // Wide is 26 px tall: floor 26, radius 13.
+        let w = tokens(Theme::Dark, BarLayout::Wide);
+        assert_eq!(pill_width(&w, 0.0), 26.0);
+        assert_eq!(pill_radius(&w), 13);
     }
 
     #[test]

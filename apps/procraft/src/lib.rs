@@ -2140,6 +2140,30 @@ fn brush_import_status(
 }
 
 impl ProCraftApp {
+    /// A plain action button in the B2 visual language. Menu triggers stay
+    /// stock `MenuButton`s on purpose; anything that is just "click me" is a
+    /// pill.
+    fn pill(&self, ui: &mut egui::Ui, label: &str) -> bool {
+        let t = design::tokens(
+            self.theme,
+            bar_layout(
+                ui.ctx().viewport_rect().width(),
+                cfg!(any(target_os = "ios", target_os = "android")),
+            ),
+        );
+        design::pill_button(
+            ui,
+            &t,
+            design::PillSpec {
+                glyph: None,
+                label: Some(label),
+                selected: false,
+                enabled: true,
+            },
+        )
+        .clicked()
+    }
+
     /// Zoom/rotate/theme/About cluster shared by the wide bar (inline) and
     /// the narrow/tablet bar (inside a View menu). `in_menu` dismisses the
     /// popup after momentary actions, matching the File menu convention;
@@ -2155,7 +2179,7 @@ impl ProCraftApp {
             if ui.button("+").clicked() {
                 self.zoom = (self.zoom * 1.25).clamp(0.1, 8.0);
             }
-            if ui.button("Fit").clicked() {
+            if self.pill(ui, "Fit") {
                 if in_menu {
                     ui.close();
                 }
@@ -2167,7 +2191,7 @@ impl ProCraftApp {
         let mut deg = self.view_angle.to_degrees();
         stepped_slider(ui, &mut deg, -180.0..=180.0, 1.0, "Rotate°");
         self.view_angle = deg.to_radians();
-        if ui.button("Reset rotation").clicked() {
+        if self.pill(ui, "Reset rotation") {
             if in_menu {
                 ui.close();
             }
@@ -2182,7 +2206,7 @@ impl ProCraftApp {
         } else {
             "About"
         };
-        if ui.button(about).clicked() {
+        if self.pill(ui, about) {
             if in_menu {
                 ui.close();
             }
@@ -2193,7 +2217,7 @@ impl ProCraftApp {
         } else {
             "Shortcuts"
         };
-        if ui.button(shortcuts).clicked() {
+        if self.pill(ui, shortcuts) {
             if in_menu {
                 ui.close();
             }
@@ -5425,10 +5449,10 @@ impl eframe::App for ProCraftApp {
                 egui::containers::menu::MenuConfig::new().close_behavior(close)
             };
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Gallery").clicked() {
+                if self.pill(ui, "Gallery") {
                     self.gallery_open = !self.gallery_open;
                 }
-                if ui.button("Reference").clicked() {
+                if self.pill(ui, "Reference") {
                     self.ref_open = !self.ref_open;
                 }
                 egui::containers::menu::MenuButton::new("File")
@@ -5652,13 +5676,13 @@ impl eframe::App for ProCraftApp {
                             }
                         }
                     });
-                if ui.button("Undo").clicked() && self.doc.undo() {
+                if self.pill(ui, "Undo") && self.doc.undo() {
                     self.status = "Undone.".to_string();
                 }
-                if ui.button("Redo").clicked() && self.doc.redo() {
+                if self.pill(ui, "Redo") && self.doc.redo() {
                     self.status = "Redone.".to_string();
                 }
-                if ui.button("Clear layer").clicked() && !self.text_paint_blocked() {
+                if self.pill(ui, "Clear layer") && !self.text_paint_blocked() {
                     self.doc.checkpoint();
                     if let Some(layer) = self.doc.active_layer_mut() {
                         layer.clear();

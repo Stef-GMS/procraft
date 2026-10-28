@@ -17,7 +17,7 @@ pub const SETTINGS_VERSION: u32 = 1;
 pub struct Settings {
     /// Schema version (see SETTINGS_VERSION).
     pub version: u32,
-    /// Theme id ("paper", "dark", ...).
+    /// Theme id ("dark", "light", "paper").
     pub theme: String,
     /// View-menu toggles.
     pub show_tools: bool,
@@ -34,7 +34,7 @@ impl Default for Settings {
     fn default() -> Settings {
         Settings {
             version: SETTINGS_VERSION,
-            theme: "paper".into(),
+            theme: "dark".into(),
             show_tools: true,
             show_layers: true,
             zoom: 1.0,
@@ -65,7 +65,7 @@ mod tests {
     fn defaults_are_pinned() {
         let s = Settings::default();
         assert_eq!(s.version, 1);
-        assert_eq!(s.theme, "paper");
+        assert_eq!(s.theme, "dark");
         assert!(s.show_tools && s.show_layers);
         assert_eq!(s.zoom, 1.0);
         assert!(s.recent.is_empty());

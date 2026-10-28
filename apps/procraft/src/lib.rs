@@ -1032,7 +1032,7 @@ impl ProCraftApp {
             brush: Brush::default(),
             color: [30, 144, 255],
             tool: Tool::Brush,
-            theme: Theme::Paper,
+            theme: Theme::Dark,
             theme_applied: None,
             has_symbols,
             page_custom: [255, 255, 255],

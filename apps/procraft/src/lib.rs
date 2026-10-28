@@ -550,6 +550,7 @@ fn settings_differ(a: &Settings, b: &Settings) -> bool {
         || a.shortcuts != b.shortcuts
         || a.strip_collapsed != b.strip_collapsed
         || a.strip_dock != b.strip_dock
+        || a.time_lapse != b.time_lapse
 }
 
 /// M49: the persistable ChordKey for an egui key (None for keys the
@@ -1212,7 +1213,7 @@ impl ProCraftApp {
             onion: true,
             onion_prev: 0.3,
             onion_next: 0.3,
-            lapse_on: false,
+            lapse_on: true,
             lapse_frames: Vec::new(),
             lapse_last: std::time::Instant::now(),
             ghost_prev: None,
@@ -1372,6 +1373,7 @@ impl ProCraftApp {
             shortcuts: self.shortcuts.to_stored(),
             strip_collapsed: self.strip_collapsed,
             strip_dock: self.strip_dock.as_str().to_string(),
+            time_lapse: self.lapse_on,
         }
     }
 
@@ -1390,6 +1392,7 @@ impl ProCraftApp {
         self.recent = s.recent.iter().take(MAX_RECENT).cloned().collect();
         self.strip_collapsed = s.strip_collapsed;
         self.strip_dock = StripDock::from_str(&s.strip_dock);
+        self.lapse_on = s.time_lapse;
         let (shortcuts, mut warns) = Shortcuts::from_stored(&s.shortcuts);
         self.shortcuts = shortcuts;
         if s.version > SETTINGS_VERSION {
@@ -2284,6 +2287,30 @@ impl ProCraftApp {
             },
         )
         .clicked()
+    }
+
+    /// Shared grip drag for the bottom bars: the bar follows the finger and
+    /// release snaps it to the nearest of the three docks. `docked_left`
+    /// recomputes from the current dock each frame, so a drag that spans a
+    /// release (or a resize) never accumulates drift.
+    fn strip_drag_ui(&mut self, grip: &egui::Response, viewport_w: f32, pad: f32, width: f32) {
+        let docked_left = strip_left(self.strip_dock, viewport_w, pad, width);
+        if grip.drag_started() {
+            self.strip_offset = 0.0;
+        }
+        if grip.dragged() {
+            self.strip_offset += grip.drag_delta().x;
+            self.strip_offset = (docked_left + self.strip_offset)
+                .clamp(pad, strip_max_left(viewport_w, pad, width))
+                - docked_left;
+            grip.ctx.request_repaint();
+        }
+        if grip.drag_stopped() {
+            let dropped =
+                strip_left_clamped(docked_left + self.strip_offset, viewport_w, pad, width);
+            self.strip_dock = strip_dock_for(dropped, viewport_w, pad, width);
+            self.strip_offset = 0.0;
+        }
     }
 
     /// Tool switch that also retires a live fill preview, mirroring the
@@ -3730,6 +3757,7 @@ impl ProCraftApp {
                         .unwrap_or("-")
                 ));
                 ui.separator();
+                self.lapse_card(ui, &t);
                 ui.collapsing("Animation", |ui| {
                     ui.label("Layers are frames, bottom first.");
                     ui.horizontal(|ui| {
@@ -3841,149 +3869,12 @@ impl ProCraftApp {
                                 self.ghost_dirty = true;
                             }
                         }
-                        if ui.button("Export GIF").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("GIF image", &["gif"])
-                                .save_file()
-                            {
-                                let path = ensure_extension(path, "gif");
-                                match export_gif_ext(&self.doc, self.anim_fps, self.anim_loop) {
-                                    Ok(bytes) => match std::fs::write(&path, &bytes) {
-                                        Ok(()) => {
-                                            let shown = self
-                                                .doc
-                                                .layers
-                                                .iter()
-                                                .filter(|l| l.visible)
-                                                .count();
-                                            let exported = if self.anim_loop == LoopMode::PingPong
-                                                && shown > 2
-                                            {
-                                                2 * shown - 2
-                                            } else {
-                                                shown
-                                            };
-                                            let held = self
-                                                .doc
-                                                .layers
-                                                .iter()
-                                                .filter(|l| l.hold > 1)
-                                                .count();
-                                            let extra = match (self.anim_loop, held) {
-                                                (LoopMode::PingPong, 0) => {
-                                                    ", ping-pong".to_string()
-                                                }
-                                                (LoopMode::PingPong, _) => {
-                                                    format!(", ping-pong, {held} held")
-                                                }
-                                                (LoopMode::Forward, 0) => String::new(),
-                                                (LoopMode::Forward, _) => {
-                                                    format!(", {held} held")
-                                                }
-                                            };
-                                            self.status = format!(
-                                                "GIF saved {} ({} frames, hidden skipped{extra}).",
-                                                path.display(),
-                                                exported
-                                            );
-                                            #[cfg(target_os = "ios")]
-                                            rfd::ios_share_file(&path);
-                                            #[cfg(target_os = "android")]
-                                            rfd::android_scan_file(&path);
-                                        }
-                                        Err(e) => self.status = format!("GIF save failed: {e}"),
-                                    },
-                                    Err(e) => self.status = format!("GIF export failed: {e}"),
-                                }
-                            }
-                        }
-                        if ui.button("Import GIF").clicked() {
-                            #[cfg(not(target_os = "ios"))]
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("GIF image", &["gif"])
-                                .pick_file()
-                            {
-                                match std::fs::read(&path)
-                                    .map_err(|e| e.to_string())
-                                    .and_then(|b| import_gif_document(&b))
-                                {
-                                    Ok((doc, fps)) => {
-                                        self.status = format!(
-                                            "GIF imported {} ({} frames, {} fps).",
-                                            path.display(),
-                                            doc.layers.len(),
-                                            fps
-                                        );
-                                        self.adopt_gif(doc, fps);
-                                    }
-                                    Err(e) => self.status = format!("GIF import failed: {e}"),
-                                }
-                            }
-                            #[cfg(target_os = "ios")]
-                            {
-                                let _ = rfd::FileDialog::new()
-                                    .add_filter("GIF image", &["gif"])
-                                    .pick_file();
-                                self.pending_open = Some(PendingOpen::Gif);
-                                self.status = "Pick GIF…".to_string();
-                            }
-                            #[cfg(target_os = "android")]
-                            {
-                                self.android_browse = Some(PendingOpen::Gif);
-                            }
-                        }
-                        // M41 Time-lapse: staged snapshots while recording
-                        // (session-only, capped small thumbs), exported as GIF.
-                        ui.separator();
+                        // One row: the two GIF actions are siblings and
+                        // wrapping them keeps them from stacking.
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.lapse_on, "Time-lapse");
-                            ui.label(format!("{} frames", self.lapse_frames.len()));
+                            self.gif_export_ui(ui);
+                            self.gif_import_ui(ui);
                         });
-                        if !self.lapse_frames.is_empty() {
-                            ui.horizontal_wrapped(|ui| {
-                                if ui
-                                    .add_sized([110.0, 28.0], egui::Button::new("Export lapse"))
-                                    .clicked()
-                                {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("GIF image", &["gif"])
-                                        .save_file()
-                                    {
-                                        let path = ensure_extension(path, "gif");
-                                        match export_timelapse(&self.lapse_frames, 10) {
-                                            Ok(bytes) => match std::fs::write(&path, &bytes) {
-                                                Ok(()) => {
-                                                    self.status = format!(
-                                                        "Time-lapse saved {} ({} frames).",
-                                                        path.display(),
-                                                        self.lapse_frames.len()
-                                                    );
-                                                    #[cfg(target_os = "ios")]
-                                                    rfd::ios_share_file(&path);
-                                                    #[cfg(target_os = "android")]
-                                                    rfd::android_scan_file(&path);
-                                                }
-                                                Err(e) => {
-                                                    self.status =
-                                                        format!("Time-lapse save failed: {e}")
-                                                }
-                                            },
-                                            Err(e) => {
-                                                self.status =
-                                                    format!("Time-lapse export failed: {e}")
-                                            }
-                                        }
-                                    }
-                                }
-                                if ui
-                                    .add_sized([110.0, 28.0], egui::Button::new("Clear lapse"))
-                                    .clicked()
-                                {
-                                    self.lapse_frames.clear();
-                                    self.status = "Time-lapse cleared.".to_string();
-                                }
-                            });
-                        }
                     }
                 });
                 ui.separator();
@@ -4938,29 +4829,83 @@ impl ProCraftApp {
         let island_h = mobile_island_height(t.control_h);
         let strip_h = island_h;
         let hit = quick_hit_height(class);
-        // Minimising the strip reclaims the canvas; the options capsule would
-        // undo that, so it folds away with the bar.
-        let capsule_visible =
-            !quick_controls(self.tool).is_empty() && !(phone && self.strip_collapsed);
+        // The bar folds to a pocket pill like the phone strip, so the tool's
+        // options can get out of the way without leaving the canvas.
+        let capsule_visible = !quick_controls(self.tool).is_empty();
         let capsule_offset = if phone {
             phone_capsule_offset(safe_bottom, pad, strip_h, t.gap)
         } else {
             -(safe_bottom + pad)
         };
 
-        if capsule_visible {
+        if capsule_visible && !phone {
+            // Tablet options bar: the phone's pocket-strip rules (grip drag,
+            // three docks, fold to a pill) around the per-tool controls.
+            // The control row scrolls horizontally with the bar hidden —
+            // swipe, not a desktop scrollbar.
+            let expanded = !self.strip_collapsed;
+            let strip_w = if expanded {
+                mobile_capsule_width(vp.width())
+            } else {
+                strip_mini_width(vp.width(), pad)
+            };
+            let left = strip_left_now(self.strip_dock, self.strip_offset, vp.width(), pad, strip_w);
             egui::Area::new(egui::Id::new("mobile-options"))
                 .order(egui::Order::Middle)
-                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, capsule_offset])
+                .anchor(egui::Align2::LEFT_BOTTOM, [left, capsule_offset])
                 .show(ctx, |ui| {
-                    ui.set_max_width(mobile_capsule_width(vp.width()));
+                    ui.set_width(strip_w);
                     ui.spacing_mut().interact_size.y = hit;
                     island_frame().show(ui, |ui| {
-                        egui::ScrollArea::horizontal()
-                            .id_salt("mobile-options-scroll")
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| self.quick_controls_ui(ui, hit, &t));
-                            });
+                        ui.set_width((strip_w - 12.0).max(1.0));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
+                            let grip = strip_grip(ui, &t, hit);
+                            self.strip_drag_ui(&grip, vp.width(), pad, strip_w);
+                            if expanded {
+                                let scroll_w =
+                                    (strip_w - 12.0 - STRIP_GRIP_W - hit - t.gap).max(120.0);
+                                egui::ScrollArea::horizontal()
+                                    .id_salt("mobile-options-scroll")
+                                    .max_width(scroll_w)
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                    )
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| self.quick_controls_ui(ui, hit, &t));
+                                    });
+                                if design::icon_button(ui, &t, design::Icon::ChevronDown, hit)
+                                    .on_hover_text("Hide options")
+                                    .clicked()
+                                {
+                                    self.strip_collapsed = true;
+                                    self.strip_offset = 0.0;
+                                }
+                            } else {
+                                if self.toggle_pill(
+                                    ui,
+                                    strip_tool_face(self.tool, self.has_symbols),
+                                    true,
+                                ) {
+                                    self.strip_collapsed = false;
+                                    self.strip_offset = 0.0;
+                                }
+                                if design::icon_button(ui, &t, design::Icon::Undo, hit)
+                                    .on_hover_text("Undo")
+                                    .clicked()
+                                    && self.doc.undo()
+                                {
+                                    self.status = "Undone.".to_string();
+                                }
+                                if design::icon_button(ui, &t, design::Icon::ChevronUp, hit)
+                                    .on_hover_text("Show options")
+                                    .clicked()
+                                {
+                                    self.strip_collapsed = false;
+                                    self.strip_offset = 0.0;
+                                }
+                            }
+                        });
                     });
                 });
         }
@@ -5096,11 +5041,9 @@ impl ProCraftApp {
             let strip_w = if expanded {
                 vp.width() - 2.0 * pad
             } else {
-                phone_mini_strip_width(vp.width(), pad)
+                strip_mini_width(vp.width(), pad)
             };
-            let docked_left = phone_strip_left(self.strip_dock, vp.width(), pad, strip_w);
-            let left =
-                phone_strip_left_clamped(docked_left + self.strip_offset, vp.width(), pad, strip_w);
+            let left = strip_left_now(self.strip_dock, self.strip_offset, vp.width(), pad, strip_w);
             egui::Area::new(egui::Id::new("mobile-strip"))
                 .order(egui::Order::Foreground)
                 .anchor(
@@ -5126,28 +5069,7 @@ impl ProCraftApp {
                             ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
                             if !expanded {
                                 let grip = strip_grip(ui, &t, hit);
-                                if grip.drag_started() {
-                                    self.strip_offset = 0.0;
-                                }
-                                if grip.dragged() {
-                                    self.strip_offset += grip.drag_delta().x;
-                                    let max_left = (vp.width() - pad - strip_w).max(pad);
-                                    self.strip_offset = (docked_left + self.strip_offset)
-                                        .clamp(pad, max_left)
-                                        - docked_left;
-                                    ui.ctx().request_repaint();
-                                }
-                                if grip.drag_stopped() {
-                                    let dropped = phone_strip_left_clamped(
-                                        docked_left + self.strip_offset,
-                                        vp.width(),
-                                        pad,
-                                        strip_w,
-                                    );
-                                    self.strip_dock =
-                                        phone_strip_dock(dropped, vp.width(), pad, strip_w);
-                                    self.strip_offset = 0.0;
-                                }
+                                self.strip_drag_ui(&grip, vp.width(), pad, strip_w);
                                 if self.toggle_pill(
                                     ui,
                                     strip_tool_face(self.tool, self.has_symbols),
@@ -5943,6 +5865,198 @@ impl ProCraftApp {
                 }
             }
             self.filter_preview = Some(fp);
+        }
+    }
+
+    /// Time-lapse card above the Animation group: the recording switch sits
+    /// one tap from the Layers panel instead of three taps deep inside the
+    /// group (plan 12). Recording is on by default.
+    fn lapse_card(&mut self, ui: &mut egui::Ui, t: &design::Tokens) {
+        let on = self.lapse_on;
+        let frames = self.lapse_frames.len();
+        let mut toggle = false;
+        let mut export = false;
+        let mut clear = false;
+        design::section_card_actions(
+            ui,
+            t,
+            Some("Time-lapse"),
+            false,
+            |ui| {
+                if design::pill_button(
+                    ui,
+                    t,
+                    design::PillSpec {
+                        icon: None,
+                        glyph: None,
+                        label: Some(if on { "On" } else { "Off" }),
+                        selected: on,
+                        enabled: true,
+                    },
+                )
+                .clicked()
+                {
+                    toggle = true;
+                }
+            },
+            |ui| {
+                ui.horizontal(|ui| {
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    if on {
+                        ui.painter().circle_filled(dot.center(), 4.5, t.danger);
+                    } else {
+                        ui.painter().circle_stroke(
+                            dot.center(),
+                            4.5,
+                            egui::Stroke::new(1.0, t.text_lo),
+                        );
+                    }
+                    ui.label(if frames == 0 {
+                        "Starts with your first stroke".to_string()
+                    } else {
+                        format!("{frames} frames recorded")
+                    });
+                });
+                if frames > 0 {
+                    ui.horizontal(|ui| {
+                        if ui.button("Export lapse").clicked() {
+                            export = true;
+                        }
+                        if ui.button("Clear").clicked() {
+                            clear = true;
+                        }
+                    });
+                }
+            },
+        );
+        if toggle {
+            self.lapse_on = !on;
+            self.status = if self.lapse_on {
+                "Time-lapse recording on.".to_string()
+            } else {
+                "Time-lapse recording off.".to_string()
+            };
+        }
+        if export {
+            self.export_lapse();
+        }
+        if clear {
+            self.lapse_frames.clear();
+            self.status = "Time-lapse cleared.".to_string();
+        }
+    }
+
+    /// Save the staged time-lapse frames as a GIF.
+    fn export_lapse(&mut self) {
+        if self.lapse_frames.is_empty() {
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("GIF image", &["gif"])
+            .save_file()
+        {
+            let path = ensure_extension(path, "gif");
+            match export_timelapse(&self.lapse_frames, 10) {
+                Ok(bytes) => match std::fs::write(&path, &bytes) {
+                    Ok(()) => {
+                        self.status = format!(
+                            "Time-lapse saved {} ({} frames).",
+                            path.display(),
+                            self.lapse_frames.len()
+                        );
+                        #[cfg(target_os = "ios")]
+                        rfd::ios_share_file(&path);
+                        #[cfg(target_os = "android")]
+                        rfd::android_scan_file(&path);
+                    }
+                    Err(e) => self.status = format!("Time-lapse save failed: {e}"),
+                },
+                Err(e) => self.status = format!("Time-lapse export failed: {e}"),
+            }
+        }
+    }
+
+    /// Export the visible layers as a GIF.
+    fn gif_export_ui(&mut self, ui: &mut egui::Ui) {
+        if !ui.button("Export GIF").clicked() {
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("GIF image", &["gif"])
+            .save_file()
+        {
+            let path = ensure_extension(path, "gif");
+            match export_gif_ext(&self.doc, self.anim_fps, self.anim_loop) {
+                Ok(bytes) => match std::fs::write(&path, &bytes) {
+                    Ok(()) => {
+                        let shown = self.doc.layers.iter().filter(|l| l.visible).count();
+                        let exported = if self.anim_loop == LoopMode::PingPong && shown > 2 {
+                            2 * shown - 2
+                        } else {
+                            shown
+                        };
+                        let held = self.doc.layers.iter().filter(|l| l.hold > 1).count();
+                        let extra = match (self.anim_loop, held) {
+                            (LoopMode::PingPong, 0) => ", ping-pong".to_string(),
+                            (LoopMode::PingPong, _) => format!(", ping-pong, {held} held"),
+                            (LoopMode::Forward, 0) => String::new(),
+                            (LoopMode::Forward, _) => format!(", {held} held"),
+                        };
+                        self.status = format!(
+                            "GIF saved {} ({} frames, hidden skipped{extra}).",
+                            path.display(),
+                            exported
+                        );
+                        #[cfg(target_os = "ios")]
+                        rfd::ios_share_file(&path);
+                        #[cfg(target_os = "android")]
+                        rfd::android_scan_file(&path);
+                    }
+                    Err(e) => self.status = format!("GIF save failed: {e}"),
+                },
+                Err(e) => self.status = format!("GIF export failed: {e}"),
+            }
+        }
+    }
+
+    /// Import a GIF as the document (one layer per frame).
+    fn gif_import_ui(&mut self, ui: &mut egui::Ui) {
+        if !ui.button("Import GIF").clicked() {
+            return;
+        }
+        #[cfg(not(target_os = "ios"))]
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("GIF image", &["gif"])
+            .pick_file()
+        {
+            match std::fs::read(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|b| import_gif_document(&b))
+            {
+                Ok((doc, fps)) => {
+                    self.status = format!(
+                        "GIF imported {} ({} frames, {} fps).",
+                        path.display(),
+                        doc.layers.len(),
+                        fps
+                    );
+                    self.adopt_gif(doc, fps);
+                }
+                Err(e) => self.status = format!("GIF import failed: {e}"),
+            }
+        }
+        #[cfg(target_os = "ios")]
+        {
+            let _ = rfd::FileDialog::new()
+                .add_filter("GIF image", &["gif"])
+                .pick_file();
+            self.pending_open = Some(PendingOpen::Gif);
+            self.status = "Pick GIF…".to_string();
+        }
+        #[cfg(target_os = "android")]
+        {
+            self.android_browse = Some(PendingOpen::Gif);
         }
     }
 
@@ -6800,17 +6914,25 @@ fn phone_capsule_offset(safe_bottom: f32, pad: f32, strip_h: f32, gap: f32) -> f
     -(safe_bottom + pad + strip_h + gap)
 }
 
-/// Preferred width of the pocket pill: grip, active tool, size readout,
-/// undo and expand, without the scrolling tail of the full bar.
+/// Preferred width of a minimised bar (the phone's pocket pill and the
+/// tablet's folded options capsule): grip, active tool, expand.
 const PHONE_MINI_STRIP_W: f32 = 260.0;
 
-fn phone_mini_strip_width(viewport_w: f32, pad: f32) -> f32 {
+/// Width of the drag grip: a dot column with a finger's slack on both sides.
+const STRIP_GRIP_W: f32 = 24.0;
+
+fn strip_mini_width(viewport_w: f32, pad: f32) -> f32 {
     (viewport_w - 2.0 * pad).clamp(180.0, PHONE_MINI_STRIP_W)
 }
 
-/// Left edge of the strip for a docked position.
-fn phone_strip_left(dock: StripDock, viewport_w: f32, pad: f32, width: f32) -> f32 {
-    let max_left = (viewport_w - pad - width).max(pad);
+/// Widest left edge that still keeps a bar on screen.
+fn strip_max_left(viewport_w: f32, pad: f32, width: f32) -> f32 {
+    (viewport_w - pad - width).max(pad)
+}
+
+/// Left edge of a bar for a docked position.
+fn strip_left(dock: StripDock, viewport_w: f32, pad: f32, width: f32) -> f32 {
+    let max_left = strip_max_left(viewport_w, pad, width);
     match dock {
         StripDock::Left => pad,
         StripDock::Center => ((viewport_w - width) * 0.5).clamp(pad, max_left),
@@ -6818,20 +6940,29 @@ fn phone_strip_left(dock: StripDock, viewport_w: f32, pad: f32, width: f32) -> f
     }
 }
 
-/// Keep a dragged strip fully on screen.
-fn phone_strip_left_clamped(left: f32, viewport_w: f32, pad: f32, width: f32) -> f32 {
-    let max_left = (viewport_w - pad - width).max(pad);
-    left.clamp(pad, max_left)
+/// Keep a dragged bar fully on screen.
+fn strip_left_clamped(left: f32, viewport_w: f32, pad: f32, width: f32) -> f32 {
+    left.clamp(pad, strip_max_left(viewport_w, pad, width))
 }
 
-/// Nearest dock for a strip whose left edge is `left`: compare the pill's
-/// centre against the three docked centres, so a wide pill still snaps to
+/// Where a bar sits this frame: its dock plus any in-flight drag, clamped.
+fn strip_left_now(dock: StripDock, offset: f32, viewport_w: f32, pad: f32, width: f32) -> f32 {
+    strip_left_clamped(
+        strip_left(dock, viewport_w, pad, width) + offset,
+        viewport_w,
+        pad,
+        width,
+    )
+}
+
+/// Nearest dock for a bar whose left edge is `left`: compare the bar's
+/// centre against the three docked centres, so a wide bar still snaps to
 /// its nearest side instead of always landing in the middle.
-fn phone_strip_dock(left: f32, viewport_w: f32, pad: f32, width: f32) -> StripDock {
+fn strip_dock_for(left: f32, viewport_w: f32, pad: f32, width: f32) -> StripDock {
     let c = left + width * 0.5;
     let mut best = (StripDock::Center, f32::INFINITY);
     for dock in [StripDock::Left, StripDock::Center, StripDock::Right] {
-        let d = (phone_strip_left(dock, viewport_w, pad, width) + width * 0.5 - c).abs();
+        let d = (strip_left(dock, viewport_w, pad, width) + width * 0.5 - c).abs();
         if d < best.1 {
             best = (dock, d);
         }
@@ -6839,11 +6970,11 @@ fn phone_strip_dock(left: f32, viewport_w: f32, pad: f32, width: f32) -> StripDo
     best.0
 }
 
-/// Drag handle for the pocket strip: two columns of painted dots. Painted,
+/// Drag handle for the pocket bars: two columns of painted dots. Painted,
 /// not typeset, so it survives the iOS font stack like the other icons.
 fn strip_grip(ui: &mut egui::Ui, t: &design::Tokens, h: f32) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(18.0, h), egui::Sense::click_and_drag());
+        ui.allocate_exact_size(egui::vec2(STRIP_GRIP_W, h), egui::Sense::click_and_drag());
     for row in 0..3 {
         for col in 0..2 {
             let p = rect.center() + egui::vec2((col as f32 - 0.5) * 5.0, (row as f32 - 1.0) * 6.0);
@@ -12211,6 +12342,11 @@ mod tests {
         let mut f = a.clone();
         f.strip_dock = "left".into();
         assert!(settings_differ(&a, &f));
+        // Time-lapse is a discrete edit too, so turning it off survives a
+        // relaunch instead of silently coming back on.
+        let mut g = a.clone();
+        g.time_lapse = false;
+        assert!(settings_differ(&a, &g));
     }
 
     #[test]
@@ -12528,26 +12664,40 @@ mod tests {
         assert_eq!(StripDock::from_str("somewhere"), StripDock::Center);
 
         let (vp, pad, w) = (390.0, 12.0, 260.0);
-        assert_eq!(phone_strip_left(StripDock::Left, vp, pad, w), 12.0);
-        assert_eq!(phone_strip_left(StripDock::Center, vp, pad, w), 65.0);
-        assert_eq!(phone_strip_left(StripDock::Right, vp, pad, w), 118.0);
+        assert_eq!(strip_left(StripDock::Left, vp, pad, w), 12.0);
+        assert_eq!(strip_left(StripDock::Center, vp, pad, w), 65.0);
+        assert_eq!(strip_left(StripDock::Right, vp, pad, w), 118.0);
         // A drag can never push the pill off either edge.
-        assert_eq!(phone_strip_left_clamped(-50.0, vp, pad, w), 12.0);
-        assert_eq!(phone_strip_left_clamped(500.0, vp, pad, w), 118.0);
+        assert_eq!(strip_left_clamped(-50.0, vp, pad, w), 12.0);
+        assert_eq!(strip_left_clamped(500.0, vp, pad, w), 118.0);
+        assert_eq!(strip_max_left(vp, pad, w), 118.0);
 
         // Release snaps to the nearest docked centre.
-        assert_eq!(phone_strip_dock(12.0, vp, pad, w), StripDock::Left);
-        assert_eq!(phone_strip_dock(65.0, vp, pad, w), StripDock::Center);
-        assert_eq!(phone_strip_dock(118.0, vp, pad, w), StripDock::Right);
-        assert_eq!(phone_strip_dock(70.0, vp, pad, w), StripDock::Center);
+        assert_eq!(strip_dock_for(12.0, vp, pad, w), StripDock::Left);
+        assert_eq!(strip_dock_for(65.0, vp, pad, w), StripDock::Center);
+        assert_eq!(strip_dock_for(118.0, vp, pad, w), StripDock::Right);
+        assert_eq!(strip_dock_for(70.0, vp, pad, w), StripDock::Center);
+    }
+
+    #[test]
+    fn pocket_bar_follows_a_drag_and_stays_on_screen() {
+        // This frame's left edge = dock + in-flight offset, clamped.
+        let (vp, pad, w) = (1024.0, 12.0, 760.0);
+        assert_eq!(strip_left_now(StripDock::Center, 0.0, vp, pad, w), 132.0);
+        assert_eq!(strip_left_now(StripDock::Center, 40.0, vp, pad, w), 172.0);
+        // Off-screen drags pin to the edges instead of leaving a gap.
+        assert_eq!(strip_left_now(StripDock::Left, -80.0, vp, pad, w), 12.0);
+        assert_eq!(strip_left_now(StripDock::Right, 999.0, vp, pad, w), 252.0);
     }
 
     #[test]
     fn pocket_strip_shrinks_to_fit_narrow_phones() {
-        assert_eq!(phone_mini_strip_width(390.0, 12.0), 260.0);
-        assert_eq!(phone_mini_strip_width(320.0, 12.0), 260.0);
-        assert_eq!(phone_mini_strip_width(280.0, 12.0), 256.0);
-        assert_eq!(phone_mini_strip_width(150.0, 12.0), 180.0);
+        assert_eq!(strip_mini_width(390.0, 12.0), 260.0);
+        assert_eq!(strip_mini_width(320.0, 12.0), 260.0);
+        assert_eq!(strip_mini_width(280.0, 12.0), 256.0);
+        assert_eq!(strip_mini_width(150.0, 12.0), 180.0);
+        // Tablet viewports get the same pocket pill, never wider.
+        assert_eq!(strip_mini_width(1024.0, 12.0), 260.0);
     }
 
     #[test]

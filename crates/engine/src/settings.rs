@@ -32,6 +32,9 @@ pub struct Settings {
     /// docks to ("left", "center", "right").
     pub strip_collapsed: bool,
     pub strip_dock: String,
+    /// Time-lapse recording; on by default so a new canvas stages snapshots
+    /// from the first stroke.
+    pub time_lapse: bool,
 }
 
 impl Default for Settings {
@@ -46,6 +49,7 @@ impl Default for Settings {
             shortcuts: StoredShortcuts::default(),
             strip_collapsed: false,
             strip_dock: "center".into(),
+            time_lapse: true,
         }
     }
 }
@@ -81,6 +85,8 @@ mod tests {
         );
         assert!(!s.strip_collapsed);
         assert_eq!(s.strip_dock, "center");
+        // Time-lapse is Procreate's default: record from the first stroke.
+        assert!(s.time_lapse);
     }
 
     #[test]
@@ -92,6 +98,7 @@ mod tests {
             recent: vec!["a.procraft".into(), "b.procraft".into()],
             strip_collapsed: true,
             strip_dock: "left".into(),
+            time_lapse: false,
             ..Settings::default()
         };
         let s2 = Settings::from_json(&s.to_json_pretty()).unwrap();
@@ -103,6 +110,7 @@ mod tests {
         let s = Settings::from_json(r#"{"theme":"light","future_field":42}"#).unwrap();
         assert_eq!(s.theme, "light");
         assert_eq!(s.zoom, 1.0); // missing field -> default
+        assert!(s.time_lapse); // older files keep recording
         assert!(!s.shortcuts.bindings.contains_key("undo")); // none customized
     }
 

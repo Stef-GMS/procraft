@@ -20,6 +20,8 @@ phone bottom strip instead of the tablet's top-left cluster.
 | 08 | Device-verdict fixes | mobile + desktop icon/readout polish | low |
 | 09 | Collapsible strip and transform improvements | phone strip + transform panel | medium |
 | 10 | Dotted workspace board | canvas board on all layouts | low |
+| 11 | Bottom bar parity: drag, dock, collapse | tablet options capsule | medium |
+| 12 | Time-lapse default on, GIF row | Layers panel / animation | low |
 
 ## Workflow
 
@@ -41,4 +43,7 @@ For every plan:
 - After Plan 06: final pass.
 - After the `aed004a` IPA (2026-10-28): icons + size readout fixed; large-brush
   lag confirmed as CPU stamping and deferred to a rendering milestone.
+- After the `e22e402` IPA (2026-10-28): bottom bar not repositionable, showed a
+  scrollbar and could not collapse (iPad = tablet capsule); Time-lapse default
+  off and buried; Export/Import GIF stacked. Plans 11–12.
 - `.ipa`/`.apk` packs need a push; ask before triggering the workflows.

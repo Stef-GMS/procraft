@@ -858,6 +858,9 @@ struct ProCraftApp {
     show_tools: bool,
     show_layers: bool,
     drawer: MobileDrawer,
+    /// One-shot request from the mobile Color dot: after the Tools drawer
+    /// opens, scroll its body to the Color card.
+    mobile_scroll_color: bool,
     narrow_setup_done: bool,
     show_about: bool,
     #[cfg(target_os = "ios")]
@@ -1104,6 +1107,7 @@ impl ProCraftApp {
             show_tools: true,
             show_layers: true,
             drawer: MobileDrawer::None,
+            mobile_scroll_color: false,
             narrow_setup_done: false,
             show_about: false,
             #[cfg(target_os = "ios")]
@@ -2167,6 +2171,19 @@ impl ProCraftApp {
         .clicked()
     }
 
+    /// Clear the active layer as one undoable step. Shared by the desktop
+    /// top bar and the mobile actions cluster.
+    fn clear_layer(&mut self) {
+        if self.text_paint_blocked() {
+            return;
+        }
+        self.doc.checkpoint();
+        if let Some(layer) = self.doc.active_layer_mut() {
+            layer.clear();
+        }
+        self.doc.mark_full_dirty();
+    }
+
     /// Zoom/rotate/About cluster shared by the wide bar (inline) and the
     /// narrow/tablet bar (inside a View menu). `in_menu` dismisses the popup
     /// after momentary actions, matching the File menu convention; inline
@@ -2723,21 +2740,27 @@ impl ProCraftApp {
             });
             ui.add_space(t.gap);
             design::section_card(ui, &t, Some("Color"), false, |ui| {
-                stepped_slider(ui, &mut self.picker_size, 140.0..=420.0, 5.0, "Picker px");
-                let mut c = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
-                // The SV square + hue strip size themselves from `slider_width`,
-                // not the panel width: drive it from the slider above.
-                let picker_width = self.picker_size;
-                ui.scope(|ui| {
-                    ui.spacing_mut().slider_width = picker_width;
-                    if egui::color_picker::color_picker_color32(
-                        ui,
-                        &mut c,
-                        egui::color_picker::Alpha::Opaque,
-                    ) {
-                        self.color = [c.r(), c.g(), c.b()];
-                    }
+                let card = ui.scope(|ui| {
+                    stepped_slider(ui, &mut self.picker_size, 140.0..=420.0, 5.0, "Picker px");
+                    let mut c = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
+                    // The SV square + hue strip size themselves from `slider_width`,
+                    // not the panel width: drive it from the slider above.
+                    let picker_width = self.picker_size;
+                    ui.scope(|ui| {
+                        ui.spacing_mut().slider_width = picker_width;
+                        if egui::color_picker::color_picker_color32(
+                            ui,
+                            &mut c,
+                            egui::color_picker::Alpha::Opaque,
+                        ) {
+                            self.color = [c.r(), c.g(), c.b()];
+                        }
+                    });
                 });
+                if self.mobile_scroll_color {
+                    ui.scroll_to_rect(card.response.rect, Some(egui::Align::Center));
+                    self.mobile_scroll_color = false;
+                }
             });
             ui.add_space(t.gap);
             design::section_card(ui, &t, Some("Swatches"), false, |ui| {
@@ -4686,13 +4709,46 @@ impl ProCraftApp {
                 0.0
             }
         };
-        let cluster_frame = || {
+        // Floating islands sit slightly translucent over the canvas and use
+        // fully rounded ends so they read as capsules, not panels.
+        let island_fill =
+            |c: egui::Color32| egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 242);
+        let island_frame = || {
             egui::Frame::NONE
-                .fill(t.surface_2)
+                .fill(island_fill(t.surface_2))
+                .stroke(egui::Stroke::new(1.0, t.stroke))
+                .corner_radius(egui::CornerRadius::same(
+                    ((t.control_h + 12.0) * 0.5).round() as u8,
+                ))
+                .inner_margin(egui::Margin::from(egui::vec2(6.0, 6.0)))
+        };
+        let drawer_frame = || {
+            egui::Frame::NONE
+                .fill(t.surface_1)
                 .stroke(egui::Stroke::new(1.0, t.stroke))
                 .corner_radius(egui::CornerRadius::same(t.radius_card))
                 .inner_margin(egui::Margin::from(egui::vec2(6.0, 6.0)))
         };
+        let island_h = mobile_island_height(t.control_h);
+        let hit = quick_hit_height(class);
+        let capsule_visible = !quick_controls(self.tool).is_empty();
+
+        if capsule_visible {
+            egui::Area::new(egui::Id::new("mobile-options"))
+                .order(egui::Order::Middle)
+                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -(safe_bottom + pad)])
+                .show(ctx, |ui| {
+                    ui.set_max_width(mobile_capsule_width(vp.width()));
+                    ui.spacing_mut().interact_size.y = hit;
+                    island_frame().show(ui, |ui| {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("mobile-options-scroll")
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| self.quick_controls_ui(ui, hit, &t));
+                            });
+                    });
+                });
+        }
 
         if self.drawer != MobileDrawer::None {
             egui::Area::new(egui::Id::new("mobile-scrim"))
@@ -4714,7 +4770,7 @@ impl ProCraftApp {
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::LEFT_TOP, [pad, safe_top + pad])
             .show(ctx, |ui| {
-                cluster_frame().show(ui, |ui| {
+                island_frame().show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
                         if self.pill(ui, "Gallery") {
@@ -4732,6 +4788,9 @@ impl ProCraftApp {
                         if self.pill(ui, "Reference") {
                             self.ref_open = !self.ref_open;
                         }
+                        if self.pill(ui, "Clear") {
+                            self.clear_layer();
+                        }
                     });
                 });
             });
@@ -4740,7 +4799,7 @@ impl ProCraftApp {
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::RIGHT_TOP, [-pad, safe_top + pad])
             .show(ctx, |ui| {
-                cluster_frame().show(ui, |ui| {
+                island_frame().show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
                         if ui
@@ -4773,6 +4832,27 @@ impl ProCraftApp {
                                 self.show_tools = false;
                             }
                         }
+                        let (dot_rect, dot_resp) = ui.allocate_exact_size(
+                            egui::vec2(t.control_h, t.control_h),
+                            egui::Sense::click(),
+                        );
+                        let dot_r = t.control_h * 0.5 - 8.0;
+                        ui.painter().circle_filled(
+                            dot_rect.center(),
+                            dot_r,
+                            egui::Color32::from_rgb(self.color[0], self.color[1], self.color[2]),
+                        );
+                        ui.painter().circle_stroke(
+                            dot_rect.center(),
+                            dot_r,
+                            egui::Stroke::new(1.0, t.stroke),
+                        );
+                        if dot_resp.on_hover_text("Color").clicked() {
+                            self.drawer = MobileDrawer::Tools;
+                            self.show_tools = true;
+                            self.show_layers = false;
+                            self.mobile_scroll_color = true;
+                        }
                         if design::theme_toggle(ui, &t, &mut self.theme) {
                             self.status = format!("{} theme.", self.theme.name());
                         }
@@ -4792,12 +4872,20 @@ impl ProCraftApp {
         if self.drawer != MobileDrawer::None {
             let tools = self.drawer == MobileDrawer::Tools;
             let w = mobile_drawer_width(vp.width());
+            let (top, h) = mobile_drawer_span(
+                vp.bottom(),
+                safe_top,
+                safe_bottom,
+                pad,
+                island_h,
+                t.gap,
+                capsule_visible,
+            );
             let pos = if tools {
-                egui::pos2(vp.left() + pad, safe_top + pad)
+                egui::pos2(vp.left() + pad, top)
             } else {
-                egui::pos2(vp.right() - pad - w, safe_top + pad)
+                egui::pos2(vp.right() - pad - w, top)
             };
-            let h = (vp.bottom() - safe_bottom - pad - pos.y).max(200.0);
             egui::Area::new(egui::Id::new(if tools {
                 "mobile-drawer-tools"
             } else {
@@ -4810,7 +4898,7 @@ impl ProCraftApp {
                     egui::vec2(w, h),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        cluster_frame().fill(t.surface_1).show(ui, |ui| {
+                        drawer_frame().show(ui, |ui| {
                             ui.set_width(w - 2.0 * 6.0);
                             if tools {
                                 self.tools_panel_body(ui);
@@ -6012,6 +6100,36 @@ impl MobileDrawer {
 /// narrow enough to leave a visible strip of canvas and the scrim.
 fn mobile_drawer_width(viewport_w: f32) -> f32 {
     (viewport_w * 0.88).clamp(240.0, 360.0)
+}
+
+/// Options capsule width: nearly the whole canvas on phones, capped so it
+/// stays a floating island on wide tablets.
+fn mobile_capsule_width(viewport_w: f32) -> f32 {
+    (viewport_w * 0.94).min(760.0)
+}
+
+/// Height of a floating cluster or capsule: one control row plus the
+/// frame's 6 pt inner margin on both sides.
+fn mobile_island_height(control_h: f32) -> f32 {
+    control_h + 12.0
+}
+
+/// Drawer window `(top, height)`: starts below the floating clusters and
+/// ends above the options capsule, so no drawer control hides under the
+/// islands.
+fn mobile_drawer_span(
+    viewport_bottom: f32,
+    safe_top: f32,
+    safe_bottom: f32,
+    pad: f32,
+    island_h: f32,
+    gap: f32,
+    has_capsule: bool,
+) -> (f32, f32) {
+    let top = safe_top + pad + island_h + gap;
+    let bottom =
+        viewport_bottom - safe_bottom - pad - if has_capsule { island_h + gap } else { 0.0 };
+    (top, (bottom - top).max(200.0))
 }
 
 /// Mobile edge padding (Android status-bar px / iOS safe-area points)
@@ -8162,12 +8280,8 @@ impl eframe::App for ProCraftApp {
                     if self.pill(ui, "Redo") && self.doc.redo() {
                         self.status = "Redone.".to_string();
                     }
-                    if self.pill(ui, "Clear layer") && !self.text_paint_blocked() {
-                        self.doc.checkpoint();
-                        if let Some(layer) = self.doc.active_layer_mut() {
-                            layer.clear();
-                        }
-                        self.doc.mark_full_dirty();
+                    if self.pill(ui, "Clear layer") {
+                        self.clear_layer();
                     }
                     // Phone and tablet fold the view cluster into a menu (the
                     // inline stepper starves to a character-wide column below
@@ -11281,6 +11395,31 @@ mod tests {
         assert_eq!(mobile_drawer_width(844.0), 360.0);
         assert_eq!(mobile_drawer_width(1366.0), 360.0);
         assert_eq!(mobile_drawer_width(240.0), 240.0);
+    }
+
+    #[test]
+    fn capsule_width_nearly_fills_phones_and_caps_on_tablets() {
+        assert!((mobile_capsule_width(390.0) - 366.6).abs() < 0.01);
+        assert_eq!(mobile_capsule_width(1180.0), 760.0);
+        assert_eq!(mobile_capsule_width(820.0), 760.0);
+    }
+
+    #[test]
+    fn islands_are_one_control_row_plus_frame_margin() {
+        assert_eq!(mobile_island_height(44.0), 56.0);
+        assert_eq!(mobile_island_height(36.0), 48.0);
+    }
+
+    #[test]
+    fn drawer_span_clears_clusters_and_options_capsule() {
+        let (top, h) = mobile_drawer_span(820.0, 24.0, 20.0, 12.0, 56.0, 8.0, true);
+        assert_eq!(top, 100.0);
+        let bottom = 820.0 - 20.0 - 12.0 - 56.0 - 8.0;
+        assert_eq!(h, bottom - top);
+        let (_, taller) = mobile_drawer_span(820.0, 24.0, 20.0, 12.0, 56.0, 8.0, false);
+        assert_eq!(taller - h, 64.0);
+        let (_, floor) = mobile_drawer_span(300.0, 100.0, 0.0, 12.0, 56.0, 8.0, true);
+        assert_eq!(floor, 200.0);
     }
 
     #[test]

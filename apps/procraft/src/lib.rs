@@ -125,13 +125,31 @@ enum Tool {
 }
 
 /// Tool radio label: icon glyphs on symbol-font platforms, plain words
-/// where the glyphs would be tofu (iPad). Shared render-safe strings
-/// (brush, eraser, smudge, move, shapes) are identical either way.
+/// where the glyphs would be tofu (iOS). Only glyphs the bundled fonts
+/// cover (`○`) are unconditional; everything else has a word fallback.
 fn tool_label(tool: Tool, symbols: bool) -> &'static str {
     match tool {
-        Tool::Brush => "✏ Brush",
-        Tool::Eraser => "⌫ Eraser",
-        Tool::Smudge => "💧 Smudge",
+        Tool::Brush => {
+            if symbols {
+                "✏ Brush"
+            } else {
+                "Brush"
+            }
+        }
+        Tool::Eraser => {
+            if symbols {
+                "⌫ Eraser"
+            } else {
+                "Eraser"
+            }
+        }
+        Tool::Smudge => {
+            if symbols {
+                "💧 Smudge"
+            } else {
+                "Smudge"
+            }
+        }
         Tool::Select => {
             if symbols {
                 "⬚ Select"
@@ -160,7 +178,13 @@ fn tool_label(tool: Tool, symbols: bool) -> &'static str {
                 "Pick"
             }
         }
-        Tool::Move => "↔ Move",
+        Tool::Move => {
+            if symbols {
+                "↔ Move"
+            } else {
+                "Move"
+            }
+        }
         Tool::Hand => {
             if symbols {
                 "✋ Hand"
@@ -2199,6 +2223,7 @@ impl ProCraftApp {
             ui,
             &t,
             design::PillSpec {
+                icon: None,
                 glyph: None,
                 label: Some(label),
                 selected: false,
@@ -2236,6 +2261,7 @@ impl ProCraftApp {
             ui,
             &t,
             design::PillSpec {
+                icon: None,
                 glyph: None,
                 label: Some(label),
                 selected,
@@ -2352,7 +2378,7 @@ impl ProCraftApp {
                 Some("Tool"),
                 false,
                 |ui| {
-                    if ui.add_sized([40.0, 24.0], egui::Button::new("◀")).clicked() {
+                    if ui.add_sized([40.0, 24.0], egui::Button::new("<")).clicked() {
                         close_tools = true;
                     }
                 },
@@ -2446,7 +2472,7 @@ impl ProCraftApp {
                             ui.horizontal(|ui| {
                                 for ax in -1..=1 {
                                     let mark =
-                                        if self.canvas_anchor == (ax, ay) { "■" } else { "□" };
+                                        if self.canvas_anchor == (ax, ay) { "■" } else { "·" };
                                     if ui
                                         .add_sized([32.0, 24.0], egui::Button::new(mark))
                                         .clicked()
@@ -2860,15 +2886,15 @@ impl ProCraftApp {
                     });
                 });
                 // Actions first, then the active palette on its own line:
-                // one long `Palettes: ◀ name ▶` row overflowed the card and
+                // one long `Palettes: < name >` row overflowed the card and
                 // clipped the name at the right edge.
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Palettes:");
                     let n = self.palettes.palettes.len();
-                    if ui.button("◀").clicked() && n > 0 {
+                    if ui.button("<").clicked() && n > 0 {
                         self.palettes.set_active((self.palettes.active + n - 1) % n);
                     }
-                    if ui.button("▶").clicked() && n > 0 {
+                    if ui.button(">").clicked() && n > 0 {
                         self.palettes.set_active((self.palettes.active + 1) % n);
                     }
                     if ui.add_enabled(n < MAX_PALETTES, egui::Button::new("+ New")).clicked() {
@@ -3284,7 +3310,7 @@ impl ProCraftApp {
                 Some("Layers"),
                 false,
                 |ui| {
-                    if ui.add_sized([40.0, 24.0], egui::Button::new("▶")).clicked() {
+                    if ui.add_sized([40.0, 24.0], egui::Button::new(">")).clicked() {
                         close_layers = true;
                     }
                 },
@@ -3610,10 +3636,10 @@ impl ProCraftApp {
                             }
                         });
                     ui.horizontal(|ui| {
-                        if ui.button("▲ Up").clicked() {
+                        if ui.button("Up").clicked() {
                             moved = 1;
                         }
-                        if ui.button("▼ Down").clicked() {
+                        if ui.button("Down").clicked() {
                             moved = -1;
                         }
                     });
@@ -4935,16 +4961,14 @@ impl ProCraftApp {
                     island_frame().show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
-                            if ui
-                                .add_sized([t.control_h, t.control_h], egui::Button::new("↶"))
+                            if design::icon_button(ui, &t, design::Icon::Undo, t.control_h)
                                 .on_hover_text("Undo")
                                 .clicked()
                                 && self.doc.undo()
                             {
                                 self.status = "Undone.".to_string();
                             }
-                            if ui
-                                .add_sized([t.control_h, t.control_h], egui::Button::new("↷"))
+                            if design::icon_button(ui, &t, design::Icon::Redo, t.control_h)
                                 .on_hover_text("Redo")
                                 .clicked()
                                 && self.doc.redo()
@@ -5021,7 +5045,12 @@ impl ProCraftApp {
                                             self.choose_tool(tool);
                                         }
                                     }
-                                    ui.label(format!("{:.0}", self.brush.size));
+                                    design::readout_label(
+                                        ui,
+                                        &t,
+                                        &format!("{:.0}", self.brush.size),
+                                        &format!("{:.0}", BRUSH_SIZE_MAX),
+                                    );
                                     ui.separator();
                                     if self.pill(ui, "Tools") {
                                         self.drawer = self.drawer.toggled(MobileDrawer::Tools);
@@ -5039,16 +5068,14 @@ impl ProCraftApp {
                                     }
                                     self.color_dot(ui, &t);
                                     ui.separator();
-                                    if ui
-                                        .add_sized([hit, hit], egui::Button::new("↶"))
+                                    if design::icon_button(ui, &t, design::Icon::Undo, hit)
                                         .on_hover_text("Undo")
                                         .clicked()
                                         && self.doc.undo()
                                     {
                                         self.status = "Undone.".to_string();
                                     }
-                                    if ui
-                                        .add_sized([hit, hit], egui::Button::new("↷"))
+                                    if design::icon_button(ui, &t, design::Icon::Redo, hit)
                                         .on_hover_text("Redo")
                                         .clicked()
                                         && self.doc.redo()

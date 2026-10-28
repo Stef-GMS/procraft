@@ -227,8 +227,21 @@ impl Tokens {
     }
 }
 
+/// Chrome icons are painted, never typeset. The glyphs they replace (↶ ↷ ☾
+/// ☀) are absent from the fonts the iOS build ships, so text glyphs render
+/// as tofu boxes there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Icon {
+    Undo,
+    Redo,
+    Moon,
+    Sun,
+    Paper,
+}
+
 /// What a pill shows and how it behaves.
 pub(crate) struct PillSpec<'a> {
+    pub(crate) icon: Option<Icon>,
     pub(crate) glyph: Option<&'a str>,
     pub(crate) label: Option<&'a str>,
     pub(crate) selected: bool,
@@ -281,18 +294,190 @@ pub(crate) fn pill_button(ui: &mut egui::Ui, t: &Tokens, spec: PillSpec<'_>) -> 
         );
     }
     let text_color = if spec.selected { Color32::WHITE } else { ink };
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        shown,
-        FontId::proportional(t.type_body),
-        text_color,
-    );
+    if let Some(icon) = spec.icon {
+        paint_icon(painter, rect, icon, text_color, fill);
+    } else {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            shown,
+            FontId::proportional(t.type_body),
+            text_color,
+        );
+    }
 
     // Icon-only pills carry their name in a tooltip.
-    match (spec.glyph, spec.label) {
-        (Some(_), Some(label)) => response.on_hover_text(label),
+    match (spec.icon.is_some() || spec.glyph.is_some(), spec.label) {
+        (true, Some(label)) => response.on_hover_text(label),
         _ => response,
+    }
+}
+
+/// Square icon button for the floating clusters: the inactive/hover fills of
+/// the widget style, with the icon painted inside so no font is involved.
+pub(crate) fn icon_button(ui: &mut egui::Ui, t: &Tokens, icon: Icon, size: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    let radius = CornerRadius::same(t.radius_control);
+    let hovered = response.hovered();
+    let fill = if hovered { t.surface_3 } else { t.surface_2 };
+    let painter = ui.painter();
+    painter.rect_filled(rect, radius, fill);
+    painter.rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, if hovered { t.accent } else { t.stroke }),
+        egui::StrokeKind::Inside,
+    );
+    paint_icon(painter, rect, icon, t.text_hi, fill);
+    let name = match icon {
+        Icon::Undo => "Undo",
+        Icon::Redo => "Redo",
+        Icon::Moon | Icon::Sun | Icon::Paper => "Theme",
+    };
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+    response
+}
+
+/// Paint one icon centred in `rect`. `bg` is the fill behind it (the moon's
+/// crescent is cut with it).
+pub(crate) fn paint_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    icon: Icon,
+    ink: Color32,
+    bg: Color32,
+) {
+    let s = rect.width().min(rect.height());
+    let stroke = Stroke::new((s * 0.075).clamp(1.5, 3.0), ink);
+    match icon {
+        Icon::Undo | Icon::Redo => {
+            let (arc, tangent) = arrow_geometry(rect, icon == Icon::Redo);
+            painter.add(egui::Shape::line(arc.clone(), stroke));
+            let tip = *arc.last().expect("arrow arc has points");
+            let normal = egui::vec2(-tangent.y, tangent.x);
+            let head = s * 0.17;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    tip + tangent * head,
+                    tip + normal * (head * 0.62),
+                    tip - normal * (head * 0.62),
+                ],
+                ink,
+                Stroke::NONE,
+            ));
+        }
+        Icon::Moon => {
+            painter.circle_filled(rect.center(), s * 0.30, ink);
+            painter.circle_filled(
+                rect.center() + egui::vec2(s * 0.14, -s * 0.11),
+                s * 0.27,
+                bg,
+            );
+        }
+        Icon::Sun => {
+            painter.circle_filled(rect.center(), s * 0.11, ink);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::TAU / 8.0;
+                let d = egui::vec2(a.cos(), a.sin());
+                painter.line_segment(
+                    [
+                        rect.center() + d * (s * 0.20),
+                        rect.center() + d * (s * 0.30),
+                    ],
+                    stroke,
+                );
+            }
+        }
+        Icon::Paper => {
+            let page = egui::Rect::from_center_size(rect.center(), egui::vec2(s * 0.42, s * 0.52));
+            painter.rect_stroke(
+                page,
+                CornerRadius::same((s * 0.06) as u8),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            for i in 0..3 {
+                let y = page.top() + page.height() * (0.26 + 0.22 * i as f32);
+                painter.line_segment(
+                    [
+                        egui::pos2(page.left() + s * 0.07, y),
+                        egui::pos2(page.right() - s * 0.07, y),
+                    ],
+                    Stroke::new(stroke.width * 0.8, ink),
+                );
+            }
+        }
+    }
+}
+
+/// Arc points (screen space, y down) plus the tangent the head points along:
+/// starts on the right, sweeps over the top and ends upper-left, where an
+/// undo arrow's head belongs. `mirror` flips it for redo.
+fn arrow_geometry(rect: egui::Rect, mirror: bool) -> (Vec<egui::Pos2>, egui::Vec2) {
+    let s = rect.width().min(rect.height());
+    let r = s * 0.28;
+    let center = rect.center() + egui::vec2(0.0, s * 0.03);
+    // From just below the right shoulder, across the top, to the upper left.
+    let (from, to) = (40.0f32, -160.0f32);
+    let steps = 24;
+    let flip = if mirror { -1.0 } else { 1.0 };
+    let at = |deg: f32| {
+        let a = deg.to_radians();
+        egui::pos2(center.x + flip * r * a.cos(), center.y + r * a.sin())
+    };
+    let arc = (0..=steps)
+        .map(|i| at(from + (to - from) * (i as f32 / steps as f32)))
+        .collect();
+    // Direction of travel at the end (decreasing angle), mirrored.
+    let a = to.to_radians();
+    let tangent = egui::vec2(flip * a.sin(), -a.cos());
+    (arc, tangent)
+}
+
+/// Right-aligned numeric readout in a slot sized for `widest`, so a value
+/// growing from two digits to three (99 → 100) never moves the controls
+/// beside it.
+pub(crate) fn readout_label(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    text: &str,
+    widest: &str,
+) -> egui::Response {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let width = ui
+        .painter()
+        .layout_no_wrap(widest.to_owned(), font.clone(), Color32::PLACEHOLDER)
+        .size()
+        .x;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width.ceil() + 2.0, t.control_h),
+        egui::Sense::hover(),
+    );
+    ui.painter().text(
+        rect.right_center(),
+        egui::Align2::RIGHT_CENTER,
+        text,
+        font,
+        ui.visuals().text_color(),
+    );
+    response
+}
+
+/// The longest value text a slider range can show, for
+/// [`readout_label`]'s slot.
+pub(crate) fn widest_value_text(lo: f32, hi: f32, step: f64) -> String {
+    let text = |v: f32| {
+        if step.fract() == 0.0 {
+            format!("{v:.0}")
+        } else {
+            format!("{v:.2}")
+        }
+    };
+    let (a, b) = (text(lo), text(hi));
+    if a.len() > b.len() {
+        a
+    } else {
+        b
     }
 }
 
@@ -410,10 +595,12 @@ pub(crate) fn thick_slider(
     } else {
         t.control_h
     };
+    let widest = widest_value_text(lo, hi, step);
     let mut track: Option<egui::Response> = None;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        ui.label(format!("{label} {value_text}"));
+        ui.label(label);
+        readout_label(ui, t, &value_text, &widest);
         if ui
             .add_sized([btn_w, t.control_h], egui::Button::new("−"))
             .clicked()
@@ -465,13 +652,13 @@ pub(crate) fn next_theme(theme: Theme) -> Theme {
     }
 }
 
-/// What the toggle shows: the *current* theme, so the glyph reads as a state
-/// (☀ light, ☾ dark, 🖹 paper) rather than as the action.
-pub(crate) fn theme_glyph(theme: Theme) -> &'static str {
+/// What the toggle shows: the *current* theme, so the icon reads as a state
+/// (sun light, moon dark, page paper) rather than as the action.
+pub(crate) fn theme_icon(theme: Theme) -> Icon {
     match theme {
-        Theme::Dark => "☾",
-        Theme::Light => "☀",
-        Theme::Paper => "🖹",
+        Theme::Dark => Icon::Moon,
+        Theme::Light => Icon::Sun,
+        Theme::Paper => Icon::Paper,
     }
 }
 
@@ -483,7 +670,8 @@ pub(crate) fn theme_toggle(ui: &mut egui::Ui, t: &Tokens, theme: &mut Theme) -> 
         ui,
         t,
         PillSpec {
-            glyph: Some(theme_glyph(*theme)),
+            icon: Some(theme_icon(*theme)),
+            glyph: None,
             label: None,
             selected: false,
             enabled: true,
@@ -611,13 +799,92 @@ mod tests {
     }
 
     #[test]
-    fn toggle_cycles_dark_light_paper_with_one_glyph_each() {
+    fn toggle_cycles_dark_light_paper_with_one_icon_each() {
         assert_eq!(next_theme(Theme::Dark), Theme::Light);
         assert_eq!(next_theme(Theme::Light), Theme::Paper);
         assert_eq!(next_theme(Theme::Paper), Theme::Dark);
-        assert_eq!(theme_glyph(Theme::Dark), "☾");
-        assert_eq!(theme_glyph(Theme::Light), "☀");
-        assert_eq!(theme_glyph(Theme::Paper), "🖹");
+        assert_eq!(theme_icon(Theme::Dark), Icon::Moon);
+        assert_eq!(theme_icon(Theme::Light), Icon::Sun);
+        assert_eq!(theme_icon(Theme::Paper), Icon::Paper);
+    }
+
+    /// iOS/Android ship only egui's bundled fonts (no Segoe UI Symbol), so a
+    /// glyph outside those fonts is a tofu box on the device. Every string
+    /// the `has_symbols == false` paths print must stay inside them.
+    #[test]
+    fn bundled_fonts_cover_every_glyph_the_fallback_paths_print() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(Default::default(), |_| {});
+        out.textures_delta.clear();
+
+        let mut strings: Vec<String> = [
+            crate::Tool::Brush,
+            crate::Tool::Eraser,
+            crate::Tool::Smudge,
+            crate::Tool::Select,
+            crate::Tool::Lasso,
+            crate::Tool::Fill,
+            crate::Tool::Picker,
+            crate::Tool::Move,
+            crate::Tool::Hand,
+            crate::Tool::Liquify,
+            crate::Tool::Crop,
+            crate::Tool::Shapes,
+            crate::Tool::Text,
+        ]
+        .iter()
+        .map(|t| crate::tool_label(*t, false).to_string())
+        .collect();
+        strings.extend(
+            [
+                "Brush", "Eraser", "Smudge", "<", ">", "Up", "Down", "·", "−", "+", "■", "○", "T",
+            ]
+            .map(str::to_string),
+        );
+
+        for s in strings {
+            for c in s.chars().filter(|c| !c.is_ascii()) {
+                let covered = ctx.fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(15.0), c));
+                assert!(
+                    covered,
+                    "{s:?} prints {c:?}, missing from the bundled fonts"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn readout_slot_is_one_width_across_the_whole_range() {
+        // The brush size range: 90 -> 100 -> 400 all fit the "400" slot.
+        assert_eq!(widest_value_text(1.0, 400.0, 1.0), "400");
+        assert_eq!(widest_value_text(-32.0, 32.0, 1.0), "-32");
+        assert_eq!(widest_value_text(0.05, 1.0, 0.05), "1.00");
+        assert_eq!(widest_value_text(0.0, 255.0, 1.0), "255");
+    }
+
+    #[test]
+    fn arrow_icons_stay_inside_their_button_at_every_size() {
+        for size in [26.0f32, 44.0, 48.0, 56.0] {
+            let rect =
+                egui::Rect::from_center_size(egui::pos2(100.0, 100.0), egui::vec2(size, size));
+            for mirror in [false, true] {
+                let (arc, tangent) = arrow_geometry(rect, mirror);
+                let tip = *arc.last().expect("arc has points");
+                let head = size * 0.17;
+                let normal = egui::vec2(-tangent.y, tangent.x);
+                let corners = [
+                    tip + tangent * head,
+                    tip + normal * (head * 0.62),
+                    tip - normal * (head * 0.62),
+                ];
+                for p in arc.iter().copied().chain(corners) {
+                    assert!(
+                        rect.contains(p),
+                        "size {size} mirror {mirror}: {p:?} escapes {rect:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

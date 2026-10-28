@@ -63,6 +63,19 @@ capsule as brush/selection (only the row contents change). Both phone drawers,
 the File popup, `Select` capsule and portrait dark/light/paper plus landscape
 dark are captured in `dist/mobile-shell/`.
 
+**Follow-up (same day, user verdict fix).** The verdict passed for tablet and
+phone, with one report: on a device the status bar (clock, battery) overlapped
+the app because the edge-to-edge surface painted the canvas beneath it. The
+root layout now reserves a `mobile-safe-top` panel of `status_inset_top()`
+points on `Shell::Mobile` (iOS safe-area top, cached Android JNI height), so
+the canvas scroll area and every later panel start below the status bar; the
+floating chrome already anchored by the same inset, so nothing double-pads.
+`PROCRAFT_SAFE_TOP` (points, clamped by `clamp_status_inset`) simulates a
+device inset on host builds, and `capture.ps1 -SafeTop` drives it.
+`plan05-phone-safe-top.png` (47 pt, iPhone portrait),
+`plan05-phone-safe-top-tools.png` (drawer clears the strip) and
+`plan05-tablet-safe-top.png` (24 pt, iPad) verify the reservation.
+
 Gates: 98 app tests (+1 ignored) and 323 engine tests pass, `cargo fmt
 --check` and `cargo clippy --workspace --all-targets -- -D warnings` are clean,
 release binary builds.

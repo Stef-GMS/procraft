@@ -4738,6 +4738,33 @@ impl ProCraftApp {
         }
     }
 
+    /// Top safe inset for the mobile shell: the status bar/notch strip the
+    /// canvas must not paint under. Read per frame (rotations change it);
+    /// `PROCRAFT_SAFE_TOP` stands in for a device on host captures.
+    fn status_inset_top(&mut self) -> f32 {
+        if let Some(px) = forced_safe_top() {
+            return px;
+        }
+        #[cfg(target_os = "ios")]
+        {
+            let (top, _) = rfd::ios_safe_area_insets().unwrap_or((0, 0));
+            clamp_status_inset(top)
+        }
+        #[cfg(target_os = "android")]
+        {
+            if self.android_inset_top < 0.0 {
+                self.android_inset_top = rfd::android_status_bar_height()
+                    .map(clamp_status_inset)
+                    .unwrap_or(0.0);
+            }
+            self.android_inset_top.max(0.0)
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            0.0
+        }
+    }
+
     /// Mobile chrome: floating clusters over a full-screen canvas, with the
     /// tools/layers sidebars presented as slide-over drawers. Every control is
     /// the same one the docked shell uses; only the presentation differs.
@@ -4745,26 +4772,7 @@ impl ProCraftApp {
         let t = design::tokens(self.theme, class);
         let vp = ctx.viewport_rect();
         let pad = 12.0;
-        let safe_top = {
-            #[cfg(target_os = "ios")]
-            {
-                let (top, _) = rfd::ios_safe_area_insets().unwrap_or((0, 0));
-                clamp_status_inset(top)
-            }
-            #[cfg(target_os = "android")]
-            {
-                if self.android_inset_top < 0.0 {
-                    self.android_inset_top = rfd::android_status_bar_height()
-                        .map(clamp_status_inset)
-                        .unwrap_or(0.0);
-                }
-                self.android_inset_top.max(0.0)
-            }
-            #[cfg(not(any(target_os = "ios", target_os = "android")))]
-            {
-                0.0
-            }
-        };
+        let safe_top = self.status_inset_top();
         let safe_bottom = safe_bottom(true);
         let phone = class == BarLayout::Narrow;
         // Floating islands sit slightly translucent over the canvas and use
@@ -6311,6 +6319,16 @@ fn safe_bottom(mobile: bool) -> f32 {
     }
 }
 
+/// `PROCRAFT_SAFE_TOP` (points, clamped like a real inset) so host builds can
+/// be captured with the same status-bar strip a device reserves.
+fn forced_safe_top() -> Option<f32> {
+    safe_inset_override(std::env::var("PROCRAFT_SAFE_TOP").ok().as_deref())
+}
+
+fn safe_inset_override(value: Option<&str>) -> Option<f32> {
+    value?.trim().parse::<u32>().ok().map(clamp_status_inset)
+}
+
 /// Y offset (negative, for a bottom anchor) of the phone strip.
 fn phone_strip_offset(safe_bottom: f32, pad: f32) -> f32 {
     -(safe_bottom + pad)
@@ -6382,9 +6400,8 @@ fn mobile_drawer_span(
 }
 
 /// Mobile edge padding (Android status-bar px / iOS safe-area points)
-/// clamped so a wild value can never eat the screen. Host builds cover it
-/// through tests.
-#[cfg(any(target_os = "android", target_os = "ios", test))]
+/// clamped so a wild value can never eat the screen. Host builds reach it
+/// through `PROCRAFT_SAFE_TOP` and tests.
 fn clamp_status_inset(px: u32) -> f32 {
     (px as f32).clamp(0.0, 200.0)
 }
@@ -8213,6 +8230,20 @@ impl eframe::App for ProCraftApp {
                 egui::ThemePreference::Light
             });
             self.theme_applied = Some((self.theme, class));
+        }
+        // Mobile surfaces are edge-to-edge, so the canvas would otherwise
+        // paint under the status bar/notch. Reserve that strip at the root:
+        // every later panel and the central canvas shrink from it, while
+        // `mobile_chrome` anchors to the viewport and offsets by it too.
+        if shell == Shell::Mobile {
+            let inset = self.status_inset_top();
+            if inset > 0.0 {
+                egui::Panel::top("mobile-safe-top")
+                    .resizable(false)
+                    .exact_size(inset)
+                    .frame(egui::Frame::NONE.fill(ui.visuals().panel_fill))
+                    .show(ui, |_| {});
+            }
         }
         // M49: the seed marker lands here — eframe 0.36's
         // `CreationContext::storage` is read-only, `Frame::storage_mut`
@@ -11715,6 +11746,17 @@ mod tests {
         assert_eq!(clamp_status_inset(0), 0.0);
         assert_eq!(clamp_status_inset(72), 72.0);
         assert_eq!(clamp_status_inset(9999), 200.0);
+    }
+
+    #[test]
+    fn safe_top_override_parses_points_and_clamps() {
+        assert_eq!(safe_inset_override(None), None);
+        assert_eq!(safe_inset_override(Some("")), None);
+        assert_eq!(safe_inset_override(Some("nope")), None);
+        assert_eq!(safe_inset_override(Some(" 59 ")), Some(59.0));
+        assert_eq!(safe_inset_override(Some("-4")), None);
+        assert_eq!(safe_inset_override(Some("9999")), Some(200.0));
+        assert_eq!(safe_inset_override(Some("0")), Some(0.0));
     }
 
     #[test]

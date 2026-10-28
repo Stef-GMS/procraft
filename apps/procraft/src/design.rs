@@ -467,30 +467,24 @@ pub(crate) fn next_theme(theme: Theme) -> Theme {
 
 /// What the toggle shows: the *current* theme, so the glyph reads as a state
 /// (☀ light, ☾ dark, 🖹 paper) rather than as the action.
-pub(crate) fn theme_glyph(has_symbols: bool, theme: Theme) -> &'static str {
-    match (has_symbols, theme) {
-        (true, Theme::Dark) => "☾",
-        (true, Theme::Light) => "☀",
-        (true, Theme::Paper) => "🖹",
-        (false, _) => theme.name(),
+pub(crate) fn theme_glyph(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Dark => "☾",
+        Theme::Light => "☀",
+        Theme::Paper => "🖹",
     }
 }
 
 /// The one pill that must never be folded into a menu: cycles Dark → Light →
 /// Paper and returns true when it changed the theme.
-pub(crate) fn theme_toggle(
-    ui: &mut egui::Ui,
-    t: &Tokens,
-    theme: &mut Theme,
-    has_symbols: bool,
-) -> bool {
+pub(crate) fn theme_toggle(ui: &mut egui::Ui, t: &Tokens, theme: &mut Theme) -> bool {
     let next = next_theme(*theme);
     let response = pill_button(
         ui,
         t,
         PillSpec {
-            glyph: has_symbols.then(|| theme_glyph(true, *theme)),
-            label: (!has_symbols).then(|| theme_glyph(false, *theme)),
+            glyph: Some(theme_glyph(*theme)),
+            label: None,
             selected: false,
             enabled: true,
         },
@@ -621,11 +615,9 @@ mod tests {
         assert_eq!(next_theme(Theme::Dark), Theme::Light);
         assert_eq!(next_theme(Theme::Light), Theme::Paper);
         assert_eq!(next_theme(Theme::Paper), Theme::Dark);
-        assert_eq!(theme_glyph(true, Theme::Dark), "☾");
-        assert_eq!(theme_glyph(true, Theme::Light), "☀");
-        assert_eq!(theme_glyph(true, Theme::Paper), "🖹");
-        assert_eq!(theme_glyph(false, Theme::Dark), "Dark");
-        assert_eq!(theme_glyph(false, Theme::Paper), "Paper");
+        assert_eq!(theme_glyph(Theme::Dark), "☾");
+        assert_eq!(theme_glyph(Theme::Light), "☀");
+        assert_eq!(theme_glyph(Theme::Paper), "🖹");
     }
 
     #[test]

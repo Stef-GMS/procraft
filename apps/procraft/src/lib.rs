@@ -2236,22 +2236,23 @@ impl ProCraftApp {
         }
     }
 
-    /// Theme picker: a dropdown showing the current theme's name. On touch
-    /// layouts the popup rows get finger-sized height — popups resolve
-    /// their style from the context, not the parent bar, so the spacing is
-    /// set inside the popup closure. (ComboBox popups close on a row tap by
-    /// design: selection applies immediately, so a persistent popup would
-    /// just hide the result.)
+    /// Theme picker: a dropdown showing the current theme's glyph (☾ / ☀ / 🖹);
+    /// the names live in the row tooltips. On touch layouts the popup rows get
+    /// finger-sized height — popups resolve their style from the context, not
+    /// the parent bar, so the spacing is set inside the popup closure.
+    /// (ComboBox popups close on a row tap by design: selection applies
+    /// immediately, so a persistent popup would just hide the result.)
     fn theme_control(&mut self, ui: &mut egui::Ui, touch: bool) {
         egui::ComboBox::from_id_salt("theme")
-            .selected_text(self.theme.name())
+            .selected_text(design::theme_glyph(self.theme))
             .show_ui(ui, |ui| {
                 if touch {
                     ui.spacing_mut().interact_size.y = self.tokens(ui).control_h;
                 }
-                ui.selectable_value(&mut self.theme, Theme::Dark, "Dark");
-                ui.selectable_value(&mut self.theme, Theme::Light, "Light");
-                ui.selectable_value(&mut self.theme, Theme::Paper, "Paper");
+                for theme in [Theme::Dark, Theme::Light, Theme::Paper] {
+                    ui.selectable_value(&mut self.theme, theme, design::theme_glyph(theme))
+                        .on_hover_text(theme.name());
+                }
             });
     }
 
@@ -5740,8 +5741,7 @@ impl eframe::App for ProCraftApp {
                 // The theme pill is the one control deliberately kept outside
                 // the touch fold: it is a single pill, and finding the theme
                 // setting is the whole point. It cycles Dark → Light → Paper.
-                let toggled_theme =
-                    design::theme_toggle(ui, &bar_t, &mut self.theme, self.has_symbols);
+                let toggled_theme = design::theme_toggle(ui, &bar_t, &mut self.theme);
                 if toggled_theme {
                     self.status = format!("{} theme.", self.theme.name());
                 }

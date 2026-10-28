@@ -568,9 +568,9 @@ git commit -m "feat(ui): thick quick-bar sliders"
 **Interfaces:**
 - Consumes: `Tokens`, `pill_button`, `Theme`.
 - Produces:
-  - `pub(crate) fn theme_toggle(ui: &mut egui::Ui, t: &Tokens, theme: &mut Theme, has_symbols: bool) -> bool`
+  - `pub(crate) fn theme_toggle(ui: &mut egui::Ui, t: &Tokens, theme: &mut Theme) -> bool`
   - `pub(crate) fn next_theme(theme: Theme) -> Theme`
-  - `pub(crate) fn theme_glyph(has_symbols: bool, theme: Theme) -> &'static str`
+  - `pub(crate) fn theme_glyph(theme: Theme) -> &'static str`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -580,10 +580,9 @@ fn toggle_cycles_dark_light_paper_with_one_glyph_each() {
     assert_eq!(next_theme(Theme::Dark), Theme::Light);
     assert_eq!(next_theme(Theme::Light), Theme::Paper);
     assert_eq!(next_theme(Theme::Paper), Theme::Dark);
-    assert_eq!(theme_glyph(true, Theme::Dark), "☾");
-    assert_eq!(theme_glyph(true, Theme::Light), "☀");
-    assert_eq!(theme_glyph(true, Theme::Paper), "🖹");
-    assert_eq!(theme_glyph(false, Theme::Paper), "Paper");
+    assert_eq!(theme_glyph(Theme::Dark), "☾");
+    assert_eq!(theme_glyph(Theme::Light), "☀");
+    assert_eq!(theme_glyph(Theme::Paper), "🖹");
 }
 ```
 
@@ -596,11 +595,11 @@ Expected: compile error — `next_theme` not defined.
 `next_theme` cycles `Dark → Light → Paper → Dark`.
 
 `theme_glyph` shows the **current** theme, so the pill reads as a state, not as
-the action: `(true, Dark) = "☾"`, `(true, Light) = "☀"`, `(true, Paper) = "🖹"`
-(Segoe UI Symbol has the document glyph; fallback is the theme name). Without
-the symbol font `(false, _)` returns `theme.name()`.
+the action: `Dark = "☾"`, `Light = "☀"`, `Paper = "🖹"`. There is no text
+fallback: the pill is icon-only at every width, and the names live in the
+tooltip and in the combo rows' tooltips.
 
-`theme_toggle` calls `pill_button` with `PillSpec { glyph: has_symbols.then(|| theme_glyph(true, *theme)), label: (!has_symbols).then(|| theme_glyph(false, *theme)), selected: false, enabled: true }`, plus `.on_hover_text(format!("{} theme · click for {}.", theme.name(), next.name()))` on the response. If clicked, `*theme = next` and return `true`.
+`theme_toggle` calls `pill_button` with `PillSpec { glyph: Some(theme_glyph(*theme)), label: None, selected: false, enabled: true }`, plus `.on_hover_text(format!("{} theme · click for {}.", theme.name(), next.name()))` on the response. If clicked, `*theme = next` and return `true`. `theme_control` shows the same glyphs: `selected_text(design::theme_glyph(self.theme))` and one `selectable_value` row per theme labelled with its glyph and `.on_hover_text(theme.name())`.
 
 - [ ] **Step 4: Run the test**
 
@@ -612,10 +611,10 @@ In `Panel::top("menu")`'s `horizontal_wrapped`, render the toggle **before** the
 
 ```rust
 let t = design::tokens(self.theme, layout);
-design::theme_toggle(ui, &t, &mut self.theme, self.has_symbols);
+design::theme_toggle(ui, &t, &mut self.theme);
 ```
 
-Because `self.theme` is borrowed mutably, capture the result into a local and let the existing `theme_applied` check pick the change up on the next frame. Leave `view_controls`'s `include_theme` combo exactly as it is — at `Wide` the toggle and the inline combo coexist; on touch the combo stays in the View menu.
+Because `self.theme` is borrowed mutably, capture the result into a local and let the existing `theme_applied` check pick the change up on the next frame. Leave `view_controls`'s `include_theme` combo exactly where it is — at `Wide` the toggle and the inline combo coexist; on touch the combo stays in the View menu — but make its face and rows icon-only.
 
 In `theme_control`, replace `ui.spacing_mut().interact_size.y = 40.0` with the token value for the current class.
 

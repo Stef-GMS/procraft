@@ -17,7 +17,7 @@ phone bottom strip instead of the tablet's top-left cluster.
 | 05 | Phone bottom strip | mobile phone only | high |
 | 06 | Overlay polish, toast, modal sizing | mobile only | medium |
 | 07 | Verification, screenshots, build packs | none | low |
-| 08 | Device-verdict fixes | tbd | tbd |
+| 08 | Device-verdict fixes | mobile + desktop icon/readout polish | low |
 
 ## Workflow
 
@@ -37,4 +37,6 @@ For every plan:
 - After Plan 04: iPad arrangement.
 - After Plan 05: iPhone arrangement.
 - After Plan 06: final pass.
+- After the `aed004a` IPA (2026-10-28): icons + size readout fixed; large-brush
+  lag confirmed as CPU stamping and deferred to a rendering milestone.
 - `.ipa`/`.apk` packs need a push; ask before triggering the workflows.

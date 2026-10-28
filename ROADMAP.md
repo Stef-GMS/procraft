@@ -71,6 +71,25 @@ people touch daily. Ranked by user-visible value per effort.
 - Close-out: Windows + iOS sideload + Android builds → next GitHub
   release (continue the existing release series).
 
+## B2 — UI modernization (branch `ui-b2-restyle`, 2026-10-27)
+
+Plan: `docs/superpowers/plans/2026-10-27-ui-modernization.md`.
+
+- [x] Design tokens per theme and per device class, with one egui style
+  pipeline (`design.rs` `Tokens::apply`).
+- [x] Pill button primitive adopted in the top bar; section cards in the
+  tools and layers panels; single touch-height source with a
+  `PROCRAFT_FORCE_LAYOUT` device-class override; thick quick-bar sliders.
+- [x] Sun/moon theme toggle in the top bar (outside the touch fold):
+  Dark ⇄ Light, Paper counts as light, `Paper` still reachable from the
+  View combo.
+- [x] Dark is the default theme for new installs; an existing
+  `settings.json` keeps its saved theme.
+- [ ] Device pass + iOS/Android artifacts for the branch (needs the push
+  and the `ios-ipa` / `android-apk` CI runs).
+- Known, pre-existing: at 1120 pt wide the right panel and the quick bar
+  clip — also true of `73e06da`, so not introduced by B2.
+
 ## Batch 1: M23–M27 (done, awaiting PC check #1)
 
 - [x] **M23 — Layer groups + group ops.** Nested model with effective

@@ -32,7 +32,7 @@ Android files live in the app's external folder
 in-app Import browser reads it, and saves land there, then appear in
 Photos after a media scan.
 
-## Status: milestone 50
+## Status: milestone 50 + v0.10.0 extras
 
 - [x] Layered document model (add / hide / reorder / opacity / blend)
 - [x] Soft-round brush + eraser with spacing, dynamics and undo
@@ -79,6 +79,15 @@ Photos after a media scan.
 - [x] Tablet/phone top bar: folded view cluster, touch-sized View ▾ / File ▾ menus, drag-collapse panel sections, iOS safe-area refold, Android status-bar inset
 - [x] Input fixes: motionless click/tap paints a dab (brush/eraser/smudge), text opens on drag-start, iPad tap positions read from `interact_pointer_pos` (hover_pos is None on touch-tap frames)
 - [x] Polish: Android adaptive launcher icon, region-local animation-assist rasterize (385x faster paint ticks), shape drag preview traces the selected shape, no console window in release builds
+
+### v0.10.0 extras (mobile shell + UI pass)
+
+- [x] Mobile shell: canvas-first layout on every screen size, floating top islands, slide-over Tools/Layers drawers with motion, fitted modals + status toast, iOS safe-area and Android status-bar insets
+- [x] Floating bottom tool bar (new in v0.10.0 — brush size and opacity used to live in the top bar): brush face, size, opacity, color and quick controls on phone and tablet; drag it anywhere and it snaps left/center/right, fold it to a pocket pill, scroll its options without a visible scrollbar
+- [x] Transform layers: live scale/rotate session in the Layers panel (sliders compose from a pristine base, no compounding resample); puppet-pin selection keeps painted pixels
+- [x] Time-lapse on by default: records from the first stroke, keeps its setting across launches, and gets its own Layers card with frame count, Export lapse and Clear
+- [x] Big UI pass (B2): per-device design tokens, pill buttons, section cards, thick quick-bar sliders, a three-state Dark/Light/Paper toggle, dark as the default theme
+- [x] Workspace board: dotted canvas backing behind the page; Export GIF and Import GIF share one row; liquify warps the whole drag segment every frame
 
 ## Icon
 

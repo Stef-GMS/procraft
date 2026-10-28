@@ -91,8 +91,9 @@ Plan: `docs/superpowers/plans/2026-10-27-ui-modernization.md`.
   border), hand-painted pixel-snapped 24 pt squares with a 4 pt corner
   (crisp at 125%), and the palette actions/name split onto two rows so
   the name no longer clips.
-- [ ] Device pass + iOS/Android artifacts for the branch (needs the push
-  and the `ios-ipa` / `android-apk` CI runs).
+- [x] Device pass + iOS/Android artifacts for the branch: shipped in
+  v0.10.0 alongside the mobile shell (iOS IPA, signed Android APK,
+  Windows zip on the release page).
 - Known, pre-existing: at 1120 pt wide the right panel and the quick bar
   clip — also true of `73e06da`, so not introduced by B2.
 

@@ -857,6 +857,7 @@ struct ProCraftApp {
     view_mask: bool,
     show_tools: bool,
     show_layers: bool,
+    drawer: MobileDrawer,
     narrow_setup_done: bool,
     show_about: bool,
     #[cfg(target_os = "ios")]
@@ -1102,6 +1103,7 @@ impl ProCraftApp {
             view_mask: false,
             show_tools: true,
             show_layers: true,
+            drawer: MobileDrawer::None,
             narrow_setup_done: false,
             show_about: false,
             #[cfg(target_os = "ios")]
@@ -4646,6 +4648,186 @@ impl ProCraftApp {
         }
     }
 
+    /// Mobile chrome: floating clusters over a full-screen canvas, with the
+    /// tools/layers sidebars presented as slide-over drawers. Every control is
+    /// the same one the docked shell uses; only the presentation differs.
+    fn mobile_chrome(&mut self, ctx: &egui::Context, class: BarLayout) {
+        let t = design::tokens(self.theme, class);
+        let vp = ctx.viewport_rect();
+        let pad = 12.0;
+        let safe_top = {
+            #[cfg(target_os = "ios")]
+            {
+                let (top, _) = rfd::ios_safe_area_insets().unwrap_or((0, 0));
+                clamp_status_inset(top)
+            }
+            #[cfg(target_os = "android")]
+            {
+                if self.android_inset_top < 0.0 {
+                    self.android_inset_top = rfd::android_status_bar_height()
+                        .map(clamp_status_inset)
+                        .unwrap_or(0.0);
+                }
+                self.android_inset_top.max(0.0)
+            }
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            {
+                0.0
+            }
+        };
+        let safe_bottom = {
+            #[cfg(target_os = "ios")]
+            {
+                let (_, bottom) = rfd::ios_safe_area_insets().unwrap_or((0, 0));
+                clamp_status_inset(bottom)
+            }
+            #[cfg(not(target_os = "ios"))]
+            {
+                0.0
+            }
+        };
+        let cluster_frame = || {
+            egui::Frame::NONE
+                .fill(t.surface_2)
+                .stroke(egui::Stroke::new(1.0, t.stroke))
+                .corner_radius(egui::CornerRadius::same(t.radius_card))
+                .inner_margin(egui::Margin::from(egui::vec2(6.0, 6.0)))
+        };
+
+        if self.drawer != MobileDrawer::None {
+            egui::Area::new(egui::Id::new("mobile-scrim"))
+                .order(egui::Order::Middle)
+                .fixed_pos(vp.min)
+                .show(ctx, |ui| {
+                    let (rect, resp) = ui.allocate_exact_size(vp.size(), egui::Sense::click());
+                    ui.painter()
+                        .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(110));
+                    if resp.clicked() {
+                        self.drawer = MobileDrawer::None;
+                        self.show_tools = false;
+                        self.show_layers = false;
+                    }
+                });
+        }
+
+        egui::Area::new(egui::Id::new("mobile-top-left"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::LEFT_TOP, [pad, safe_top + pad])
+            .show(ctx, |ui| {
+                cluster_frame().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
+                        if self.pill(ui, "Gallery") {
+                            self.gallery_open = !self.gallery_open;
+                        }
+                        egui::containers::menu::MenuButton::new("File")
+                            .config(
+                                egui::containers::menu::MenuConfig::new()
+                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                            )
+                            .ui(ui, |ui| {
+                                ui.spacing_mut().interact_size.y = t.control_h;
+                                self.file_menu_ui(ui, class, &t);
+                            });
+                        if self.pill(ui, "Reference") {
+                            self.ref_open = !self.ref_open;
+                        }
+                    });
+                });
+            });
+
+        egui::Area::new(egui::Id::new("mobile-top-right"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, [-pad, safe_top + pad])
+            .show(ctx, |ui| {
+                cluster_frame().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
+                        if ui
+                            .add_sized([t.control_h, t.control_h], egui::Button::new("↶"))
+                            .on_hover_text("Undo")
+                            .clicked()
+                            && self.doc.undo()
+                        {
+                            self.status = "Undone.".to_string();
+                        }
+                        if ui
+                            .add_sized([t.control_h, t.control_h], egui::Button::new("↷"))
+                            .on_hover_text("Redo")
+                            .clicked()
+                            && self.doc.redo()
+                        {
+                            self.status = "Redone.".to_string();
+                        }
+                        if self.pill(ui, "Tools") {
+                            self.drawer = self.drawer.toggled(MobileDrawer::Tools);
+                            self.show_tools = self.drawer == MobileDrawer::Tools;
+                            if self.drawer == MobileDrawer::Tools {
+                                self.show_layers = false;
+                            }
+                        }
+                        if self.pill(ui, "Layers") {
+                            self.drawer = self.drawer.toggled(MobileDrawer::Layers);
+                            self.show_layers = self.drawer == MobileDrawer::Layers;
+                            if self.drawer == MobileDrawer::Layers {
+                                self.show_tools = false;
+                            }
+                        }
+                        if design::theme_toggle(ui, &t, &mut self.theme) {
+                            self.status = format!("{} theme.", self.theme.name());
+                        }
+                        egui::containers::menu::MenuButton::new("View")
+                            .config(
+                                egui::containers::menu::MenuConfig::new()
+                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                            )
+                            .ui(ui, |ui| {
+                                ui.spacing_mut().interact_size.y = t.control_h;
+                                self.view_controls(ui, true);
+                            });
+                    });
+                });
+            });
+
+        if self.drawer != MobileDrawer::None {
+            let tools = self.drawer == MobileDrawer::Tools;
+            let w = mobile_drawer_width(vp.width());
+            let pos = if tools {
+                egui::pos2(vp.left() + pad, safe_top + pad)
+            } else {
+                egui::pos2(vp.right() - pad - w, safe_top + pad)
+            };
+            let h = (vp.bottom() - safe_bottom - pad - pos.y).max(200.0);
+            egui::Area::new(egui::Id::new(if tools {
+                "mobile-drawer-tools"
+            } else {
+                "mobile-drawer-layers"
+            }))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(w, h),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        cluster_frame().fill(t.surface_1).show(ui, |ui| {
+                            ui.set_width(w - 2.0 * 6.0);
+                            if tools {
+                                self.tools_panel_body(ui);
+                            } else {
+                                self.layers_panel_body(ui);
+                            }
+                        });
+                    },
+                );
+            });
+            // The panel bodies own their close arrows; honor them.
+            if (tools && !self.show_tools) || (!tools && !self.show_layers) {
+                self.drawer = MobileDrawer::None;
+            }
+        }
+    }
+
     fn tool_options_bar(&mut self, ui: &mut egui::Ui, layout: BarLayout) {
         let hit = quick_hit_height(layout);
         let t = design::tokens(self.theme, layout);
@@ -5804,6 +5986,32 @@ fn mobile_shell() -> bool {
         forced_shell(),
         cfg!(any(target_os = "ios", target_os = "android")),
     ) == Shell::Mobile
+}
+
+/// Which slide-over is open in the mobile shell. Session-only: the desktop
+/// dock keeps owning the persisted `show_tools`/`show_layers` flags.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MobileDrawer {
+    None,
+    Tools,
+    Layers,
+}
+
+impl MobileDrawer {
+    /// Tapping the open drawer's trigger closes it; any other trigger swaps.
+    fn toggled(self, other: MobileDrawer) -> MobileDrawer {
+        if self == other {
+            MobileDrawer::None
+        } else {
+            other
+        }
+    }
+}
+
+/// Drawer width on touch screens: wide enough for the two-column cards,
+/// narrow enough to leave a visible strip of canvas and the scrim.
+fn mobile_drawer_width(viewport_w: f32) -> f32 {
+    (viewport_w * 0.88).clamp(240.0, 360.0)
 }
 
 /// Mobile edge padding (Android status-bar px / iOS safe-area points)
@@ -7879,118 +8087,120 @@ impl eframe::App for ProCraftApp {
         // horizontal_wrapped so the bar folds to 2+ lines on narrow
         // screens instead of overlapping; the popups never clip like
         // the old button soup did.
-        egui::Panel::top("menu").show(ui, |ui| {
-            // Edge-to-edge Android draws under the status bar (winit never
-            // surfaces insets); pad once from the JNI readout, cached.
-            #[cfg(target_os = "android")]
-            {
-                if self.android_inset_top < 0.0 {
-                    self.android_inset_top = rfd::android_status_bar_height()
-                        .map(|px| clamp_status_inset(px))
-                        .unwrap_or(0.0);
+        if shell == Shell::Desktop {
+            egui::Panel::top("menu").show(ui, |ui| {
+                // Edge-to-edge Android draws under the status bar (winit never
+                // surfaces insets); pad once from the JNI readout, cached.
+                #[cfg(target_os = "android")]
+                {
+                    if self.android_inset_top < 0.0 {
+                        self.android_inset_top = rfd::android_status_bar_height()
+                            .map(|px| clamp_status_inset(px))
+                            .unwrap_or(0.0);
+                    }
+                    if self.android_inset_top > 0.0 {
+                        ui.add_space(self.android_inset_top);
+                    }
                 }
-                if self.android_inset_top > 0.0 {
-                    ui.add_space(self.android_inset_top);
+                // Same edge-to-edge story on iOS: the wgpu surface draws under
+                // the status bar and notch, so pad by the window's safe-area
+                // top (read per frame; rotations change it).
+                #[cfg(target_os = "ios")]
+                {
+                    let (top, _) = rfd::ios_safe_area_insets().unwrap_or((0, 0));
+                    let pad = clamp_status_inset(top);
+                    if pad > 0.0 {
+                        ui.add_space(pad);
+                    }
                 }
-            }
-            // Same edge-to-edge story on iOS: the wgpu surface draws under
-            // the status bar and notch, so pad by the window's safe-area
-            // top (read per frame; rotations change it).
-            #[cfg(target_os = "ios")]
-            {
-                let (top, _) = rfd::ios_safe_area_insets().unwrap_or((0, 0));
-                let pad = clamp_status_inset(top);
-                if pad > 0.0 {
-                    ui.add_space(pad);
+                let layout = effective_layout(
+                    ui.ctx().viewport_rect().width(),
+                    cfg!(any(target_os = "ios", target_os = "android")),
+                );
+                let bar_t = design::tokens(self.theme, layout);
+                if layout == BarLayout::Tablet {
+                    ui.spacing_mut().interact_size.y = bar_t.control_h;
+                    ui.spacing_mut().item_spacing = egui::vec2(bar_t.gap, bar_t.gap);
                 }
-            }
-            let layout = effective_layout(
+                // Device pass 1: on touch layouts, tapping a stepper/slider inside
+                // a menu closed it before the tap could land. CloseOnClickOutside
+                // keeps inside taps alive while an outside tap still dismisses;
+                // momentary action buttons call ui.close() themselves. Desktop
+                // keeps egui's default CloseOnClick.
+                let menu_config = || {
+                    let close = if layout == BarLayout::Wide {
+                        egui::PopupCloseBehavior::CloseOnClick
+                    } else {
+                        egui::PopupCloseBehavior::CloseOnClickOutside
+                    };
+                    egui::containers::menu::MenuConfig::new().close_behavior(close)
+                };
+                ui.horizontal_wrapped(|ui| {
+                    // Desktop row budget: one row, always. The pills get their
+                    // padding from the tokens; the stock File/zoom/combo buttons
+                    // and the gaps between items get a tighter inset here so the
+                    // full cluster fits the default 1120-point window. Touch
+                    // keeps its finger-sized padding.
+                    if layout == BarLayout::Wide {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        ui.spacing_mut().button_padding.x = 6.0;
+                    }
+                    if self.pill(ui, "Gallery") {
+                        self.gallery_open = !self.gallery_open;
+                    }
+                    if self.pill(ui, "Reference") {
+                        self.ref_open = !self.ref_open;
+                    }
+                    egui::containers::menu::MenuButton::new("File")
+                        .config(menu_config())
+                        .ui(ui, |ui| {
+                            self.file_menu_ui(ui, layout, &bar_t);
+                        });
+                    if self.pill(ui, "Undo") && self.doc.undo() {
+                        self.status = "Undone.".to_string();
+                    }
+                    if self.pill(ui, "Redo") && self.doc.redo() {
+                        self.status = "Redone.".to_string();
+                    }
+                    if self.pill(ui, "Clear layer") && !self.text_paint_blocked() {
+                        self.doc.checkpoint();
+                        if let Some(layer) = self.doc.active_layer_mut() {
+                            layer.clear();
+                        }
+                        self.doc.mark_full_dirty();
+                    }
+                    // Phone and tablet fold the view cluster into a menu (the
+                    // inline stepper starves to a character-wide column below
+                    // ~600px); desktop keeps the exact inline layout and the
+                    // theme pill sits just before About, inside `view_controls`.
+                    // On touch the pill stays outside the fold — one tap from
+                    // anywhere — right before the View menu.
+                    if matches!(layout, BarLayout::Narrow | BarLayout::Tablet) {
+                        if design::theme_toggle(ui, &bar_t, &mut self.theme) {
+                            self.status = format!("{} theme.", self.theme.name());
+                        }
+                        egui::containers::menu::MenuButton::new("View")
+                            .config(menu_config())
+                            .ui(ui, |ui| {
+                                if layout == BarLayout::Tablet {
+                                    ui.spacing_mut().interact_size.y = bar_t.control_h;
+                                }
+                                self.view_controls(ui, true);
+                            });
+                    } else {
+                        self.view_controls(ui, false);
+                    }
+                });
+            });
+
+            let tool_layout = effective_layout(
                 ui.ctx().viewport_rect().width(),
                 cfg!(any(target_os = "ios", target_os = "android")),
             );
-            let bar_t = design::tokens(self.theme, layout);
-            if layout == BarLayout::Tablet {
-                ui.spacing_mut().interact_size.y = bar_t.control_h;
-                ui.spacing_mut().item_spacing = egui::vec2(bar_t.gap, bar_t.gap);
-            }
-            // Device pass 1: on touch layouts, tapping a stepper/slider inside
-            // a menu closed it before the tap could land. CloseOnClickOutside
-            // keeps inside taps alive while an outside tap still dismisses;
-            // momentary action buttons call ui.close() themselves. Desktop
-            // keeps egui's default CloseOnClick.
-            let menu_config = || {
-                let close = if layout == BarLayout::Wide {
-                    egui::PopupCloseBehavior::CloseOnClick
-                } else {
-                    egui::PopupCloseBehavior::CloseOnClickOutside
-                };
-                egui::containers::menu::MenuConfig::new().close_behavior(close)
-            };
-            ui.horizontal_wrapped(|ui| {
-                // Desktop row budget: one row, always. The pills get their
-                // padding from the tokens; the stock File/zoom/combo buttons
-                // and the gaps between items get a tighter inset here so the
-                // full cluster fits the default 1120-point window. Touch
-                // keeps its finger-sized padding.
-                if layout == BarLayout::Wide {
-                    ui.spacing_mut().item_spacing.x = 3.0;
-                    ui.spacing_mut().button_padding.x = 6.0;
-                }
-                if self.pill(ui, "Gallery") {
-                    self.gallery_open = !self.gallery_open;
-                }
-                if self.pill(ui, "Reference") {
-                    self.ref_open = !self.ref_open;
-                }
-                egui::containers::menu::MenuButton::new("File")
-                    .config(menu_config())
-                    .ui(ui, |ui| {
-                        self.file_menu_ui(ui, layout, &bar_t);
-                    });
-                if self.pill(ui, "Undo") && self.doc.undo() {
-                    self.status = "Undone.".to_string();
-                }
-                if self.pill(ui, "Redo") && self.doc.redo() {
-                    self.status = "Redone.".to_string();
-                }
-                if self.pill(ui, "Clear layer") && !self.text_paint_blocked() {
-                    self.doc.checkpoint();
-                    if let Some(layer) = self.doc.active_layer_mut() {
-                        layer.clear();
-                    }
-                    self.doc.mark_full_dirty();
-                }
-                // Phone and tablet fold the view cluster into a menu (the
-                // inline stepper starves to a character-wide column below
-                // ~600px); desktop keeps the exact inline layout and the
-                // theme pill sits just before About, inside `view_controls`.
-                // On touch the pill stays outside the fold — one tap from
-                // anywhere — right before the View menu.
-                if matches!(layout, BarLayout::Narrow | BarLayout::Tablet) {
-                    if design::theme_toggle(ui, &bar_t, &mut self.theme) {
-                        self.status = format!("{} theme.", self.theme.name());
-                    }
-                    egui::containers::menu::MenuButton::new("View")
-                        .config(menu_config())
-                        .ui(ui, |ui| {
-                            if layout == BarLayout::Tablet {
-                                ui.spacing_mut().interact_size.y = bar_t.control_h;
-                            }
-                            self.view_controls(ui, true);
-                        });
-                } else {
-                    self.view_controls(ui, false);
-                }
+            egui::Panel::top("tool-options").show(ui, |ui| {
+                self.tool_options_bar(ui, tool_layout);
             });
-        });
-
-        let tool_layout = effective_layout(
-            ui.ctx().viewport_rect().width(),
-            cfg!(any(target_os = "ios", target_os = "android")),
-        );
-        egui::Panel::top("tool-options").show(ui, |ui| {
-            self.tool_options_bar(ui, tool_layout);
-        });
+        }
 
         // M33 Gallery: file browser (New / Open / Recent / Duplicate).
         // OS dialogs stay as the fallback path; recents persist in
@@ -8573,57 +8783,59 @@ impl eframe::App for ProCraftApp {
         // Drag-to-collapse (phone fix): shrinking past the minimum closes
         // the panel instead of clamping; the ▶ strip reopens (drag_to_open
         // stays off so a stray edge touch never pops panels open).
-        let tools_was = self.show_tools;
-        let mut tools_open = tools_was;
-        egui::Panel::left("tools-compact")
-            .default_size(240.0)
-            .drag_to_open(false)
-            .show_collapsible(ui, &mut tools_open, |ui| {
-                self.tools_panel_body(ui);
-            });
-        // Either the ◀ button (inside) or a drag past the minimum (panel)
-        // can close; reopening is only via ▶/persistence, never a drag.
-        self.show_tools = tools_open && self.show_tools;
-
-        // Fresh id (not "layers"): panel widths persist to disk by id (see
-        // `persistence_path` in `main`), and the old narrow width would
-        // otherwise override `default_size` forever.
-        // Same drag-to-collapse contract as the tools panel.
-        let mut layers_open = self.show_layers;
-        egui::Panel::right("layers-wide")
-            .default_size(280.0)
-            .drag_to_open(false)
-            .show_collapsible(ui, &mut layers_open, |ui| {
-                self.layers_panel_body(ui);
-            });
-        self.show_layers = layers_open && self.show_layers;
-
-        // Floating edge buttons reopen hidden sidebars (touch-sized).
-        if !self.show_tools {
-            egui::Area::new(egui::Id::new("tools-fab"))
-                .anchor(egui::Align2::LEFT_CENTER, [8.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    let t = self.tokens(ui);
-                    if ui
-                        .add_sized([t.control_h, t.control_h], egui::Button::new("▶"))
-                        .clicked()
-                    {
-                        self.show_tools = true;
-                    }
+        if shell == Shell::Desktop {
+            let tools_was = self.show_tools;
+            let mut tools_open = tools_was;
+            egui::Panel::left("tools-compact")
+                .default_size(240.0)
+                .drag_to_open(false)
+                .show_collapsible(ui, &mut tools_open, |ui| {
+                    self.tools_panel_body(ui);
                 });
-        }
-        if !self.show_layers {
-            egui::Area::new(egui::Id::new("layers-fab"))
-                .anchor(egui::Align2::RIGHT_CENTER, [-8.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    let t = self.tokens(ui);
-                    if ui
-                        .add_sized([t.control_h, t.control_h], egui::Button::new("◀"))
-                        .clicked()
-                    {
-                        self.show_layers = true;
-                    }
+            // Either the ◀ button (inside) or a drag past the minimum (panel)
+            // can close; reopening is only via ▶/persistence, never a drag.
+            self.show_tools = tools_open && self.show_tools;
+
+            // Fresh id (not "layers"): panel widths persist to disk by id (see
+            // `persistence_path` in `main`), and the old narrow width would
+            // otherwise override `default_size` forever.
+            // Same drag-to-collapse contract as the tools panel.
+            let mut layers_open = self.show_layers;
+            egui::Panel::right("layers-wide")
+                .default_size(280.0)
+                .drag_to_open(false)
+                .show_collapsible(ui, &mut layers_open, |ui| {
+                    self.layers_panel_body(ui);
                 });
+            self.show_layers = layers_open && self.show_layers;
+
+            // Floating edge buttons reopen hidden sidebars (touch-sized).
+            if !self.show_tools {
+                egui::Area::new(egui::Id::new("tools-fab"))
+                    .anchor(egui::Align2::LEFT_CENTER, [8.0, 0.0])
+                    .show(ui.ctx(), |ui| {
+                        let t = self.tokens(ui);
+                        if ui
+                            .add_sized([t.control_h, t.control_h], egui::Button::new("▶"))
+                            .clicked()
+                        {
+                            self.show_tools = true;
+                        }
+                    });
+            }
+            if !self.show_layers {
+                egui::Area::new(egui::Id::new("layers-fab"))
+                    .anchor(egui::Align2::RIGHT_CENTER, [-8.0, 0.0])
+                    .show(ui.ctx(), |ui| {
+                        let t = self.tokens(ui);
+                        if ui
+                            .add_sized([t.control_h, t.control_h], egui::Button::new("◀"))
+                            .clicked()
+                        {
+                            self.show_layers = true;
+                        }
+                    });
+            }
         }
 
         // The mobile shell floats its status as a toast (Plan 06); until then
@@ -10542,6 +10754,10 @@ impl eframe::App for ProCraftApp {
                 }
             });
         });
+
+        if shell == Shell::Mobile {
+            self.mobile_chrome(ui.ctx(), class);
+        }
     }
 }
 
@@ -11047,6 +11263,24 @@ mod tests {
     fn forced_shell_overrides_the_native_default() {
         assert_eq!(resolve_shell(Some(true), false), Shell::Mobile);
         assert_eq!(resolve_shell(Some(false), true), Shell::Desktop);
+    }
+
+    #[test]
+    fn drawer_trigger_swaps_and_retaps_close() {
+        use MobileDrawer::{Layers, None, Tools};
+        assert_eq!(None.toggled(Tools), Tools);
+        assert_eq!(Tools.toggled(Tools), None);
+        assert_eq!(Tools.toggled(Layers), Layers);
+        assert_eq!(Layers.toggled(Layers), None);
+        assert_eq!(Layers.toggled(Tools), Tools);
+    }
+
+    #[test]
+    fn drawer_width_keeps_a_canvas_edge_visible() {
+        assert!((mobile_drawer_width(390.0) - 343.2).abs() < 0.01);
+        assert_eq!(mobile_drawer_width(844.0), 360.0);
+        assert_eq!(mobile_drawer_width(1366.0), 360.0);
+        assert_eq!(mobile_drawer_width(240.0), 240.0);
     }
 
     #[test]

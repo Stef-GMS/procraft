@@ -3367,6 +3367,38 @@ fn effective_layout(width: f32, mobile: bool) -> BarLayout {
     resolve_layout(forced_layout(), width, mobile)
 }
 
+/// Presentation shell: desktop keeps the docked chrome, mobile floats it over
+/// a full-screen canvas. Native mobile is the only automatic source; the env
+/// override exists so host builds can be screenshotted in the touch shell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shell {
+    Desktop,
+    Mobile,
+}
+
+fn forced_shell() -> Option<bool> {
+    match std::env::var("PROCRAFT_FORCE_SHELL").ok()?.as_str() {
+        "mobile" => Some(true),
+        "desktop" => Some(false),
+        _ => None,
+    }
+}
+
+fn resolve_shell(forced: Option<bool>, native_mobile: bool) -> Shell {
+    if forced.unwrap_or(native_mobile) {
+        Shell::Mobile
+    } else {
+        Shell::Desktop
+    }
+}
+
+fn mobile_shell() -> bool {
+    resolve_shell(
+        forced_shell(),
+        cfg!(any(target_os = "ios", target_os = "android")),
+    ) == Shell::Mobile
+}
+
 /// Mobile edge padding (Android status-bar px / iOS safe-area points)
 /// clamped so a wild value can never eat the screen. Host builds cover it
 /// through tests.
@@ -5174,6 +5206,11 @@ impl eframe::App for ProCraftApp {
             ui.ctx().viewport_rect().width(),
             cfg!(any(target_os = "ios", target_os = "android")),
         );
+        let shell = if mobile_shell() {
+            Shell::Mobile
+        } else {
+            Shell::Desktop
+        };
         if self.theme_applied != Some((self.theme, class)) {
             let t = design::tokens(self.theme, class);
             // egui 0.36 keeps two style slots (dark/light) plus a
@@ -8621,18 +8658,22 @@ impl eframe::App for ProCraftApp {
                 });
         }
 
-        egui::Panel::bottom("status").show(ui, |ui| {
-            ui.label(&self.status);
-            // iOS: lift the label clear of the home indicator.
-            #[cfg(target_os = "ios")]
-            {
-                let (_, bottom) = rfd::ios_safe_area_insets().unwrap_or((0, 0));
-                let pad = clamp_status_inset(bottom);
-                if pad > 0.0 {
-                    ui.add_space(pad);
+        // The mobile shell floats its status as a toast (Plan 06); until then
+        // the row is simply gone so the canvas can own the bottom edge.
+        if shell == Shell::Desktop {
+            egui::Panel::bottom("status").show(ui, |ui| {
+                ui.label(&self.status);
+                // iOS: lift the label clear of the home indicator.
+                #[cfg(target_os = "ios")]
+                {
+                    let (_, bottom) = rfd::ios_safe_area_insets().unwrap_or((0, 0));
+                    let pad = clamp_status_inset(bottom);
+                    if pad > 0.0 {
+                        ui.add_space(pad);
+                    }
                 }
-            }
-        });
+            });
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             let ctx = ui.ctx().clone();
@@ -11026,6 +11067,18 @@ mod tests {
         );
         assert_eq!(resolve_layout(None, 380.0, false), BarLayout::Narrow);
         assert_eq!(resolve_layout(None, 844.0, true), BarLayout::Tablet);
+    }
+
+    #[test]
+    fn native_mobile_gets_the_mobile_shell() {
+        assert_eq!(resolve_shell(None, true), Shell::Mobile);
+        assert_eq!(resolve_shell(None, false), Shell::Desktop);
+    }
+
+    #[test]
+    fn forced_shell_overrides_the_native_default() {
+        assert_eq!(resolve_shell(Some(true), false), Shell::Mobile);
+        assert_eq!(resolve_shell(Some(false), true), Shell::Desktop);
     }
 
     #[test]

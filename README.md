@@ -87,6 +87,7 @@ Photos after a media scan.
 - [x] Transform layers: live scale/rotate session in the Layers panel (sliders compose from a pristine base, no compounding resample); puppet-pin selection keeps painted pixels
 - [x] Time-lapse on by default: records from the first stroke, keeps its setting across launches, and gets its own Layers card with frame count, Export lapse and Clear
 - [x] Big UI pass (B2): per-device design tokens, pill buttons, section cards, thick quick-bar sliders, a three-state Dark/Light/Paper toggle, dark as the default theme
+- [x] Brush imports: Clip Studio Paint `.sut` support (SQLite variant settings, embedded tips, pattern tips + dynamics); imported sizes and textures render faithfully via bundled shape/grain stand-ins, grain depth and cell tuning; only the selected preset highlights
 - [x] Workspace board: dotted canvas backing behind the page; Export GIF and Import GIF share one row; liquify warps the whole drag segment every frame
 
 ## Icon

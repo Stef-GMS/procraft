@@ -95,7 +95,7 @@ pub(crate) fn tokens(theme: Theme, class: BarLayout) -> Tokens {
         type_small,
         type_heading,
     ) = match class {
-        BarLayout::Wide => (26.0, 6.0, 10.0, 6.0, 6.0, 8.0, 8, 10, 6.0, 14.0, 12.0, 15.0),
+        BarLayout::Wide => (26.0, 6.0, 6.0, 6.0, 6.0, 8.0, 8, 10, 6.0, 14.0, 12.0, 15.0),
         BarLayout::Tablet => (
             44.0, 8.0, 14.0, 10.0, 8.0, 10.0, 12, 14, 10.0, 15.0, 13.0, 16.0,
         ),
@@ -304,6 +304,7 @@ pub(crate) fn card_pad(t: &Tokens, flush: bool) -> egui::Vec2 {
 
 /// Content width a card can offer inside a panel of `panel_width`
 /// (`16.0` is the panel's own ~8 px margin on each side).
+#[cfg(test)]
 pub(crate) fn card_available_width(panel_width: f32, t: &Tokens, flush: bool) -> f32 {
     panel_width - 16.0 - 2.0 * card_pad(t, flush).x
 }
@@ -455,6 +456,59 @@ pub(crate) fn thick_slider(
     track.expect("thick_slider always allocates its rail")
 }
 
+/// Sun/moon semantics: Dark ⇄ Light, and Paper counts as light (the toggle's
+/// job is "give me the other brightness", not "cycle three themes").
+pub(crate) fn toggled(theme: Theme) -> Theme {
+    match theme {
+        Theme::Dark => Theme::Light,
+        Theme::Light | Theme::Paper => Theme::Dark,
+    }
+}
+
+/// What the toggle shows: the theme it will switch to.
+pub(crate) fn toggle_glyph(has_symbols: bool, theme: Theme) -> &'static str {
+    match (has_symbols, toggled(theme)) {
+        (true, Theme::Light) => "☀",
+        (true, _) => "☾",
+        (false, Theme::Light) => "Light",
+        (false, _) => "Dark",
+    }
+}
+
+/// The one pill that must never be folded into a menu: toggles Dark ⇄ Light
+/// and returns true when it changed the theme.
+pub(crate) fn theme_toggle(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    theme: &mut Theme,
+    has_symbols: bool,
+) -> bool {
+    let target = toggled(*theme);
+    let response = pill_button(
+        ui,
+        t,
+        PillSpec {
+            glyph: has_symbols.then(|| toggle_glyph(true, *theme)),
+            label: (!has_symbols).then(|| toggle_glyph(false, *theme)),
+            selected: false,
+            enabled: true,
+        },
+    )
+    .on_hover_text(format!(
+        "Switch to {}",
+        match target {
+            Theme::Dark => "Dark",
+            _ => "Light",
+        }
+    ));
+    if response.clicked() {
+        *theme = target;
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
 fn luminance_channel(c: u8) -> f32 {
     let c = c as f32 / 255.0;
     if c <= 0.04045 {
@@ -465,6 +519,7 @@ fn luminance_channel(c: u8) -> f32 {
 }
 
 /// WCAG relative-luminance contrast ratio, 1.0 (identical) .. 21.0.
+#[cfg(test)]
 pub(crate) fn contrast_ratio(a: Color32, b: Color32) -> f32 {
     let la = 0.2126 * luminance_channel(a.r())
         + 0.7152 * luminance_channel(a.g())
@@ -560,6 +615,16 @@ mod tests {
         assert_eq!(slider_track_width(&wide), 110.0);
         assert_eq!(slider_track_width(&tablet), 130.0);
         assert!(slider_track_width(&tablet) < tablet.control_h * 7.0);
+    }
+
+    #[test]
+    fn toggle_swaps_dark_and_light_and_treats_paper_as_light() {
+        assert_eq!(toggled(Theme::Dark), Theme::Light);
+        assert_eq!(toggled(Theme::Light), Theme::Dark);
+        assert_eq!(toggled(Theme::Paper), Theme::Dark);
+        assert_eq!(toggle_glyph(true, Theme::Dark), "☀");
+        assert_eq!(toggle_glyph(true, Theme::Light), "☾");
+        assert_eq!(toggle_glyph(false, Theme::Dark), "Light");
     }
 
     #[test]

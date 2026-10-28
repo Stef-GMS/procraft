@@ -2190,9 +2190,19 @@ impl ProCraftApp {
             }
         });
         let mut deg = self.view_angle.to_degrees();
-        stepped_slider(ui, &mut deg, -180.0..=180.0, 1.0, "Rotate°");
+        // Desktop keeps this rail short enough to share the row with the
+        // theme cluster; touch menus have the width to keep the full rail.
+        let rotate_rail = if self.tokens(ui).class == BarLayout::Wide {
+            90.0
+        } else {
+            140.0
+        };
+        ui.scope(|ui| {
+            ui.spacing_mut().slider_width = rotate_rail;
+            stepped_slider(ui, &mut deg, -180.0..=180.0, 1.0, "Rotate°");
+        });
         self.view_angle = deg.to_radians();
-        if self.pill(ui, "Reset rotation") {
+        if self.pill(ui, "Reset") {
             if in_menu {
                 ui.close();
             }
@@ -5450,6 +5460,15 @@ impl eframe::App for ProCraftApp {
                 egui::containers::menu::MenuConfig::new().close_behavior(close)
             };
             ui.horizontal_wrapped(|ui| {
+                // Desktop row budget: one row, always. The pills get their
+                // padding from the tokens; the stock File/zoom/combo buttons
+                // and the gaps between items get a tighter inset here so the
+                // full cluster fits the default 1120-point window. Touch
+                // keeps its finger-sized padding.
+                if layout == BarLayout::Wide {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    ui.spacing_mut().button_padding.x = 6.0;
+                }
                 if self.pill(ui, "Gallery") {
                     self.gallery_open = !self.gallery_open;
                 }
@@ -5689,6 +5708,14 @@ impl eframe::App for ProCraftApp {
                         layer.clear();
                     }
                     self.doc.mark_full_dirty();
+                }
+                // The sun/moon is the one control deliberately kept outside
+                // the touch fold: it is a single pill, and finding the theme
+                // setting is the whole point. Paper still lives in view_controls.
+                let toggled_theme =
+                    design::theme_toggle(ui, &bar_t, &mut self.theme, self.has_symbols);
+                if toggled_theme {
+                    self.status = format!("{} theme.", self.theme.name());
                 }
                 // Phone and tablet fold the view cluster into a menu (the
                 // inline stepper starves to a character-wide column below

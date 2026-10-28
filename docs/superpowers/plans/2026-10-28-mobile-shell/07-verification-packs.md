@@ -20,10 +20,11 @@
   compare against `dist/ui-2026-10-27` and `dist/liquify` to prove no drift.
 - [x] Windows artifact: `dist/win-<sha>/procraft.exe` + mirrored
   `dist/procraft.exe`, with size and SHA-256.
-- [ ] Mobile packs: **ask before pushing**. If approved, push `ui-b2-restyle`,
-  run `ios-ipa` and `android-apk` (debug) workflows, and download into
-  `dist/ios-<sha>/`, `dist/android-<sha>/`. **Blocked on user approval — no
-  push was made.**
+- [x] Mobile packs: **ask before pushing**. Approved 2026-10-28, so
+  `ui-b2-restyle` was pushed and the `ios-ipa` workflow ran; the IPA is in
+  `dist/ios-aed004a/`.
+- [ ] Android APK: run the `android-apk` (debug) workflow and download into
+  `dist/android-<sha>/` (not requested yet).
 - [x] Commit any doc updates: `docs(ui): mobile shell verification record`.
 
 **Exit:** gates green, all screenshots present, artifacts recorded, user can
@@ -99,6 +100,15 @@ install and give the final device verdict.
   `plan07-bases.ps1`, pixel diff `diff.ps1`.
 
 ### Packs
-Not built. Pushing `ui-b2-restyle` and dispatching `ios-ipa` /
-`android-apk` is waiting on explicit user approval, per the standing
-"don't push yet" instruction.
+- iOS: `ui-b2-restyle` pushed (commit 77b182b, code identical to aed004a);
+  `ios-ipa` run
+  <https://github.com/surfrpt1/procraft/actions/runs/40688842059> succeeded
+  and the artifact was downloaded to `dist/ios-aed004a/ProCraft-ios-v1.ipa`.
+  - 23,297,947 bytes; SHA-256
+    `aea79349b0db0bd441dbf3d9f80dd2d2d49612a0b5341972995c5ac7c6fb2363`.
+  - `Payload/ProCraft.app`: ProCraft 0.9.0, bundle `com.surfrpt1.procraft`,
+    `MinimumOSVersion` 17.0, arm64 binary, 4 icon sizes, Info.plist.
+  - Ad-hoc signed only (`codesign --sign -`), so it needs re-signing with a
+    development profile (Sideloadly/AltStore style) before it installs on a
+    device.
+- Android: not built; the `android-apk` workflow has not been dispatched.

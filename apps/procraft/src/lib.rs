@@ -3202,27 +3202,55 @@ fn quick_slider<Num: egui::emath::Numeric>(
     *value = Num::from_f64(v as f64);
 }
 
+/// Swatch side and gutter in logical px. The gutter is 4.0 (not 3.0): at
+/// 125% Windows scaling 4 pt becomes 5 physical px, so every cell lands on a
+/// whole pixel instead of a half one.
+const SWATCH: f32 = 24.0;
+const SWATCH_GAP: f32 = 4.0;
+
 /// Swatch grid at full height (never an inner scroller — the panel's own
 /// scroll handles overflow, and separate scrollers with no explicit ids
 /// share one scroll offset). Wrap width is pinned to 8 swatches per row
 /// so Starter always lands 3x8 at any panel width.
 fn swatch_grid(ui: &mut egui::Ui, mut add_contents: impl FnMut(&mut egui::Ui)) {
     ui.scope(|ui| {
-        ui.set_max_width(8.0 * 27.0 + 8.0);
+        ui.set_max_width(8.0 * (SWATCH + SWATCH_GAP));
         add_contents(ui);
     });
 }
 
 /// One clickable swatch: applies the color. Returns the response for
 /// right-click-to-remove handling by the caller.
+///
+/// Painted by hand rather than as a `Button`: the control radius is 8–12 pt
+/// on touch layouts, which turns a 24 pt swatch into a soft blob. Here the
+/// corner is a fixed 4 pt and the rect is snapped to the physical pixel grid,
+/// so the colour block stays crisp at any DPI.
 fn swatch_button(ui: &mut egui::Ui, rgb: [u8; 3], selected: bool) -> egui::Response {
-    let (r, g, b) = (rgb[0], rgb[1], rgb[2]);
-    ui.add_sized(
-        [24.0, 24.0],
-        egui::Button::new("")
-            .fill(Color32::from_rgb(r, g, b))
-            .selected(selected),
-    )
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(SWATCH), Sense::click());
+    let ppp = ui.ctx().pixels_per_point();
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let r = egui::Rect::from_min_max(
+        egui::pos2(snap(rect.min.x), snap(rect.min.y)),
+        egui::pos2(snap(rect.max.x), snap(rect.max.y)),
+    );
+    let corner = egui::CornerRadius::same(4);
+    // The theme's accent marks hover/selection; the neutral stroke keeps
+    // pale swatches visible on pale surfaces.
+    let ring = if selected || response.hovered() {
+        ui.visuals().selection.stroke.color
+    } else {
+        ui.visuals().widgets.inactive.bg_stroke.color
+    };
+    let painter = ui.painter();
+    painter.rect_filled(r, corner, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+    painter.rect_stroke(
+        r,
+        corner,
+        egui::Stroke::new(if selected { 2.0 } else { 1.0 }, ring),
+        egui::StrokeKind::Inside,
+    );
+    response
 }
 
 /// Box-downsample straight RGBA to half resolution for cheap onion-ghost
@@ -5709,9 +5737,9 @@ impl eframe::App for ProCraftApp {
                     }
                     self.doc.mark_full_dirty();
                 }
-                // The sun/moon is the one control deliberately kept outside
+                // The theme pill is the one control deliberately kept outside
                 // the touch fold: it is a single pill, and finding the theme
-                // setting is the whole point. Paper still lives in view_controls.
+                // setting is the whole point. It cycles Dark → Light → Paper.
                 let toggled_theme =
                     design::theme_toggle(ui, &bar_t, &mut self.theme, self.has_symbols);
                 if toggled_theme {
@@ -6832,11 +6860,11 @@ impl eframe::App for ProCraftApp {
                 });
             });
             ui.add_space(t.gap);
-            design::section_card(ui, &t, Some("Swatches"), true, |ui| {
+            design::section_card(ui, &t, Some("Swatches"), false, |ui| {
                 ui.label("Starter (click applies):");
                 swatch_grid(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                        ui.spacing_mut().item_spacing = Vec2::new(SWATCH_GAP, SWATCH_GAP);
                         for rgb in starter_palette().colors {
                             let resp = swatch_button(ui, rgb, self.color == rgb);
                             if resp.clicked() {
@@ -6845,20 +6873,15 @@ impl eframe::App for ProCraftApp {
                         }
                     });
                 });
-                // Wrapped (not horizontal): long palette names must fold here
-                // instead of forcing the whole panel wider.
+                // Actions first, then the active palette on its own line:
+                // one long `Palettes: ◀ name ▶` row overflowed the card and
+                // clipped the name at the right edge.
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Palettes:");
                     let n = self.palettes.palettes.len();
                     if ui.button("◀").clicked() && n > 0 {
                         self.palettes.set_active((self.palettes.active + n - 1) % n);
                     }
-                    let (pname, pcount) = self
-                        .palettes
-                        .active()
-                        .map(|p| (p.name.clone(), p.colors.len()))
-                        .unwrap_or_else(|| ("-".to_string(), 0));
-                    ui.label(format!("{pname} ({}/{} · {} swatches)", self.palettes.active + 1, n, pcount));
                     if ui.button("▶").clicked() && n > 0 {
                         self.palettes.set_active((self.palettes.active + 1) % n);
                     }
@@ -6870,6 +6893,14 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                 });
+                let n = self.palettes.palettes.len();
+                let (pname, pcount) = self
+                    .palettes
+                    .active()
+                    .map(|p| (p.name.clone(), p.colors.len()))
+                    .unwrap_or_else(|| ("-".to_string(), 0));
+                let pos = if n == 0 { 0 } else { self.palettes.active + 1 };
+                ui.label(format!("{pname} ({pos}/{n} · {pcount} swatches)"));
                 ui.horizontal(|ui| {
                     if !self.pal_renaming {
                         if ui.button("Rename").clicked() {
@@ -6911,7 +6942,7 @@ impl eframe::App for ProCraftApp {
                     let mut remove = None;
                     swatch_grid(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                            ui.spacing_mut().item_spacing = Vec2::new(SWATCH_GAP, SWATCH_GAP);
                             for (idx, rgb) in swatches.iter().enumerate() {
                                 let resp = swatch_button(ui, *rgb, self.color == *rgb);
                                 if resp.clicked() {
@@ -7041,7 +7072,7 @@ impl eframe::App for ProCraftApp {
                 ui.label("Harmony of the current color (click applies):");
                 swatch_grid(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                        ui.spacing_mut().item_spacing = Vec2::new(SWATCH_GAP, SWATCH_GAP);
                         let cur = self.color;
                         let mut harmonies = vec![complementary(cur)];
                         harmonies.extend(triadic(cur));

@@ -559,7 +559,7 @@ git commit -m "feat(ui): thick quick-bar sliders"
 
 ---
 
-### Task 6: Sun/moon theme toggle
+### Task 6: Three-state theme toggle (☀ / ☾ / 🖹)
 
 **Files:**
 - Modify: `apps/procraft/src/design.rs`
@@ -569,33 +569,38 @@ git commit -m "feat(ui): thick quick-bar sliders"
 - Consumes: `Tokens`, `pill_button`, `Theme`.
 - Produces:
   - `pub(crate) fn theme_toggle(ui: &mut egui::Ui, t: &Tokens, theme: &mut Theme, has_symbols: bool) -> bool`
-  - `pub(crate) fn toggled(theme: Theme) -> Theme`
-  - `pub(crate) fn toggle_glyph(has_symbols: bool, theme: Theme) -> &'static str`
+  - `pub(crate) fn next_theme(theme: Theme) -> Theme`
+  - `pub(crate) fn theme_glyph(has_symbols: bool, theme: Theme) -> &'static str`
 
 - [ ] **Step 1: Write the failing test**
 
 ```rust
 #[test]
-fn toggle_swaps_dark_and_light_and_treats_paper_as_light() {
-    assert_eq!(toggled(Theme::Dark), Theme::Light);
-    assert_eq!(toggled(Theme::Light), Theme::Dark);
-    assert_eq!(toggled(Theme::Paper), Theme::Dark);
-    assert_eq!(toggle_glyph(true, Theme::Dark), "☀");
-    assert_eq!(toggle_glyph(true, Theme::Light), "☾");
-    assert_eq!(toggle_glyph(false, Theme::Dark), "Light");
+fn toggle_cycles_dark_light_paper_with_one_glyph_each() {
+    assert_eq!(next_theme(Theme::Dark), Theme::Light);
+    assert_eq!(next_theme(Theme::Light), Theme::Paper);
+    assert_eq!(next_theme(Theme::Paper), Theme::Dark);
+    assert_eq!(theme_glyph(true, Theme::Dark), "☾");
+    assert_eq!(theme_glyph(true, Theme::Light), "☀");
+    assert_eq!(theme_glyph(true, Theme::Paper), "🖹");
+    assert_eq!(theme_glyph(false, Theme::Paper), "Paper");
 }
 ```
 
 - [ ] **Step 2: Run to verify it fails**
 
-Expected: compile error — `toggled` not defined.
+Expected: compile error — `next_theme` not defined.
 
 - [ ] **Step 3: Implement**
 
-`toggled(Dark) = Light`, `toggled(Light) = Dark`, `toggled(Paper) = Dark`.
-`toggle_glyph(true, Dark) = "☀"`, `(true, Light|Paper) = "☾"`, `(false, Dark) = "Light"`, `(false, _) = "Dark"`.
+`next_theme` cycles `Dark → Light → Paper → Dark`.
 
-`theme_toggle` calls `pill_button` with `PillSpec { glyph: has_symbols.then(|| toggle_glyph(true, *theme)), label: (!has_symbols).then(|| toggle_glyph(false, *theme)), selected: false, enabled: true }`, plus `.on_hover_text(format!("Switch to {}", match toggled(*theme) { Theme::Dark => "Dark", _ => "Light" }))` on the response. If clicked, `*theme = toggled(*theme)` and return `true`.
+`theme_glyph` shows the **current** theme, so the pill reads as a state, not as
+the action: `(true, Dark) = "☾"`, `(true, Light) = "☀"`, `(true, Paper) = "🖹"`
+(Segoe UI Symbol has the document glyph; fallback is the theme name). Without
+the symbol font `(false, _)` returns `theme.name()`.
+
+`theme_toggle` calls `pill_button` with `PillSpec { glyph: has_symbols.then(|| theme_glyph(true, *theme)), label: (!has_symbols).then(|| theme_glyph(false, *theme)), selected: false, enabled: true }`, plus `.on_hover_text(format!("{} theme · click for {}.", theme.name(), next.name()))` on the response. If clicked, `*theme = next` and return `true`.
 
 - [ ] **Step 4: Run the test**
 
@@ -619,13 +624,13 @@ In `theme_control`, replace `ui.spacing_mut().interact_size.y = 40.0` with the t
 Run: `cargo test -p procraft --lib 2>&1 | Select-String -Pattern 'test result|failures:'`
 Expected: `88 passed`.
 
-Expected by eye: at 1400 px the toggle sits beside the theme combo; at 400 px it is visible without opening the View menu; tapping it flips all three themes' surfaces immediately; Paper is still selectable from the combo / View menu; the top bar does not gain a row at any width.
+Expected by eye: at 1400 px the toggle sits beside the theme combo; at 400 px it is visible without opening the View menu; tapping it cycles Dark → Light → Paper and repaints immediately; the pill shows the current theme (☾ / ☀ / 🖹); the top bar does not gain a row at any width.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add apps/procraft/src/design.rs apps/procraft/src/lib.rs
-git commit -m "feat(ui): sun/moon theme toggle in the top bar"
+git commit -m "feat(ui): three-state theme toggle in the top bar"
 ```
 
 ---
@@ -683,3 +688,35 @@ git commit -m "feat(settings): dark is the default theme for new installs"
 ```
 
 Report: test counts, exe size + hash, conditional on: swatches still 3 × 8, no chrome row gained, all nine screenshots present.
+
+---
+
+### Task 8: Swatch card legibility
+
+**Files:**
+- Modify: `apps/procraft/src/lib.rs` (`swatch_grid` / `swatch_button` near `:3205`, the Swatches card near `:6835`)
+
+**Problem:** the Swatches card was built `flush` (zero horizontal inner
+margin), so `SWATCHES`, `Starter (…):` and the first swatch column touched the
+card border and read as clipped; the swatches used the control radius (8 on
+wide, 12 on touch), turning 24 pt squares into soft blobs at 125% scaling; and
+the one-line `Palettes: ◀ name (1/1 · 0 swatches) ▶ + New` row overflowed the
+card and clipped the palette name.
+
+- [ ] **Step 1: Normal card padding** — call
+  `design::section_card(ui, &t, Some("Swatches"), false, …)`; the grid still
+  fits 8 per row inside the padded content width.
+- [ ] **Step 2: Draw swatches by hand** — fixed `SWATCH = 24.0`,
+  `SWATCH_GAP = 4.0`; `swatch_button` allocates a 24 pt click rect, snaps the
+  painted rect to the physical pixel grid (`round(x * ppp) / ppp`), fills it
+  with radius `4` and draws a 1 pt neutral / 2 pt accent (selected) inside
+  stroke. No `Button` widget, so the control radius cannot round it into a
+  blob.
+- [ ] **Step 3: Reflow the palette row** — actions (`◀ ▶ + New`) on one
+  wrapped row, the active palette name/counts on the next label so long names
+  wrap instead of being clipped.
+- [ ] **Step 4: Verify** — `cargo test -p procraft`, `cargo clippy --workspace
+  --all-targets -- -D warnings`, then screenshot the scrolled Swatches card at
+  wide (dark/light/paper) and confirm crisp 8-per-row squares, padded labels
+  and a fully visible palette name.
+

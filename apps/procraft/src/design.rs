@@ -456,53 +456,52 @@ pub(crate) fn thick_slider(
     track.expect("thick_slider always allocates its rail")
 }
 
-/// Sun/moon semantics: Dark ⇄ Light, and Paper counts as light (the toggle's
-/// job is "give me the other brightness", not "cycle three themes").
-pub(crate) fn toggled(theme: Theme) -> Theme {
+/// Three-state cycle for the top-bar toggle: Dark → Light → Paper → Dark.
+pub(crate) fn next_theme(theme: Theme) -> Theme {
     match theme {
         Theme::Dark => Theme::Light,
-        Theme::Light | Theme::Paper => Theme::Dark,
+        Theme::Light => Theme::Paper,
+        Theme::Paper => Theme::Dark,
     }
 }
 
-/// What the toggle shows: the theme it will switch to.
-pub(crate) fn toggle_glyph(has_symbols: bool, theme: Theme) -> &'static str {
-    match (has_symbols, toggled(theme)) {
+/// What the toggle shows: the *current* theme, so the glyph reads as a state
+/// (☀ light, ☾ dark, 🖹 paper) rather than as the action.
+pub(crate) fn theme_glyph(has_symbols: bool, theme: Theme) -> &'static str {
+    match (has_symbols, theme) {
+        (true, Theme::Dark) => "☾",
         (true, Theme::Light) => "☀",
-        (true, _) => "☾",
-        (false, Theme::Light) => "Light",
-        (false, _) => "Dark",
+        (true, Theme::Paper) => "🖹",
+        (false, _) => theme.name(),
     }
 }
 
-/// The one pill that must never be folded into a menu: toggles Dark ⇄ Light
-/// and returns true when it changed the theme.
+/// The one pill that must never be folded into a menu: cycles Dark → Light →
+/// Paper and returns true when it changed the theme.
 pub(crate) fn theme_toggle(
     ui: &mut egui::Ui,
     t: &Tokens,
     theme: &mut Theme,
     has_symbols: bool,
 ) -> bool {
-    let target = toggled(*theme);
+    let next = next_theme(*theme);
     let response = pill_button(
         ui,
         t,
         PillSpec {
-            glyph: has_symbols.then(|| toggle_glyph(true, *theme)),
-            label: (!has_symbols).then(|| toggle_glyph(false, *theme)),
+            glyph: has_symbols.then(|| theme_glyph(true, *theme)),
+            label: (!has_symbols).then(|| theme_glyph(false, *theme)),
             selected: false,
             enabled: true,
         },
     )
     .on_hover_text(format!(
-        "Switch to {}",
-        match target {
-            Theme::Dark => "Dark",
-            _ => "Light",
-        }
+        "{} theme · click for {}.",
+        theme.name(),
+        next.name()
     ));
     if response.clicked() {
-        *theme = target;
+        *theme = next;
         return true;
     }
     false
@@ -618,13 +617,15 @@ mod tests {
     }
 
     #[test]
-    fn toggle_swaps_dark_and_light_and_treats_paper_as_light() {
-        assert_eq!(toggled(Theme::Dark), Theme::Light);
-        assert_eq!(toggled(Theme::Light), Theme::Dark);
-        assert_eq!(toggled(Theme::Paper), Theme::Dark);
-        assert_eq!(toggle_glyph(true, Theme::Dark), "☀");
-        assert_eq!(toggle_glyph(true, Theme::Light), "☾");
-        assert_eq!(toggle_glyph(false, Theme::Dark), "Light");
+    fn toggle_cycles_dark_light_paper_with_one_glyph_each() {
+        assert_eq!(next_theme(Theme::Dark), Theme::Light);
+        assert_eq!(next_theme(Theme::Light), Theme::Paper);
+        assert_eq!(next_theme(Theme::Paper), Theme::Dark);
+        assert_eq!(theme_glyph(true, Theme::Dark), "☾");
+        assert_eq!(theme_glyph(true, Theme::Light), "☀");
+        assert_eq!(theme_glyph(true, Theme::Paper), "🖹");
+        assert_eq!(theme_glyph(false, Theme::Dark), "Dark");
+        assert_eq!(theme_glyph(false, Theme::Paper), "Paper");
     }
 
     #[test]

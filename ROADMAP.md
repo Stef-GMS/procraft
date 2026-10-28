@@ -80,11 +80,15 @@ Plan: `docs/superpowers/plans/2026-10-27-ui-modernization.md`.
 - [x] Pill button primitive adopted in the top bar; section cards in the
   tools and layers panels; single touch-height source with a
   `PROCRAFT_FORCE_LAYOUT` device-class override; thick quick-bar sliders.
-- [x] Sun/moon theme toggle in the top bar (outside the touch fold):
-  Dark ⇄ Light, Paper counts as light, `Paper` still reachable from the
-  View combo.
+- [x] Three-state theme toggle in the top bar (outside the touch fold):
+  cycles Dark → Light → Paper and shows the current state — ☾ dark,
+  ☀ light, 🖹 paper (`Paper` is also selectable from the View combo).
 - [x] Dark is the default theme for new installs; an existing
   `settings.json` keeps its saved theme.
+- [x] Swatch card pass: normal card padding (labels no longer touch the
+  border), hand-painted pixel-snapped 24 pt squares with a 4 pt corner
+  (crisp at 125%), and the palette actions/name split onto two rows so
+  the name no longer clips.
 - [ ] Device pass + iOS/Android artifacts for the branch (needs the push
   and the `ios-ipa` / `android-apk` CI runs).
 - Known, pre-existing: at 1120 pt wide the right panel and the quick bar

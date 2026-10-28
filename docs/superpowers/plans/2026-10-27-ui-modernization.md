@@ -607,12 +607,16 @@ Expected: `1 passed`.
 
 - [ ] **Step 5: Place it in the top bar**
 
-In `Panel::top("menu")`'s `horizontal_wrapped`, render the toggle **before** the width-dependent cluster so it is never inside the fold:
+In `Panel::top("menu")`'s `horizontal_wrapped`, place the toggle by layout so it is never inside the fold: `Wide` renders it from `view_controls(ui, false)` right before the `About` pill; `Narrow`/`Tablet` render it in front of the `View` menu trigger.
 
 ```rust
-let t = design::tokens(self.theme, layout);
-design::theme_toggle(ui, &t, &mut self.theme);
+// touch: in front of the View trigger
+if design::theme_toggle(ui, &bar_t, &mut self.theme) {
+    self.status = format!("{} theme.", self.theme.name());
+}
 ```
+
+In `view_controls`, the `!in_menu` branch draws the same pill right before `about`, so the wide bar reads `… Reset · ☾ · About · Shortcuts`.
 
 Because `self.theme` is borrowed mutably, capture the result into a local and let the existing `theme_applied` check pick the change up on the next frame. Delete the old theme combo: drop `theme_control`, drop the `include_theme` parameter and its separator block from `view_controls`, and drop the `Tablet` call that rendered it beside the View menu. The pill is then the only theme control at every width, and the touch-height line that used to live in `theme_control` disappears with it.
 
@@ -621,7 +625,7 @@ Because `self.theme` is borrowed mutably, capture the result into a local and le
 Run: `cargo test -p procraft --lib 2>&1 | Select-String -Pattern 'test result|failures:'`
 Expected: `88 passed`.
 
-Expected by eye: at 1400 px exactly one theme pill sits in the right cluster (no dropdown beside it); at 400 px it is visible without opening the View menu; tapping it cycles Dark → Light → Paper and repaints immediately; the pill shows the current theme (☾ / ☀ / 🖹) and takes one square control of width; the top bar does not gain a row at any width.
+Expected by eye: at 1400 px exactly one theme pill sits between `Reset` and `About` (no dropdown beside it); at 400 px it is visible without opening the View menu, right before `View`; tapping it cycles Dark → Light → Paper and repaints immediately; the pill shows the current theme (☾ / ☀ / 🖹) and takes one square control of width; the top bar does not gain a row at any width.
 
 - [ ] **Step 7: Commit**
 

@@ -80,10 +80,11 @@ Plan: `docs/superpowers/plans/2026-10-27-ui-modernization.md`.
 - [x] Pill button primitive adopted in the top bar; section cards in the
   tools and layers panels; single touch-height source with a
   `PROCRAFT_FORCE_LAYOUT` device-class override; thick quick-bar sliders.
-- [x] Three-state theme toggle in the top bar (outside the touch fold):
-  cycles Dark → Light → Paper and shows the current state — ☾ dark,
-  ☀ light, 🖹 paper. It is the only theme control; the old View theme
-  combo is gone, so the bar carries one square icon pill instead.
+- [x] Three-state theme toggle in the top bar (outside the touch fold,
+  right before `About` on desktop and before `View` on touch): cycles
+  Dark → Light → Paper and shows the current state — ☾ dark, ☀ light,
+  🖹 paper. It is the only theme control; the old View theme combo is
+  gone, so the bar carries one square icon pill instead.
 - [x] Dark is the default theme for new installs; an existing
   `settings.json` keeps its saved theme.
 - [x] Swatch card pass: normal card padding (labels no longer touch the

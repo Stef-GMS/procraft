@@ -2206,6 +2206,15 @@ impl ProCraftApp {
             }
             self.view_angle = 0.0;
         }
+        // The wide bar carries the one theme control right before About.
+        // Touch bars render it outside this cluster (inside the View menu it
+        // would need two taps).
+        if !in_menu {
+            let t = self.tokens(ui);
+            if design::theme_toggle(ui, &t, &mut self.theme) {
+                self.status = format!("{} theme.", self.theme.name());
+            }
+        }
         let about = if self.has_symbols {
             "ⓘ About"
         } else {
@@ -5712,17 +5721,16 @@ impl eframe::App for ProCraftApp {
                     }
                     self.doc.mark_full_dirty();
                 }
-                // The theme pill is the single theme control at every width,
-                // and it stays outside the touch fold: finding the theme
-                // setting is the whole point. It cycles Dark → Light → Paper.
-                let toggled_theme = design::theme_toggle(ui, &bar_t, &mut self.theme);
-                if toggled_theme {
-                    self.status = format!("{} theme.", self.theme.name());
-                }
                 // Phone and tablet fold the view cluster into a menu (the
                 // inline stepper starves to a character-wide column below
-                // ~600px); desktop keeps the exact inline layout.
+                // ~600px); desktop keeps the exact inline layout and the
+                // theme pill sits just before About, inside `view_controls`.
+                // On touch the pill stays outside the fold — one tap from
+                // anywhere — right before the View menu.
                 if matches!(layout, BarLayout::Narrow | BarLayout::Tablet) {
+                    if design::theme_toggle(ui, &bar_t, &mut self.theme) {
+                        self.status = format!("{} theme.", self.theme.name());
+                    }
                     egui::containers::menu::MenuButton::new("View")
                         .config(menu_config())
                         .ui(ui, |ui| {

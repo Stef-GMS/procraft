@@ -389,8 +389,10 @@ thick_slider(ui, tokens, value: &mut f32, range: RangeInclusive<f32>,
 
 ### 8.7 Primitive 4 — `theme_toggle`
 
-- A single pill button, always in the top bar's right cluster, at every
-  width including `Narrow` (this is the discoverability fix).
+- A single pill button in the top bar's right cluster at every width
+  including `Narrow` (this is the discoverability fix). At `Wide` it sits
+  immediately before `About`; on touch it sits immediately before the
+  `View` menu, outside the fold.
 - Shows the **current** state: `☾` dark, `☀` light, `🖹` paper, with the
   tooltip naming the next theme. The pill is icon-only at every width — no
   `Dark`/`Light`/`Paper` text variant.

@@ -198,6 +198,19 @@ fn tool_glyph(tool: Tool) -> &'static str {
     }
 }
 
+/// Phone-strip face for a paint tool: the glyph where the bundled fonts
+/// cover it, the plain name where they do not.
+fn strip_tool_face(tool: Tool, has_symbols: bool) -> &'static str {
+    if has_symbols {
+        return tool_glyph(tool);
+    }
+    match tool {
+        Tool::Brush => "Brush",
+        Tool::Eraser => "Eraser",
+        _ => "Smudge",
+    }
+}
+
 /// One control in the context-sensitive bar under the top bar. The bar is
 /// driven by this list so every tool's quick options live in one place.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -869,9 +882,15 @@ struct ProCraftApp {
     show_tools: bool,
     show_layers: bool,
     drawer: MobileDrawer,
+    /// Last drawer actually shown: `drawer` drops to `None` the moment it
+    /// closes, this keeps the panel around for its slide-out.
+    drawer_shown: MobileDrawer,
     /// One-shot request from the mobile Color dot: after the Tools drawer
     /// opens, scroll its body to the Color card.
     mobile_scroll_color: bool,
+    /// Status text the toast has already announced, and when it changed.
+    status_seen: String,
+    status_at: f64,
     narrow_setup_done: bool,
     show_about: bool,
     #[cfg(target_os = "ios")]
@@ -1118,7 +1137,10 @@ impl ProCraftApp {
             show_tools: true,
             show_layers: true,
             drawer: MobileDrawer::None,
+            drawer_shown: MobileDrawer::None,
             mobile_scroll_color: false,
+            status_seen: String::new(),
+            status_at: 0.0,
             narrow_setup_done: false,
             show_about: false,
             #[cfg(target_os = "ios")]
@@ -1597,105 +1619,109 @@ impl ProCraftApp {
     /// arms capture for that row.
     fn shortcuts_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_shortcuts;
-        egui::Window::new("Shortcuts")
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .resizable(false)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                for note in [&self.save_note, &self.settings_note].into_iter().flatten() {
-                    let t = design::tokens(
-                        self.theme,
-                        effective_layout(
-                            ctx.viewport_rect().width(),
-                            cfg!(any(target_os = "ios", target_os = "android")),
-                        ),
-                    );
-                    ui.colored_label(t.danger, note);
-                }
-                if self.save_note.is_some() || self.settings_note.is_some() {
-                    ui.separator();
-                }
-                ui.label("Click a binding, then press the keys you want.");
-                egui::ScrollArea::vertical()
-                    .max_height(420.0)
-                    .show(ui, |ui| {
-                        for a in ActionId::ALL {
-                            ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    [150.0, 18.0],
-                                    egui::Label::new(self.action_label(a)).truncate(),
-                                );
-                                let capturing = self.capture == Some(a);
-                                let text = if capturing {
-                                    "Press keys… (Esc cancels, Del clears)".to_string()
-                                } else {
-                                    self.shortcuts
-                                        .get(a)
-                                        .map(|c| c.format())
-                                        .unwrap_or_else(|| "—".to_string())
-                                };
-                                if ui.button(text).clicked() {
-                                    self.capture = Some(a);
-                                }
-                                let clear = if self.has_symbols { "✕" } else { "x" };
-                                if self.shortcuts.get(a).is_some()
-                                    && ui.small_button(clear).clicked()
-                                {
-                                    self.shortcuts.clear_binding(a);
-                                    if self.capture == Some(a) {
-                                        self.capture = None;
-                                    }
-                                }
-                            });
-                        }
-                    });
+        let fit = self.mobile_modal_fit(ctx);
+        fitted_modal(
+            egui::Window::new("Shortcuts")
+                .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .resizable(false)
+                .collapsible(false),
+            fit,
+        )
+        .show(ctx, |ui| {
+            for note in [&self.save_note, &self.settings_note].into_iter().flatten() {
+                let t = design::tokens(
+                    self.theme,
+                    effective_layout(
+                        ctx.viewport_rect().width(),
+                        cfg!(any(target_os = "ios", target_os = "android")),
+                    ),
+                );
+                ui.colored_label(t.danger, note);
+            }
+            if self.save_note.is_some() || self.settings_note.is_some() {
                 ui.separator();
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [150.0, 18.0],
-                        egui::Label::new("Drag on canvas — Brush size"),
-                    );
-                    let cur = self.shortcuts.drag_get(DragActionId::BrushSize);
-                    let mut ctrl = cur.ctrl;
-                    let mut shift = cur.shift;
-                    ui.checkbox(&mut ctrl, "Ctrl");
-                    ui.checkbox(&mut shift, "Shift");
-                    // Alt is deliberately absent: it drives the pick loupe.
-                    let next = ModSet {
-                        ctrl,
-                        shift,
-                        alt: false,
-                    };
-                    if !next.is_empty() && next != cur {
-                        self.shortcuts.set_drag(DragActionId::BrushSize, next);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.add_sized([150.0, 18.0], egui::Label::new("Drag direction"));
-                    let mut mode = self.shortcuts.size_drag_mode();
-                    egui::ComboBox::from_id_salt("size_drag_mode")
-                        .selected_text(size_drag_mode_label(mode))
-                        .show_ui(ui, |ui| {
-                            for m in [
-                                SizeDragMode::Horizontal,
-                                SizeDragMode::Vertical,
-                                SizeDragMode::Distance,
-                            ] {
-                                ui.selectable_value(&mut mode, m, size_drag_mode_label(m));
+            }
+            ui.label("Click a binding, then press the keys you want.");
+            // Touch screens clamp the list to the fitted dialog height.
+            let list_h = fit.map_or(420.0, |f| (f.y - 200.0).clamp(160.0, 420.0));
+            egui::ScrollArea::vertical()
+                .max_height(list_h)
+                .show(ui, |ui| {
+                    for a in ActionId::ALL {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [150.0, 18.0],
+                                egui::Label::new(self.action_label(a)).truncate(),
+                            );
+                            let capturing = self.capture == Some(a);
+                            let text = if capturing {
+                                "Press keys… (Esc cancels, Del clears)".to_string()
+                            } else {
+                                self.shortcuts
+                                    .get(a)
+                                    .map(|c| c.format())
+                                    .unwrap_or_else(|| "—".to_string())
+                            };
+                            if ui.button(text).clicked() {
+                                self.capture = Some(a);
+                            }
+                            let clear = if self.has_symbols { "✕" } else { "x" };
+                            if self.shortcuts.get(a).is_some() && ui.small_button(clear).clicked() {
+                                self.shortcuts.clear_binding(a);
+                                if self.capture == Some(a) {
+                                    self.capture = None;
+                                }
                             }
                         });
-                    if mode != self.shortcuts.size_drag_mode() {
-                        self.shortcuts.set_size_drag_mode(mode);
                     }
                 });
-                ui.separator();
-                if ui.button("Reset all").clicked() {
-                    self.shortcuts.reset_all();
-                    self.capture = None;
-                    self.status = "Shortcuts reset to defaults.".to_string();
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [150.0, 18.0],
+                    egui::Label::new("Drag on canvas — Brush size"),
+                );
+                let cur = self.shortcuts.drag_get(DragActionId::BrushSize);
+                let mut ctrl = cur.ctrl;
+                let mut shift = cur.shift;
+                ui.checkbox(&mut ctrl, "Ctrl");
+                ui.checkbox(&mut shift, "Shift");
+                // Alt is deliberately absent: it drives the pick loupe.
+                let next = ModSet {
+                    ctrl,
+                    shift,
+                    alt: false,
+                };
+                if !next.is_empty() && next != cur {
+                    self.shortcuts.set_drag(DragActionId::BrushSize, next);
                 }
             });
+            ui.horizontal(|ui| {
+                ui.add_sized([150.0, 18.0], egui::Label::new("Drag direction"));
+                let mut mode = self.shortcuts.size_drag_mode();
+                egui::ComboBox::from_id_salt("size_drag_mode")
+                    .selected_text(size_drag_mode_label(mode))
+                    .show_ui(ui, |ui| {
+                        for m in [
+                            SizeDragMode::Horizontal,
+                            SizeDragMode::Vertical,
+                            SizeDragMode::Distance,
+                        ] {
+                            ui.selectable_value(&mut mode, m, size_drag_mode_label(m));
+                        }
+                    });
+                if mode != self.shortcuts.size_drag_mode() {
+                    self.shortcuts.set_size_drag_mode(mode);
+                }
+            });
+            ui.separator();
+            if ui.button("Reset all").clicked() {
+                self.shortcuts.reset_all();
+                self.capture = None;
+                self.status = "Shortcuts reset to defaults.".to_string();
+            }
+        });
         self.show_shortcuts = open;
     }
 
@@ -4765,6 +4791,18 @@ impl ProCraftApp {
         }
     }
 
+    /// Fitted dialog size on the mobile shell; `None` on desktop.
+    fn mobile_modal_fit(&mut self, ctx: &egui::Context) -> Option<egui::Vec2> {
+        let mobile = mobile_shell();
+        let safe_top = if mobile { self.status_inset_top() } else { 0.0 };
+        modal_fit(
+            ctx.viewport_rect().size(),
+            safe_top,
+            safe_bottom(mobile),
+            mobile,
+        )
+    }
+
     /// Mobile chrome: floating clusters over a full-screen canvas, with the
     /// tools/layers sidebars presented as slide-over drawers. Every control is
     /// the same one the docked shell uses; only the presentation differs.
@@ -4822,15 +4860,36 @@ impl ProCraftApp {
                 });
         }
 
-        if self.drawer != MobileDrawer::None {
+        // Slide-over motion: the panel keeps a `drawer_shown` copy for the
+        // slide-out, and the scrim fades on the same progress.
+        let drawer_open = self.drawer != MobileDrawer::None;
+        if drawer_open {
+            self.drawer_shown = self.drawer;
+        }
+        let draw_slide = ctx.animate_value_with_time(
+            egui::Id::new("mobile-drawer-slide"),
+            if drawer_open { 1.0 } else { 0.0 },
+            0.18,
+        );
+        let shown = if drawer_open || draw_slide > 0.0 {
+            self.drawer_shown
+        } else {
+            MobileDrawer::None
+        };
+
+        if shown != MobileDrawer::None {
             egui::Area::new(egui::Id::new("mobile-scrim"))
                 .order(egui::Order::Middle)
                 .fixed_pos(vp.min)
+                .interactable(drawer_open)
                 .show(ctx, |ui| {
                     let (rect, resp) = ui.allocate_exact_size(vp.size(), egui::Sense::click());
-                    ui.painter()
-                        .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(110));
-                    if resp.clicked() {
+                    ui.painter().rect_filled(
+                        rect,
+                        0.0,
+                        egui::Color32::from_black_alpha((110.0 * draw_slide) as u8),
+                    );
+                    if drawer_open && resp.clicked() {
                         self.drawer = MobileDrawer::None;
                         self.show_tools = false;
                         self.show_layers = false;
@@ -4957,8 +5016,8 @@ impl ProCraftApp {
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
                                     for tool in PHONE_STRIP_TOOLS {
-                                        if self.toggle_pill(ui, tool_glyph(tool), self.tool == tool)
-                                        {
+                                        let face = strip_tool_face(tool, self.has_symbols);
+                                        if self.toggle_pill(ui, face, self.tool == tool) {
                                             self.choose_tool(tool);
                                         }
                                     }
@@ -5044,8 +5103,8 @@ impl ProCraftApp {
                 });
         }
 
-        if self.drawer != MobileDrawer::None {
-            let tools = self.drawer == MobileDrawer::Tools;
+        if shown != MobileDrawer::None {
+            let tools = shown == MobileDrawer::Tools;
             let w = if phone {
                 phone_drawer_width(vp.width())
             } else {
@@ -5072,10 +5131,11 @@ impl ProCraftApp {
                     capsule_visible,
                 )
             };
+            let slide = drawer_slide_distance(draw_slide, w, pad);
             let pos = if tools {
-                egui::pos2(vp.left() + pad, top)
+                egui::pos2(vp.left() + pad - slide, top)
             } else {
-                egui::pos2(vp.right() - pad - w, top)
+                egui::pos2(vp.right() - pad - w + slide, top)
             };
             egui::Area::new(egui::Id::new(if tools {
                 "mobile-drawer-tools"
@@ -5083,8 +5143,21 @@ impl ProCraftApp {
                 "mobile-drawer-layers"
             }))
             .order(egui::Order::Foreground)
+            // Areas are clamped into the viewport by default, which pins the
+            // closed drawer to the edge and kills the slide. Let it sit off
+            // screen; the viewport clip still trims it.
+            .constrain(false)
             .fixed_pos(pos)
+            .interactable(drawer_open)
             .show(ctx, |ui| {
+                // The panel covers its own gaps (margins, card spacing) so a
+                // drag or tap between cards can never reach the canvas.
+                let block = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, h));
+                ui.interact(
+                    block,
+                    egui::Id::new("mobile-drawer-block"),
+                    egui::Sense::click_and_drag(),
+                );
                 ui.allocate_ui_with_layout(
                     egui::vec2(w, h),
                     egui::Layout::top_down(egui::Align::Min),
@@ -5101,9 +5174,43 @@ impl ProCraftApp {
                 );
             });
             // The panel bodies own their close arrows; honor them.
-            if (tools && !self.show_tools) || (!tools && !self.show_layers) {
+            if drawer_open && ((tools && !self.show_tools) || (!tools && !self.show_layers)) {
                 self.drawer = MobileDrawer::None;
             }
+        }
+
+        // Status toast: the mobile shell has no status row, so the newest
+        // message floats above the options capsule and fades out. It never
+        // senses input.
+        let now = ctx.input(|i| i.time);
+        if self.status != self.status_seen {
+            self.status_seen = self.status.clone();
+            self.status_at = now;
+        }
+        let age = (now - self.status_at) as f32;
+        let alpha = toast_alpha(age);
+        if !self.status.is_empty() && alpha > 0.0 {
+            let offset = toast_offset(capsule_offset, island_h, t.gap, capsule_visible);
+            egui::Area::new(egui::Id::new("mobile-toast"))
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, offset])
+                .show(ctx, |ui| {
+                    ui.set_opacity(alpha);
+                    ui.set_max_width((vp.width() - 2.0 * pad).min(520.0));
+                    island_frame().show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&self.status).small()).truncate(),
+                        );
+                    });
+                });
+            // Keep the fade running without a 60 fps spin through the hold.
+            let wait = if age < TOAST_HOLD {
+                TOAST_HOLD - age
+            } else {
+                0.016
+            };
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(wait.max(0.016)));
         }
     }
 
@@ -6404,6 +6511,72 @@ fn mobile_drawer_span(
 /// through `PROCRAFT_SAFE_TOP` and tests.
 fn clamp_status_inset(px: u32) -> f32 {
     (px as f32).clamp(0.0, 200.0)
+}
+
+/// Status toast timing: long enough to read one line, short enough that it
+/// is gone before the next stroke.
+const TOAST_HOLD: f32 = 2.5;
+const TOAST_FADE: f32 = 0.4;
+
+/// Toast opacity `age` seconds after the status changed.
+fn toast_alpha(age: f32) -> f32 {
+    if age < 0.0 {
+        return 0.0;
+    }
+    if age <= TOAST_HOLD {
+        return 1.0;
+    }
+    ((TOAST_HOLD + TOAST_FADE - age) / TOAST_FADE).clamp(0.0, 1.0)
+}
+
+/// Y offset of the toast: stacked above the options capsule, or in the
+/// capsule's place when the active tool has no options to show.
+fn toast_offset(capsule_offset: f32, island_h: f32, gap: f32, has_capsule: bool) -> f32 {
+    capsule_offset - if has_capsule { island_h + gap } else { 0.0 }
+}
+
+/// How far a drawer still has to travel: fully past the screen edge at 0,
+/// flush with it at 1.
+fn drawer_slide_distance(progress: f32, width: f32, pad: f32) -> f32 {
+    (1.0 - progress.clamp(0.0, 1.0)) * (width + 2.0 * pad)
+}
+
+/// Mobile dialogs: at most 92% of the viewport in either axis, and short
+/// enough that centring it still clears the status-bar strip. Desktop
+/// windows keep their own sizing.
+fn modal_fit(
+    viewport: egui::Vec2,
+    safe_top: f32,
+    safe_bottom: f32,
+    mobile: bool,
+) -> Option<egui::Vec2> {
+    if !mobile {
+        return None;
+    }
+    let insets = 2.0 * (safe_top.max(0.0) + safe_bottom.max(0.0) + 12.0);
+    Some(egui::vec2(
+        (viewport.x * 0.92).max(240.0),
+        (viewport.y * 0.92).min(viewport.y - insets).max(200.0),
+    ))
+}
+
+/// Apply the mobile fit to a dialog; desktop windows keep their own size.
+fn fitted_modal<'a>(win: egui::Window<'a>, fit: Option<egui::Vec2>) -> egui::Window<'a> {
+    match fit {
+        Some(fit) => win.max_width(fit.x),
+        None => win,
+    }
+}
+
+/// Mobile dialog body: scrolls within the fitted height so content never
+/// clips below the fold. Desktop bodies stay unwrapped.
+fn modal_scroll(ui: &mut egui::Ui, fit: Option<egui::Vec2>, body: impl FnOnce(&mut egui::Ui)) {
+    let Some(fit) = fit else {
+        return body(ui);
+    };
+    egui::ScrollArea::vertical()
+        .max_height((fit.y - 56.0).max(160.0))
+        .show(ui, body);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -8608,12 +8781,17 @@ impl eframe::App for ProCraftApp {
             let mut dup_idx: Option<usize> = None;
             let mut remove_idx: Option<usize> = None;
             let mut clear_all = false;
-            egui::Window::new("Gallery")
-                .open(&mut open)
-                .resizable(true)
-                .collapsible(false)
-                .min_width(280.0)
-                .show(ui.ctx(), |ui| {
+            let fit = self.mobile_modal_fit(ui.ctx());
+            fitted_modal(
+                egui::Window::new("Gallery")
+                    .open(&mut open)
+                    .resizable(true)
+                    .collapsible(false)
+                    .min_width(280.0),
+                fit,
+            )
+            .show(ui.ctx(), |ui| {
+                modal_scroll(ui, fit, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.add(
                             egui::DragValue::new(&mut self.gallery_new_w)
@@ -8699,6 +8877,7 @@ impl eframe::App for ProCraftApp {
                         clear_all = true;
                     }
                 });
+            });
             self.gallery_open = open;
             if create {
                 let (w, h) = (self.gallery_new_w, self.gallery_new_h);
@@ -8769,12 +8948,17 @@ impl eframe::App for ProCraftApp {
             let mut open = self.ref_open;
             let mut load = false;
             let mut clear = false;
-            egui::Window::new("Reference")
-                .open(&mut open)
-                .resizable(true)
-                .collapsible(false)
-                .min_width(200.0)
-                .show(ui.ctx(), |ui| {
+            let fit = self.mobile_modal_fit(ui.ctx());
+            fitted_modal(
+                egui::Window::new("Reference")
+                    .open(&mut open)
+                    .resizable(true)
+                    .collapsible(false)
+                    .min_width(200.0),
+                fit,
+            )
+            .show(ui.ctx(), |ui| {
+                modal_scroll(ui, fit, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         if ui
                             .add_sized([70.0, 28.0], egui::Button::new("Load…"))
@@ -8794,16 +8978,20 @@ impl eframe::App for ProCraftApp {
                         (self.ref_tex.as_ref(), self.ref_image.as_ref())
                     {
                         // Fit the pin inside 320px, then zoom (slider).
-                        let fit = (320.0 / (*w).max(*h).max(1) as f32).min(1.0);
-                        let z = fit * self.ref_scale;
-                        let dw = (*w as f32 * z).clamp(32.0, 640.0);
-                        let dh = (*h as f32 * z).clamp(32.0, 640.0);
+                        let fit_px = (320.0 / (*w).max(*h).max(1) as f32).min(1.0);
+                        let z = fit_px * self.ref_scale;
+                        // The mobile frame is narrower than the 640px pin:
+                        // cap the image to the dialog instead of clipping it.
+                        let cap = fit.map_or(640.0, |f| (f.x - 56.0).min(f.y - 160.0).max(120.0));
+                        let dw = (*w as f32 * z).clamp(32.0, cap);
+                        let dh = (*h as f32 * z).clamp(32.0, cap);
                         ui.image((tex.id(), egui::Vec2::new(dw, dh)));
                         stepped_slider(ui, &mut self.ref_scale, 0.25..=2.0, 0.25, "Zoom");
                     } else {
                         ui.label("Pin an image to paint from — nothing here yet.");
                     }
                 });
+            });
             self.ref_open = open;
             if clear {
                 self.ref_image = None;
@@ -8849,14 +9037,19 @@ impl eframe::App for ProCraftApp {
         // Recovery prompt: a previous session died with unsaved work.
         if self.recovery_offer {
             let mut open = self.recovery_offer;
-            egui::Window::new("Unsaved work found")
-                .open(&mut open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .resizable(false)
-                .collapsible(false)
-                .show(ui.ctx(), |ui| {
+            let fit = self.mobile_modal_fit(ui.ctx());
+            fitted_modal(
+                egui::Window::new("Unsaved work found")
+                    .open(&mut open)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .resizable(false)
+                    .collapsible(false),
+                fit,
+            )
+            .show(ui.ctx(), |ui| {
+                modal_scroll(ui, fit, |ui| {
                     ui.label("The last session ended without saving. Recover the autosave?");
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button("Recover").clicked() {
                             match Document::open_project(&self.recovery_path) {
                                 Ok(doc) => {
@@ -8884,6 +9077,7 @@ impl eframe::App for ProCraftApp {
                         }
                     });
                 });
+            });
             // The X button snoozes (file kept, offered again next launch);
             // Recover/Discard already dismissed above and must stick.
             if !open {
@@ -8895,12 +9089,17 @@ impl eframe::App for ProCraftApp {
         // from the workspace Cargo.toml at compile time, so release bumps
         // show up here with no code changes.
         if self.show_about {
-            egui::Window::new("About ProCraft")
-                .open(&mut self.show_about)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .resizable(false)
-                .collapsible(false)
-                .show(ui.ctx(), |ui| {
+            let fit = self.mobile_modal_fit(ui.ctx());
+            fitted_modal(
+                egui::Window::new("About ProCraft")
+                    .open(&mut self.show_about)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .resizable(false)
+                    .collapsible(false),
+                fit,
+            )
+            .show(ui.ctx(), |ui| {
+                modal_scroll(ui, fit, |ui| {
                     ui.heading("ProCraft");
                     ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                     ui.label("Painting studio by surfrpt1.");
@@ -8915,6 +9114,7 @@ impl eframe::App for ProCraftApp {
                     );
                     ui.label("Original code, MIT licensed.");
                 });
+            });
         }
 
         // M49: shortcuts editor window.
@@ -8926,15 +9126,22 @@ impl eframe::App for ProCraftApp {
         // Done re-renders the one being edited in place; one undo step).
         if self.text_open {
             let mut open = self.text_open;
-            egui::Window::new("Text")
-                .open(&mut open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .resizable(true)
-                .collapsible(false)
-                .show(ui.ctx(), |ui| {
-                    // Scrollable: on small screens (iPad keyboard up) the
-                    // tall dialog clips Import/Render below the fold.
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+            let fit = self.mobile_modal_fit(ui.ctx());
+            fitted_modal(
+                egui::Window::new("Text")
+                    .open(&mut open)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .resizable(true)
+                    .collapsible(false),
+                fit,
+            )
+            .show(ui.ctx(), |ui| {
+                // Scrollable: on small screens (iPad keyboard up) the
+                // tall dialog clips Import/Render below the fold.
+                let scroll_h = fit.map_or(f32::INFINITY, |f| (f.y - 96.0).max(160.0));
+                egui::ScrollArea::vertical()
+                    .max_height(scroll_h)
+                    .show(ui, |ui| {
                         if self.editing_text.is_some() {
                             ui.label("Tap the canvas to move the text; edit, then Done.");
                         } else {
@@ -9157,7 +9364,7 @@ impl eframe::App for ProCraftApp {
                             }
                         });
                     });
-                });
+            });
             // A button inside the dialog may have set `text_open = false`
             // (Render/Done/Cancel); the window ✕ flips `open`. Honor both —
             // and any close clears the edit session.
@@ -11757,6 +11964,83 @@ mod tests {
         assert_eq!(safe_inset_override(Some("-4")), None);
         assert_eq!(safe_inset_override(Some("9999")), Some(200.0));
         assert_eq!(safe_inset_override(Some("0")), Some(0.0));
+    }
+
+    #[test]
+    fn toast_holds_then_fades_to_nothing() {
+        assert_eq!(toast_alpha(-0.1), 0.0);
+        assert_eq!(toast_alpha(0.0), 1.0);
+        assert_eq!(toast_alpha(TOAST_HOLD), 1.0);
+        assert!((toast_alpha(TOAST_HOLD + TOAST_FADE * 0.5) - 0.5).abs() < 1e-5);
+        assert_eq!(toast_alpha(TOAST_HOLD + TOAST_FADE), 0.0);
+        assert_eq!(toast_alpha(60.0), 0.0);
+    }
+
+    #[test]
+    fn toast_stacks_above_the_options_capsule() {
+        let capsule = phone_capsule_offset(34.0, 12.0, 56.0, 8.0);
+        assert_eq!(toast_offset(capsule, 56.0, 8.0, true), capsule - 64.0);
+        assert_eq!(toast_offset(-24.0, 56.0, 8.0, false), -24.0);
+    }
+
+    #[test]
+    fn drawer_slides_a_full_width_off_screen() {
+        assert_eq!(drawer_slide_distance(1.0, 358.8, 12.0), 0.0);
+        assert!((drawer_slide_distance(0.0, 358.8, 12.0) - 382.8).abs() < 0.01);
+        assert!((drawer_slide_distance(0.5, 358.8, 12.0) - 191.4).abs() < 0.01);
+        // Out-of-range progress can never overshoot the edge.
+        assert_eq!(drawer_slide_distance(2.0, 100.0, 10.0), 0.0);
+        assert_eq!(drawer_slide_distance(-1.0, 100.0, 10.0), 120.0);
+    }
+
+    #[test]
+    fn mobile_modals_fit_the_viewport_and_clear_the_status_strip() {
+        // Desktop dialogs keep their own size.
+        assert_eq!(modal_fit(egui::vec2(1600.0, 900.0), 0.0, 0.0, false), None);
+
+        let phone = modal_fit(egui::vec2(390.0, 844.0), 47.0, 0.0, true).unwrap();
+        assert!((phone.x - 358.8).abs() < 0.01);
+        // 92% alone would start 34 px down, under the 47 pt status bar.
+        assert_eq!(phone.y, 844.0 - 2.0 * (47.0 + 12.0));
+
+        let tablet = modal_fit(egui::vec2(1024.0, 768.0), 24.0, 0.0, true).unwrap();
+        assert_eq!(tablet.y, 768.0 - 2.0 * (24.0 + 12.0));
+
+        // No inset: the plain 92% cap, still a usable dialog in landscape.
+        let land = modal_fit(egui::vec2(844.0, 390.0), 0.0, 0.0, true).unwrap();
+        assert!((land.y - 390.0 * 0.92).abs() < 0.01);
+        assert!(land.y >= 200.0);
+    }
+
+    #[test]
+    fn every_tool_has_a_unique_quick_control_row() {
+        let tools = [
+            Tool::Brush,
+            Tool::Eraser,
+            Tool::Smudge,
+            Tool::Select,
+            Tool::Lasso,
+            Tool::Fill,
+            Tool::Picker,
+            Tool::Move,
+            Tool::Hand,
+            Tool::Liquify,
+            Tool::Crop,
+            Tool::Shapes,
+            Tool::Text,
+        ];
+        for tool in tools {
+            let mut seen: Vec<QuickControl> = Vec::new();
+            for control in quick_controls(tool) {
+                assert!(!seen.contains(control), "{tool:?} repeats {control:?}");
+                seen.push(*control);
+            }
+        }
+        // The touch strip can still name its tools when glyphs are missing.
+        for tool in PHONE_STRIP_TOOLS {
+            assert!(!strip_tool_face(tool, false).is_empty());
+            assert_ne!(strip_tool_face(tool, true), strip_tool_face(tool, false));
+        }
     }
 
     #[test]

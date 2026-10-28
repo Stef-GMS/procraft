@@ -39,6 +39,16 @@ pub(crate) fn rgb(r: u8, g: u8, b: u8) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
+/// Dot colour for the workspace board behind the page: a faint tint over
+/// `panel_fill`, lightening dark themes and darkening light ones. Alpha
+/// stays low so the board never competes with the artwork.
+pub(crate) fn board_dot(theme: Theme) -> Color32 {
+    match theme {
+        Theme::Dark => rgba(0xFF, 0xFF, 0xFF, 0x28),
+        Theme::Light | Theme::Paper => rgba(0x10, 0x12, 0x16, 0x24),
+    }
+}
+
 pub(crate) fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
@@ -929,6 +939,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn board_dots_stay_faint_and_follow_the_theme() {
+        // Premultiplied: white at 0x28 alpha reads back as r == g == b == a.
+        let dark = board_dot(Theme::Dark);
+        let light = board_dot(Theme::Light);
+        let paper = board_dot(Theme::Paper);
+        assert_eq!(dark.a(), 0x28);
+        assert_eq!((dark.r(), dark.g(), dark.b()), (0x28, 0x28, 0x28));
+        assert!(
+            light.a() <= 0x30 && light.r() < 0x20,
+            "light dots darken the board"
+        );
+        assert_eq!(paper, light);
     }
 
     #[test]

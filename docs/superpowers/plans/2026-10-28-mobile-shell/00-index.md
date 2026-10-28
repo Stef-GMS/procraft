@@ -19,6 +19,7 @@ phone bottom strip instead of the tablet's top-left cluster.
 | 07 | Verification, screenshots, build packs | none | low |
 | 08 | Device-verdict fixes | mobile + desktop icon/readout polish | low |
 | 09 | Collapsible strip and transform improvements | phone strip + transform panel | medium |
+| 10 | Dotted workspace board | canvas board on all layouts | low |
 
 ## Workflow
 

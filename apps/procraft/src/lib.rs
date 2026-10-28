@@ -6476,6 +6476,111 @@ fn unrot_pt(p: egui::Pos2, c: egui::Pos2, ang: f32) -> egui::Pos2 {
     rot_pt(p, c, -ang)
 }
 
+/// Workspace dot grid spacing in canvas px. Steps snap to powers of two so
+/// the dots land on the same points as the zoom crosses an octave.
+const BOARD_DOT_STEP: f32 = 32.0;
+const BOARD_DOT_SCREEN_MIN: f32 = 24.0;
+const BOARD_DOT_SCREEN_MAX: f32 = 48.0;
+/// Breathing room the fit zoom leaves around the page so the board stays
+/// visible instead of the sheet pinning itself to the viewport edge.
+const BOARD_FIT_MARGIN: f32 = 28.0;
+
+fn board_fit_zoom(w: f32, h: f32, avail: egui::Vec2) -> f32 {
+    let (w, h) = (w.max(1.0), h.max(1.0));
+    ((avail.x - 2.0 * BOARD_FIT_MARGIN) / w)
+        .min((avail.y - 2.0 * BOARD_FIT_MARGIN) / h)
+        .clamp(0.05, 8.0)
+}
+
+/// Offset that centres content smaller than the viewport, leaving the board
+/// visible on both sides (the page floats in the middle instead of pinning
+/// to the top-left corner). Zero when the content overflows, so a zoomed-in
+/// page keeps the viewport origin.
+fn center_offset(content: egui::Vec2, avail: egui::Vec2) -> egui::Vec2 {
+    egui::vec2(
+        ((avail.x - content.x) * 0.5).max(0.0),
+        ((avail.y - content.y) * 0.5).max(0.0),
+    )
+}
+
+fn board_dot_step(zoom: f32) -> f32 {
+    let zoom = zoom.max(0.05);
+    let mut step = BOARD_DOT_STEP;
+    while step * zoom < BOARD_DOT_SCREEN_MIN {
+        step *= 2.0;
+    }
+    while step * zoom > BOARD_DOT_SCREEN_MAX {
+        step *= 0.5;
+    }
+    step
+}
+
+/// Inclusive index range of grid lines (`i * step`) inside `lo..=hi`.
+fn board_dot_span(step: f32, lo: f32, hi: f32) -> (i32, i32) {
+    ((lo / step).ceil() as i32, (hi / step).floor() as i32)
+}
+
+/// Canvas-fixed dots on the workspace board. They pan and rotate with the
+/// page and are skipped wherever the page covers them, so the artwork and
+/// its texture stay untouched.
+fn paint_board_dots(
+    painter: &egui::Painter,
+    view: egui::Rect,
+    page: egui::Rect,
+    zoom: f32,
+    ang: f32,
+    color: egui::Color32,
+) {
+    if !view.is_positive() || !page.is_positive() {
+        return;
+    }
+    let step = board_dot_step(zoom);
+    let center = page.center();
+    let to_canvas = |p: egui::Pos2| {
+        let q = unrot_pt(p, center, ang);
+        ((q.x - page.min.x) / zoom, (q.y - page.min.y) / zoom)
+    };
+    let mut x0 = f32::INFINITY;
+    let mut y0 = f32::INFINITY;
+    let mut x1 = f32::NEG_INFINITY;
+    let mut y1 = f32::NEG_INFINITY;
+    for p in [
+        view.left_top(),
+        view.right_top(),
+        view.right_bottom(),
+        view.left_bottom(),
+    ] {
+        let (x, y) = to_canvas(p);
+        x0 = x0.min(x);
+        x1 = x1.max(x);
+        y0 = y0.min(y);
+        y1 = y1.max(y);
+    }
+    let (i0, i1) = board_dot_span(step, x0, x1);
+    let (j0, j1) = board_dot_span(step, y0, y1);
+    if i1 < i0 || j1 < j0 {
+        return;
+    }
+    let (pw, ph) = (page.width() / zoom, page.height() / zoom);
+    for i in i0..=i1 {
+        let x = i as f32 * step;
+        for j in j0..=j1 {
+            let y = j as f32 * step;
+            if x >= 0.0 && x <= pw && y >= 0.0 && y <= ph {
+                continue;
+            }
+            let p = rot_pt(
+                egui::pos2(page.min.x + x * zoom, page.min.y + y * zoom),
+                center,
+                ang,
+            );
+            if view.contains(p) {
+                painter.circle_filled(p, 1.15, color);
+            }
+        }
+    }
+}
+
 /// Brush cursor ring radius in screen px: nominal dab diameter scaled by
 /// zoom, floored so 1px brushes stay visible. Hover has no pressure, so
 /// this is the base size; dynamics spread real dabs around it.
@@ -9909,7 +10014,7 @@ impl eframe::App for ProCraftApp {
             // in it, including paper margins outside the canvas rect).
             let view_rect = ui.available_rect_before_wrap();
             if self.zoom <= 0.0 {
-                self.zoom = (avail.x / w).min(avail.y / h).clamp(0.1, 8.0);
+                self.zoom = board_fit_zoom(w, h, avail);
             }
             // Pinch-to-zoom (iOS touch; Ctrl+wheel on desktop): no-op when
             // the backend reports no gesture.
@@ -10004,6 +10109,9 @@ impl eframe::App for ProCraftApp {
             canvas_scroll.show(ui, |ui| {
                 let (rect, resp) =
                     ui.allocate_exact_size(Vec2::new(w * z, h * z), Sense::click_and_drag());
+                // A page that fits floats centred on the board; a zoomed-in
+                // page keeps the viewport origin so panning still works.
+                let rect = rect.translate(center_offset(rect.size(), avail));
                 // Pan applies to the drawn canvas and every overlay/mapping
                 // below (sizes are translation-invariant).
                 let rect = rect.translate(self.view_offset);
@@ -10011,6 +10119,18 @@ impl eframe::App for ProCraftApp {
                 // the unrotated rect, then spins into place.
                 let ang = self.view_angle;
                 let cc = rect.center();
+                // Board dots first: the page texture covers anything the
+                // grid's radius grazes along its edge. The scroll-area
+                // painter clips to the page viewport, so widen the clip to
+                // the panel or the margins outside the page lose the grid.
+                paint_board_dots(
+                    &ui.painter().with_clip_rect(view_rect),
+                    view_rect,
+                    rect,
+                    z,
+                    ang,
+                    design::board_dot(self.theme),
+                );
                 let to_screen = |x: f32, y: f32| {
                     rot_pt(
                         egui::Pos2::new(rect.min.x + x * z, rect.min.y + y * z),
@@ -12428,6 +12548,81 @@ mod tests {
         assert_eq!(phone_mini_strip_width(320.0, 12.0), 260.0);
         assert_eq!(phone_mini_strip_width(280.0, 12.0), 256.0);
         assert_eq!(phone_mini_strip_width(150.0, 12.0), 180.0);
+    }
+
+    #[test]
+    fn board_dots_keep_a_steady_screen_spacing_across_zoom() {
+        for zoom in [0.1_f32, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0] {
+            let screen = board_dot_step(zoom) * zoom;
+            assert!(
+                (BOARD_DOT_SCREEN_MIN..=BOARD_DOT_SCREEN_MAX).contains(&screen),
+                "zoom {zoom} gives {screen}pt dot spacing"
+            );
+        }
+    }
+
+    #[test]
+    fn board_dots_snap_to_a_power_of_two_canvas_grid() {
+        // Alignment across zoom levels matters: doubling the step must land
+        // on the same points, so every step is BOARD_DOT_STEP * 2^k.
+        for zoom in [0.1_f32, 0.3, 0.5, 1.0, 2.0, 3.7, 8.0] {
+            let ratio = board_dot_step(zoom) / BOARD_DOT_STEP;
+            assert!(
+                ratio > 0.0 && (ratio.log2().fract()).abs() < 1e-4,
+                "zoom {zoom}"
+            );
+        }
+        assert_eq!(board_dot_step(1.0), BOARD_DOT_STEP);
+        // One octave of zoom either way keeps roughly the same density.
+        assert_eq!(board_dot_step(0.5), BOARD_DOT_STEP * 2.0);
+        assert_eq!(board_dot_step(2.0), BOARD_DOT_STEP * 0.5);
+    }
+
+    #[test]
+    fn board_dot_span_brackets_the_visible_range() {
+        assert_eq!(board_dot_span(32.0, 0.0, 64.0), (0, 2));
+        assert_eq!(board_dot_span(32.0, -10.0, 70.0), (0, 2));
+        assert_eq!(board_dot_span(32.0, 5.0, 40.0), (1, 1));
+        // Nothing to draw when the range falls between two grid lines.
+        let (first, last) = board_dot_span(32.0, 5.0, 20.0);
+        assert!(first > last);
+    }
+
+    #[test]
+    fn board_fit_leaves_a_margin_around_the_page() {
+        let avail = egui::vec2(1024.0, 1366.0);
+        let z = board_fit_zoom(1280.0, 800.0, avail);
+        assert!(
+            (1280.0 * z - (avail.x - 2.0 * BOARD_FIT_MARGIN)).abs() < 1e-3,
+            "fitted width should fill the padded viewport"
+        );
+        assert!(800.0 * z <= avail.y - 2.0 * BOARD_FIT_MARGIN);
+        assert!(1280.0 * z < avail.x, "board stays visible beside the page");
+
+        // Never larger than the unpadded fit, and still clamped at both ends.
+        let plain = (avail.x / 1280.0).min(avail.y / 800.0);
+        assert!(board_fit_zoom(1280.0, 800.0, avail) <= plain);
+        assert_eq!(board_fit_zoom(8.0, 8.0, avail), 8.0);
+        assert_eq!(board_fit_zoom(1280.0, 800.0, egui::vec2(40.0, 40.0)), 0.05);
+    }
+
+    #[test]
+    fn board_centres_the_page_only_when_it_fits() {
+        let avail = egui::vec2(1000.0, 800.0);
+        assert_eq!(
+            center_offset(egui::vec2(1000.0, 800.0), avail),
+            egui::Vec2::ZERO
+        );
+        assert_eq!(
+            center_offset(egui::vec2(600.0, 400.0), avail),
+            egui::vec2(200.0, 200.0)
+        );
+        // Overflow clips instead of centring, so a zoomed-in page keeps its
+        // origin at the viewport edge.
+        assert_eq!(
+            center_offset(egui::vec2(1600.0, 1200.0), avail),
+            egui::Vec2::ZERO
+        );
     }
 
     #[test]

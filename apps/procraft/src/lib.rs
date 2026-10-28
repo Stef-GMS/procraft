@@ -3298,19 +3298,30 @@ fn tool_ring_size(tool: Tool, brush_size: f32, liquify_size: f32) -> Option<f32>
     }
 }
 
-/// One liquify frame step: move the warp anchor from `from` toward `to`
-/// at most `max_step` px. Returns the new anchor and the push applied
-/// this frame; the remainder arrives next frame (trailing glide, no
-/// jumpy mega-pushes).
-fn liquify_step(from: (f32, f32), to: (f32, f32), max_step: f32) -> ((f32, f32), (f32, f32)) {
+/// Split one pointer segment into warp pushes no longer than `max_step`,
+/// so a fast drag warps the whole segment in this frame. One capped step
+/// per frame could never catch up with the cursor: the warp trailed the
+/// pointer and the unwarped tail was dropped on release. The 64-push
+/// ceiling keeps a pathological one-frame jump from stalling the frame.
+fn liquify_pushes(
+    from: (f32, f32),
+    to: (f32, f32),
+    max_step: f32,
+) -> Vec<((f32, f32), (f32, f32))> {
     let (dx, dy) = (to.0 - from.0, to.1 - from.1);
     let len = (dx * dx + dy * dy).sqrt();
-    if len <= max_step || len == 0.0 {
-        return (to, (dx, dy));
+    if len == 0.0 {
+        return Vec::new();
     }
-    let s = max_step / len;
-    let (mx, my) = (dx * s, dy * s);
-    ((from.0 + mx, from.1 + my), (mx, my))
+    let steps = (len / max_step.max(1.0)).ceil().clamp(1.0, 64.0);
+    let mut pushes = Vec::with_capacity(steps as usize);
+    for i in 1..=steps as u32 {
+        let t = i as f32 / steps;
+        let t0 = (i - 1) as f32 / steps;
+        let (sx, sy) = (dx * (t - t0), dy * (t - t0));
+        pushes.push(((from.0 + dx * t, from.1 + dy * t), (sx, sy)));
+    }
+    pushes
 }
 
 /// Top-bar width era. Below [`WIDE_BAR_W`] the zoom/rotate/theme/About
@@ -9853,19 +9864,18 @@ impl eframe::App for ProCraftApp {
                     if resp.dragged() {
                         if let (Some(from), Some(pos)) = (self.liquify_from, pos) {
                             let to = to_canvas(pos);
-                            // Cap the per-frame push at a quarter of the
-                            // liquify radius: a laggy pointer must not
-                            // drag whole slabs sideways, which tears
-                            // transparent gaps into the layer.
+                            // Warp the whole pointer segment every frame.
+                            // Sub-steps cap each push at a quarter of the
+                            // brush radius so fast strokes stay smooth
+                            // instead of tearing holes into the layer.
                             let max_step = (self.liquify_size * 0.125).max(2.0);
-                            let ((x, y), (dx, dy)) = liquify_step(from, to, max_step);
-                            if dx != 0.0 || dy != 0.0 {
-                                let active = self.doc.active;
-                                let (size, strength) = (self.liquify_size, self.liquify_strength);
+                            let active = self.doc.active;
+                            let (size, strength) = (self.liquify_size, self.liquify_strength);
+                            for ((x, y), (dx, dy)) in liquify_pushes(from, to, max_step) {
                                 self.doc.liquify(active, x, y, dx, dy, size, strength);
                                 self.ghost_dirty = true;
-                                self.liquify_from = Some((x, y));
                             }
+                            self.liquify_from = Some(to);
                         }
                     }
                     if resp.drag_stopped() {
@@ -10877,28 +10887,36 @@ mod tests {
     }
 
     #[test]
-    fn liquify_step_caps_move_and_carries_the_rest() {
-        // Within the cap: exact move, full delta.
-        assert_eq!(
-            liquify_step((0.0, 0.0), (3.0, 4.0), 10.0),
-            ((3.0, 4.0), (3.0, 4.0))
-        );
-        // Beyond the cap: the anchor advances max_step along the segment
-        // and the push matches the advance (remainder arrives next frame).
-        let (pos, d) = liquify_step((0.0, 0.0), (30.0, 40.0), 5.0);
-        assert!(
-            (pos.0 - 3.0).abs() < 1e-4 && (pos.1 - 4.0).abs() < 1e-4,
-            "{pos:?}"
-        );
-        assert!(
-            (d.0 - 3.0).abs() < 1e-4 && (d.1 - 4.0).abs() < 1e-4,
-            "{d:?}"
-        );
-        // Idle hand: no move, zero push.
-        assert_eq!(
-            liquify_step((7.0, 8.0), (7.0, 8.0), 5.0),
-            ((7.0, 8.0), (0.0, 0.0))
-        );
+    fn liquify_pushes_cover_the_whole_pointer_segment() {
+        // Within the cap: one push, ending exactly at the pointer.
+        let pushes = liquify_pushes((0.0, 0.0), (3.0, 4.0), 10.0);
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0], ((3.0, 4.0), (3.0, 4.0)));
+
+        // A fast move is split so every push stays under the cap, the
+        // pushes chain end-to-end, and the last anchor is the pointer —
+        // nothing is left over for the release to drop.
+        let pushes = liquify_pushes((0.0, 0.0), (120.0, 160.0), 10.0);
+        assert_eq!(pushes.len(), 20);
+        let mut at = (0.0, 0.0);
+        let mut sum = (0.0, 0.0);
+        for ((x, y), (dx, dy)) in &pushes {
+            assert!(dx.hypot(*dy) <= 10.0 + 1e-4, "step {dx},{dy}");
+            assert!(
+                (at.0 + dx - x).abs() < 1e-4 && (at.1 + dy - y).abs() < 1e-4,
+                "gap before {x},{y}"
+            );
+            at = (*x, *y);
+            sum = (sum.0 + dx, sum.1 + dy);
+        }
+        assert_eq!(at, (120.0, 160.0));
+        assert!((sum.0 - 120.0).abs() < 1e-3 && (sum.1 - 160.0).abs() < 1e-3);
+
+        // A pathological one-frame jump stays bounded.
+        assert_eq!(liquify_pushes((0.0, 0.0), (10_000.0, 0.0), 10.0).len(), 64);
+
+        // Idle hand: nothing to push.
+        assert!(liquify_pushes((7.0, 8.0), (7.0, 8.0), 5.0).is_empty());
     }
 
     #[test]

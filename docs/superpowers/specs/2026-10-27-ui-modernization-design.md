@@ -46,7 +46,7 @@ chrome, per-device arrangement) is project A and is out of scope here.
    cards, pill-shaped controls, thick draggable sliders, generous spacing.
 4. Finger-sized controls on every touch surface (44 px), with desktop
    staying dense.
-5. Dark mode reachable in one tap from anywhere (sun/moon toggle), not
+5. Theme reachable in one tap from anywhere (☀ / ☾ / 🖹 toggle), not
    buried in a menu.
 6. No functional regressions; the existing test suite stays green.
 
@@ -131,7 +131,7 @@ applied once. All widgets stay stock.
 
 ### B2 — Tokens + a small set of custom primitives **(chosen)**
 B1, plus four hand-drawn pieces that carry the visual identity: a pill
-button, a section card, a thick quick slider, and a sun/moon theme toggle.
+button, a section card, a thick quick slider, and a three-state theme toggle.
 
 - Pros: delivers the visible jump; bounded (~400-550 new lines, mostly one
   new module); leaves menus, scroll areas, numeric fields, canvas and all
@@ -391,16 +391,17 @@ thick_slider(ui, tokens, value: &mut f32, range: RangeInclusive<f32>,
 
 - A single pill button, always in the top bar's right cluster, at every
   width including `Narrow` (this is the discoverability fix).
-- Renders `☀` (light) / `☾` (dark) when `has_symbols`, otherwise `Light` /
-  `Dark`, with the tooltip naming the target theme.
-- Tapping toggles **Dark ⇄ Light**.
-- **Paper stays reachable at every width.** Today the theme combo is inline
+- Shows the **current** state: `☾` dark, `☀` light, `🖹` paper when
+  `has_symbols`, otherwise the theme name, with the tooltip naming the next
+  theme.
+- Tapping cycles **Dark → Light → Paper → Dark**.
+- **Paper is also reachable from the combo.** The theme combo is inline
   at `Wide` (`view_controls(ui, false, true)` at `lib.rs:5656`) and inside
   the View menu at `Tablet`/`Narrow`. That split is preserved exactly: at
-  `Wide`, the sun/moon sits *beside* the existing inline combo; on touch it
+  `Wide`, the toggle sits *beside* the existing inline combo; on touch it
   sits outside the fold while the combo stays in the View menu. Nothing is
   removed, so no theme is stranded and no menu contents change.
-- The sun/moon is the only control explicitly kept out of the
+- The toggle is the only control explicitly kept out of the
   `Narrow`/`Tablet` View-menu fold, because it is one pill and is the whole
   point of this item.
 
@@ -441,7 +442,7 @@ not allowed is **gaining rows**. Budget, measured after the restyle:
 | `Tablet` | 1 row | 1 row |
 | `Narrow` | ≤ 2 rows | 1 row, horizontally scrollable |
 
-If the sun/moon pushes `Narrow` to 3 rows, the fallback order is: (1) make
+If the theme pill pushes `Narrow` to 3 rows, the fallback order is: (1) make
 `About` icon-only, (2) drop `Fit`/`Rotate` to glyph-only, (3) move
 `Fit`/`Rotate` into the `Narrow` View menu. Each step is a label change, not
 a reorganization. If step 3 is needed, say so in the commit and report it.
@@ -513,9 +514,10 @@ device confirmation still needs the iPad and the Pixel.
 2. **44 px touch targets** on both touch classes; desktop stays 26 px for
    controls and 26 px for quick-bar rows (was 20 / 34 / 40). This makes
    touch bars taller by design; §8.10 forbids gaining rows instead.
-3. **Sun/moon toggles Dark ⇄ Light only**, and Paper stays exactly where it
-   is today at every width — inline at `Wide`, in the View menu on touch —
-   so it never becomes unreachable.
+3. **The toggle cycles all three themes**, showing the current one as a
+   glyph (☾ / ☀ / 🖹), with the tooltip naming the next; Paper stays in the
+   combo at every width — inline at `Wide`, in the View menu on touch — so
+   it never becomes unreachable.
 4. **`thick_slider` keeps its `−` / `+` steppers and hit-tests only the
    track**, so horizontal scrolling in the quick bar still works and no
    existing way to nudge a value disappears.

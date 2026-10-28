@@ -98,3 +98,15 @@ An iPhone core is slower than this host, so 200+ px brushes cannot hold
 clipped CPU path with a cheaper falloff), not a shell tweak — deferred by the
 user to a later milestone. Recorded here so that milestone starts from these
 numbers.
+
+## Packs
+
+- **iOS IPA for verdict 2** — `ui-b2-restyle` pushed at `406b8a6`; run
+  [40702350473](https://github.com/surfrpt1/procraft/actions/runs/40702350473)
+  succeeded (check, build, package, upload). Staged as
+  `dist/ios-406b8a6/ProCraft-ios-v1.ipa`: 23,309,377 bytes, SHA-256
+  `3dd63046b6382f790c01ba480d4ccae999887622bcdfa427c8ef129ee1c03f9f`,
+  version 0.9.0, `com.surfrpt1.procraft`, iOS 17+, iPhone + iPad. Ad-hoc
+  signed — re-sign with a development profile (Sideloadly, AltStore or Xcode)
+  before installing.
+- **Android APK** — not requested.

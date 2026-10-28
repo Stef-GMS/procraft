@@ -1181,30 +1181,51 @@ impl Document {
         self.rehome_canvas(x1 - x0 + 1, y1 - y0 + 1, -(x0 as i32), -(y0 as i32))
     }
 
+    /// Bilinear sample in premultiplied-alpha space. Straight-RGBA
+    /// interpolation drags transparent black into every edge pixel and
+    /// darkens the rim of rotations, scales and warps; weighting the
+    /// colour by its own alpha (then unpremultiplying) keeps edges
+    /// saturated while the coverage fades.
     fn sample_bilinear(pixels: &[u8], w: u32, h: u32, x: f32, y: f32) -> [u8; 4] {
         let x0 = x.floor().clamp(0.0, w as f32 - 1.0) as u32;
         let y0 = y.floor().clamp(0.0, h as f32 - 1.0) as u32;
         let x1 = (x0 + 1).min(w - 1);
         let y1 = (y0 + 1).min(h - 1);
         let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        if fx.abs() < 1e-6 && fy.abs() < 1e-6 {
+            let o = ((y0 * w + x0) * 4) as usize;
+            return [pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]];
+        }
         let at = |x: u32, y: u32| -> [f32; 4] {
             let o = ((y * w + x) * 4) as usize;
+            let a = pixels[o + 3] as f32;
+            let k = a / 255.0;
             [
-                pixels[o] as f32,
-                pixels[o + 1] as f32,
-                pixels[o + 2] as f32,
-                pixels[o + 3] as f32,
+                pixels[o] as f32 * k,
+                pixels[o + 1] as f32 * k,
+                pixels[o + 2] as f32 * k,
+                a,
             ]
         };
         let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
-        let mut out = [0u8; 4];
+        let mut pm = [0.0f32; 4];
         for i in 0..4 {
-            let v = a[i] * (1.0 - fx) * (1.0 - fy)
+            pm[i] = a[i] * (1.0 - fx) * (1.0 - fy)
                 + b[i] * fx * (1.0 - fy)
                 + c[i] * (1.0 - fx) * fy
                 + d[i] * fx * fy;
+        }
+        let alpha = pm[3];
+        let mut out = [0u8; 4];
+        for i in 0..3 {
+            let v = if alpha > 0.0 {
+                pm[i] * 255.0 / alpha
+            } else {
+                0.0
+            };
             out[i] = v.round().clamp(0.0, 255.0) as u8;
         }
+        out[3] = alpha.round().clamp(0.0, 255.0) as u8;
         out
     }
 
@@ -4963,6 +4984,25 @@ mod tests {
         let view = doc.mask_view().unwrap();
         assert_eq!(&view[0..4], &[0, 0, 0, 255]);
         assert_eq!(&view[4..8], &[200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn bilinear_edges_keep_their_colour_over_transparency() {
+        // One opaque red pixel beside transparent black. A straight-RGBA
+        // blend would give dark red (128, 0, 0, 128) at the midpoint; the
+        // premultiplied blend keeps the hue and only fades coverage.
+        let mut px = vec![0u8; 2 * 2 * 4];
+        px[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        let s = Document::sample_bilinear(&px, 2, 2, 0.5, 0.0);
+        assert_eq!(&s[..3], &[255, 0, 0], "sample was {s:?}");
+        assert!((s[3] as i32 - 128).abs() <= 1, "alpha was {}", s[3]);
+        // An exact hit still returns the pixel bit-for-bit.
+        assert_eq!(
+            Document::sample_bilinear(&px, 2, 2, 0.0, 0.0),
+            [255, 0, 0, 255]
+        );
+        // Transparent neighbourhoods stay fully transparent, never grey.
+        assert_eq!(Document::sample_bilinear(&px, 2, 2, 1.0, 1.0), [0, 0, 0, 0]);
     }
 
     #[test]

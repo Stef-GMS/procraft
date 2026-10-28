@@ -548,6 +548,8 @@ fn settings_differ(a: &Settings, b: &Settings) -> bool {
         || a.show_layers != b.show_layers
         || a.recent != b.recent
         || a.shortcuts != b.shortcuts
+        || a.strip_collapsed != b.strip_collapsed
+        || a.strip_dock != b.strip_dock
 }
 
 /// M49: the persistable ChordKey for an egui key (None for keys the
@@ -909,6 +911,12 @@ struct ProCraftApp {
     /// Last drawer actually shown: `drawer` drops to `None` the moment it
     /// closes, this keeps the panel around for its slide-out.
     drawer_shown: MobileDrawer,
+    /// Phone strip: the pocket pill instead of the full bar, which third of
+    /// the bottom edge it docks to, and the live drag offset while it is
+    /// being moved (screen px from the docked position).
+    strip_collapsed: bool,
+    strip_dock: StripDock,
+    strip_offset: f32,
     /// One-shot request from the mobile Color dot: after the Tools drawer
     /// opens, scroll its body to the Color card.
     mobile_scroll_color: bool,
@@ -1162,6 +1170,9 @@ impl ProCraftApp {
             show_layers: true,
             drawer: MobileDrawer::None,
             drawer_shown: MobileDrawer::None,
+            strip_collapsed: false,
+            strip_dock: StripDock::Center,
+            strip_offset: 0.0,
             mobile_scroll_color: false,
             status_seen: String::new(),
             status_at: 0.0,
@@ -1359,6 +1370,8 @@ impl ProCraftApp {
             zoom: self.zoom,
             recent: self.recent.clone(),
             shortcuts: self.shortcuts.to_stored(),
+            strip_collapsed: self.strip_collapsed,
+            strip_dock: self.strip_dock.as_str().to_string(),
         }
     }
 
@@ -1375,6 +1388,8 @@ impl ProCraftApp {
             self.zoom = s.zoom;
         }
         self.recent = s.recent.iter().take(MAX_RECENT).cloned().collect();
+        self.strip_collapsed = s.strip_collapsed;
+        self.strip_dock = StripDock::from_str(&s.strip_dock);
         let (shortcuts, mut warns) = Shortcuts::from_stored(&s.shortcuts);
         self.shortcuts = shortcuts;
         if s.version > SETTINGS_VERSION {
@@ -3974,8 +3989,57 @@ impl ProCraftApp {
                 ui.separator();
                 ui.collapsing("Transform layer", |ui| {
                     // Buttons compose into one session that always
-                    // re-applies from the pristine base (see tform_button):
+                    // re-applies from the pristine base (see tform_apply):
                     // mashing them never compounds resampling blur.
+                    tform_refresh(&self.doc, &mut self.tform_press);
+                    let blocked = self.text_paint_blocked();
+                    let mut scale_pct = (self.tform_press.scale * 100.0).round();
+                    let mut angle = self.tform_press.degrees;
+                    let mut ended = false;
+                    if !blocked {
+                        let size = ui.add(
+                            egui::Slider::new(
+                                &mut scale_pct,
+                                TFORM_SCALE_MIN * 100.0..=TFORM_SCALE_MAX * 100.0,
+                            )
+                            .step_by(1.0)
+                            .suffix("%")
+                            .text("Size"),
+                        );
+                        if size.changed() {
+                            tform_apply(
+                                &mut self.doc,
+                                &mut self.tform_press,
+                                TformOp::SetScale(scale_pct),
+                                true,
+                            );
+                        }
+                        if size.drag_stopped() || (size.changed() && !size.dragged()) {
+                            self.tform_press.end_gesture();
+                            ended = true;
+                        }
+                        let turn = ui.add(
+                            egui::Slider::new(&mut angle, -180.0..=180.0)
+                                .step_by(1.0)
+                                .suffix(" deg")
+                                .text("Angle"),
+                        );
+                        if turn.changed() {
+                            tform_apply(
+                                &mut self.doc,
+                                &mut self.tform_press,
+                                TformOp::SetRotation(angle),
+                                true,
+                            );
+                        }
+                        if turn.drag_stopped() || (turn.changed() && !turn.dragged()) {
+                            self.tform_press.end_gesture();
+                            ended = true;
+                        }
+                    }
+                    if ended {
+                        self.status = tform_status(&self.tform_press);
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Scale +").clicked() && !self.text_paint_blocked() {
                             tform_button(
@@ -4048,6 +4112,18 @@ impl ProCraftApp {
                                 }
                                 _ => "Layer flipped vertically.".to_string(),
                             };
+                        }
+                        if ui
+                            .button("Reset")
+                            .on_hover_text(
+                                "Back to the layer as it was when this transform session began",
+                            )
+                            .clicked()
+                            && !self.text_paint_blocked()
+                        {
+                            let _ =
+                                tform_button(&mut self.doc, &mut self.tform_press, TformOp::Reset);
+                            self.status = "Layer transform reset.".to_string();
                         }
                     });
                     // M48 transform handles: mode-specific on-canvas
@@ -4862,7 +4938,10 @@ impl ProCraftApp {
         let island_h = mobile_island_height(t.control_h);
         let strip_h = island_h;
         let hit = quick_hit_height(class);
-        let capsule_visible = !quick_controls(self.tool).is_empty();
+        // Minimising the strip reclaims the canvas; the options capsule would
+        // undo that, so it folds away with the bar.
+        let capsule_visible =
+            !quick_controls(self.tool).is_empty() && !(phone && self.strip_collapsed);
         let capsule_offset = if phone {
             phone_capsule_offset(safe_bottom, pad, strip_h, t.gap)
         } else {
@@ -5010,12 +5089,23 @@ impl ProCraftApp {
 
         if phone {
             // Phones trade the two top islands for one thumb-reachable strip.
-            let strip_w = vp.width() - 2.0 * pad;
+            // Expanded it is edge-to-edge and scrolls; minimised it becomes a
+            // pocket pill that keeps the essentials and can be dragged to
+            // either side of the thumb zone (Apple's floating-bar behaviour).
+            let expanded = !self.strip_collapsed;
+            let strip_w = if expanded {
+                vp.width() - 2.0 * pad
+            } else {
+                phone_mini_strip_width(vp.width(), pad)
+            };
+            let docked_left = phone_strip_left(self.strip_dock, vp.width(), pad, strip_w);
+            let left =
+                phone_strip_left_clamped(docked_left + self.strip_offset, vp.width(), pad, strip_w);
             egui::Area::new(egui::Id::new("mobile-strip"))
                 .order(egui::Order::Foreground)
                 .anchor(
-                    egui::Align2::CENTER_BOTTOM,
-                    [0.0, phone_strip_offset(safe_bottom, pad)],
+                    egui::Align2::LEFT_BOTTOM,
+                    [left, phone_strip_offset(safe_bottom, pad)],
                 )
                 .show(ctx, |ui| {
                     ui.set_width(strip_w);
@@ -5031,101 +5121,204 @@ impl ProCraftApp {
                         egui::Sense::click_and_drag(),
                     );
                     island_frame().show(ui, |ui| {
-                        egui::ScrollArea::horizontal()
-                            .id_salt("mobile-strip-scroll")
-                            .scroll_bar_visibility(
-                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                            )
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
-                                    for tool in PHONE_STRIP_TOOLS {
-                                        let face = strip_tool_face(tool, self.has_symbols);
-                                        if self.toggle_pill(ui, face, self.tool == tool) {
-                                            self.choose_tool(tool);
-                                        }
-                                    }
-                                    design::readout_label(
-                                        ui,
-                                        &t,
-                                        &format!("{:.0}", self.brush.size),
-                                        &format!("{:.0}", BRUSH_SIZE_MAX),
+                        ui.set_width((strip_w - 12.0).max(1.0));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
+                            if !expanded {
+                                let grip = strip_grip(ui, &t, hit);
+                                if grip.drag_started() {
+                                    self.strip_offset = 0.0;
+                                }
+                                if grip.dragged() {
+                                    self.strip_offset += grip.drag_delta().x;
+                                    let max_left = (vp.width() - pad - strip_w).max(pad);
+                                    self.strip_offset = (docked_left + self.strip_offset)
+                                        .clamp(pad, max_left)
+                                        - docked_left;
+                                    ui.ctx().request_repaint();
+                                }
+                                if grip.drag_stopped() {
+                                    let dropped = phone_strip_left_clamped(
+                                        docked_left + self.strip_offset,
+                                        vp.width(),
+                                        pad,
+                                        strip_w,
                                     );
-                                    ui.separator();
-                                    if self.pill(ui, "Tools") {
-                                        self.drawer = self.drawer.toggled(MobileDrawer::Tools);
-                                        self.show_tools = self.drawer == MobileDrawer::Tools;
-                                        if self.drawer == MobileDrawer::Tools {
-                                            self.show_layers = false;
-                                        }
-                                    }
-                                    if self.pill(ui, "Layers") {
-                                        self.drawer = self.drawer.toggled(MobileDrawer::Layers);
-                                        self.show_layers = self.drawer == MobileDrawer::Layers;
-                                        if self.drawer == MobileDrawer::Layers {
-                                            self.show_tools = false;
-                                        }
-                                    }
-                                    self.color_dot(ui, &t);
-                                    ui.separator();
-                                    if design::icon_button(ui, &t, design::Icon::Undo, hit)
-                                        .on_hover_text("Undo")
-                                        .clicked()
-                                        && self.doc.undo()
-                                    {
-                                        self.status = "Undone.".to_string();
-                                    }
-                                    if design::icon_button(ui, &t, design::Icon::Redo, hit)
-                                        .on_hover_text("Redo")
-                                        .clicked()
-                                        && self.doc.redo()
-                                    {
-                                        self.status = "Redone.".to_string();
-                                    }
-                                    if self.pill(ui, "Gallery") {
-                                        self.gallery_open = !self.gallery_open;
-                                    }
-                                    egui::containers::menu::MenuButton::new("File")
-                                        .config(
-                                            egui::containers::menu::MenuConfig::new()
-                                                .close_behavior(
-                                                    egui::PopupCloseBehavior::CloseOnClickOutside,
-                                                ),
-                                        )
-                                        .ui(ui, |ui| {
-                                            ui.spacing_mut().interact_size.y = t.control_h;
-                                            self.file_menu_ui(ui, class, &t);
-                                        });
-                                    if self.pill(ui, "Reference") {
-                                        self.ref_open = !self.ref_open;
-                                    }
-                                    egui::containers::menu::MenuButton::new("More")
-                                        .config(
-                                            egui::containers::menu::MenuConfig::new()
-                                                .close_behavior(
-                                                    egui::PopupCloseBehavior::CloseOnClickOutside,
-                                                ),
-                                        )
-                                        .ui(ui, |ui| {
-                                            ui.spacing_mut().interact_size.y = t.control_h;
-                                            if ui.button("Clear layer").clicked() {
-                                                self.clear_layer();
-                                                ui.close();
+                                    self.strip_dock =
+                                        phone_strip_dock(dropped, vp.width(), pad, strip_w);
+                                    self.strip_offset = 0.0;
+                                }
+                                if self.toggle_pill(
+                                    ui,
+                                    strip_tool_face(self.tool, self.has_symbols),
+                                    true,
+                                ) {
+                                    self.strip_collapsed = false;
+                                }
+                                if design::icon_button(ui, &t, design::Icon::Undo, hit)
+                                    .on_hover_text("Undo")
+                                    .clicked()
+                                    && self.doc.undo()
+                                {
+                                    self.status = "Undone.".to_string();
+                                }
+                                if design::icon_button(ui, &t, design::Icon::ChevronUp, hit)
+                                    .on_hover_text("Show tools")
+                                    .clicked()
+                                {
+                                    self.strip_collapsed = false;
+                                    self.strip_offset = 0.0;
+                                }
+                            } else {
+                                let scroll_w = (strip_w - 12.0 - hit - t.gap).max(120.0);
+                                egui::ScrollArea::horizontal()
+                                    .id_salt("mobile-strip-scroll")
+                                    .max_width(scroll_w)
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                    )
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
+                                            for tool in PHONE_STRIP_TOOLS {
+                                                let face =
+                                                    strip_tool_face(tool, self.has_symbols);
+                                                if self.toggle_pill(ui, face, self.tool == tool) {
+                                                    self.choose_tool(tool);
+                                                }
                                             }
-                                            if ui
-                                                .button(format!("Theme: {}", self.theme.name()))
-                                                .clicked()
-                                            {
-                                                self.theme = design::next_theme(self.theme);
-                                                self.status =
-                                                    format!("{} theme.", self.theme.name());
-                                                ui.close();
-                                            }
+                                            design::readout_label(
+                                                ui,
+                                                &t,
+                                                &format!("{:.0}", self.brush.size),
+                                                &format!("{:.0}", BRUSH_SIZE_MAX),
+                                            );
                                             ui.separator();
-                                            self.view_controls(ui, true);
+                                            if self.pill(ui, "Tools") {
+                                                self.drawer =
+                                                    self.drawer.toggled(MobileDrawer::Tools);
+                                                self.show_tools =
+                                                    self.drawer == MobileDrawer::Tools;
+                                                if self.drawer == MobileDrawer::Tools {
+                                                    self.show_layers = false;
+                                                }
+                                            }
+                                            if self.pill(ui, "Layers") {
+                                                self.drawer =
+                                                    self.drawer.toggled(MobileDrawer::Layers);
+                                                self.show_layers =
+                                                    self.drawer == MobileDrawer::Layers;
+                                                if self.drawer == MobileDrawer::Layers {
+                                                    self.show_tools = false;
+                                                }
+                                            }
+                                            self.color_dot(ui, &t);
+                                            ui.separator();
+                                            if design::icon_button(ui, &t, design::Icon::Undo, hit)
+                                                .on_hover_text("Undo")
+                                                .clicked()
+                                                && self.doc.undo()
+                                            {
+                                                self.status = "Undone.".to_string();
+                                            }
+                                            if design::icon_button(ui, &t, design::Icon::Redo, hit)
+                                                .on_hover_text("Redo")
+                                                .clicked()
+                                                && self.doc.redo()
+                                            {
+                                                self.status = "Redone.".to_string();
+                                            }
+                                            if self.pill(ui, "Gallery") {
+                                                self.gallery_open = !self.gallery_open;
+                                            }
+                                            egui::containers::menu::MenuButton::new("File")
+                                                .config(
+                                                    egui::containers::menu::MenuConfig::new()
+                                                        .close_behavior(
+                                                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                                                        ),
+                                                )
+                                                .ui(ui, |ui| {
+                                                    ui.spacing_mut().interact_size.y = t.control_h;
+                                                    self.file_menu_ui(ui, class, &t);
+                                                });
+                                            if self.pill(ui, "Reference") {
+                                                self.ref_open = !self.ref_open;
+                                            }
+                                            egui::containers::menu::MenuButton::new("More")
+                                                .config(
+                                                    egui::containers::menu::MenuConfig::new()
+                                                        .close_behavior(
+                                                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                                                        ),
+                                                )
+                                                .ui(ui, |ui| {
+                                                    ui.spacing_mut().interact_size.y = t.control_h;
+                                                    let armed =
+                                                        self.xform.mode != XformMode::Off;
+                                                    if ui
+                                                        .button(if armed {
+                                                            "Finish transform"
+                                                        } else {
+                                                            "Transform"
+                                                        })
+                                                        .clicked()
+                                                    {
+                                                        if armed {
+                                                            // Disarm keeps the
+                                                            // applied warp and
+                                                            // hides the handles.
+                                                            self.xform.arm(
+                                                                XformMode::Off,
+                                                                &self.doc,
+                                                            );
+                                                            self.status =
+                                                                "Transform finished.".to_string();
+                                                        } else {
+                                                            self.xform.arm(
+                                                                XformMode::Free,
+                                                                &self.doc,
+                                                            );
+                                                            self.status = xform_mode_status(
+                                                                XformMode::Free,
+                                                            )
+                                                            .to_string();
+                                                        }
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Clear layer").clicked() {
+                                                        self.clear_layer();
+                                                        ui.close();
+                                                    }
+                                                    if ui
+                                                        .button(format!(
+                                                            "Theme: {}",
+                                                            self.theme.name()
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        self.theme =
+                                                            design::next_theme(self.theme);
+                                                        self.status = format!(
+                                                            "{} theme.",
+                                                            self.theme.name()
+                                                        );
+                                                        ui.close();
+                                                    }
+                                                    ui.separator();
+                                                    self.view_controls(ui, true);
+                                                });
                                         });
-                                });
-                            });
+                                    });
+                                if design::icon_button(ui, &t, design::Icon::ChevronDown, hit)
+                                    .on_hover_text("Hide tools")
+                                    .clicked()
+                                {
+                                    self.strip_collapsed = true;
+                                    self.strip_offset = 0.0;
+                                }
+                            }
+                        });
                     });
                 });
         }
@@ -6421,6 +6614,34 @@ impl MobileDrawer {
     }
 }
 
+/// Horizontal anchor of the compact phone strip. The full bar is always
+/// edge-to-edge; the pocket pill snaps to one of the bottom thirds so it can
+/// live where the thumb reaches without covering the canvas middle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StripDock {
+    Left,
+    Center,
+    Right,
+}
+
+impl StripDock {
+    fn as_str(self) -> &'static str {
+        match self {
+            StripDock::Left => "left",
+            StripDock::Center => "center",
+            StripDock::Right => "right",
+        }
+    }
+
+    fn from_str(s: &str) -> StripDock {
+        match s {
+            "left" => StripDock::Left,
+            "right" => StripDock::Right,
+            _ => StripDock::Center,
+        }
+    }
+}
+
 /// Drawer width on touch screens: wide enough for the two-column cards,
 /// narrow enough to leave a visible strip of canvas and the scrim.
 fn mobile_drawer_width(viewport_w: f32) -> f32 {
@@ -6472,6 +6693,59 @@ fn phone_strip_offset(safe_bottom: f32, pad: f32) -> f32 {
 /// the strip and its gap on phones, directly above the inset elsewhere.
 fn phone_capsule_offset(safe_bottom: f32, pad: f32, strip_h: f32, gap: f32) -> f32 {
     -(safe_bottom + pad + strip_h + gap)
+}
+
+/// Preferred width of the pocket pill: grip, active tool, size readout,
+/// undo and expand, without the scrolling tail of the full bar.
+const PHONE_MINI_STRIP_W: f32 = 260.0;
+
+fn phone_mini_strip_width(viewport_w: f32, pad: f32) -> f32 {
+    (viewport_w - 2.0 * pad).clamp(180.0, PHONE_MINI_STRIP_W)
+}
+
+/// Left edge of the strip for a docked position.
+fn phone_strip_left(dock: StripDock, viewport_w: f32, pad: f32, width: f32) -> f32 {
+    let max_left = (viewport_w - pad - width).max(pad);
+    match dock {
+        StripDock::Left => pad,
+        StripDock::Center => ((viewport_w - width) * 0.5).clamp(pad, max_left),
+        StripDock::Right => max_left,
+    }
+}
+
+/// Keep a dragged strip fully on screen.
+fn phone_strip_left_clamped(left: f32, viewport_w: f32, pad: f32, width: f32) -> f32 {
+    let max_left = (viewport_w - pad - width).max(pad);
+    left.clamp(pad, max_left)
+}
+
+/// Nearest dock for a strip whose left edge is `left`: compare the pill's
+/// centre against the three docked centres, so a wide pill still snaps to
+/// its nearest side instead of always landing in the middle.
+fn phone_strip_dock(left: f32, viewport_w: f32, pad: f32, width: f32) -> StripDock {
+    let c = left + width * 0.5;
+    let mut best = (StripDock::Center, f32::INFINITY);
+    for dock in [StripDock::Left, StripDock::Center, StripDock::Right] {
+        let d = (phone_strip_left(dock, viewport_w, pad, width) + width * 0.5 - c).abs();
+        if d < best.1 {
+            best = (dock, d);
+        }
+    }
+    best.0
+}
+
+/// Drag handle for the pocket strip: two columns of painted dots. Painted,
+/// not typeset, so it survives the iOS font stack like the other icons.
+fn strip_grip(ui: &mut egui::Ui, t: &design::Tokens, h: f32) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(18.0, h), egui::Sense::click_and_drag());
+    for row in 0..3 {
+        for col in 0..2 {
+            let p = rect.center() + egui::vec2((col as f32 - 0.5) * 5.0, (row as f32 - 1.0) * 6.0);
+            ui.painter().circle_filled(p, 1.5, t.text_lo);
+        }
+    }
+    response
 }
 
 /// Vertical room available on a phone: safe insets, edge padding, the strip
@@ -6754,6 +7028,31 @@ fn xform_points_center(points: &[(f32, f32)]) -> (f32, f32) {
         .iter()
         .fold((0.0f32, 0.0f32), |(ax, ay), &(x, y)| (ax + x, ay + y));
     (sx / points.len() as f32, sy / points.len() as f32)
+}
+
+/// Lock a drag to its dominant axis (Shift while moving).
+fn constrain_axis(dx: f32, dy: f32) -> (f32, f32) {
+    if dx.abs() >= dy.abs() {
+        (dx, 0.0)
+    } else {
+        (0.0, dy)
+    }
+}
+
+/// Quantize an angle in degrees to 15° steps (Shift while rotating).
+fn snap_angle(deg: f32) -> f32 {
+    const STEP: f32 = 15.0;
+    (deg / STEP).round() * STEP
+}
+
+/// Half extents of the four-corner frame: (half width, half height).
+fn frame_extents(points: &[(f32, f32)]) -> (f32, f32) {
+    if points.len() != 4 {
+        return (1.0, 1.0);
+    }
+    let side =
+        |a: (f32, f32), b: (f32, f32)| ((b.0 - a.0).hypot(b.1 - a.1) * 0.5).max(XFORM_MIN_EXTENT);
+    (side(points[0], points[1]), side(points[0], points[3]))
 }
 
 /// Lattice lines for one axis: the canvas edges, the bounds edges, and
@@ -7432,8 +7731,12 @@ impl XformState {
 
     /// Move the grabbed pin (or gesture) by the pointer's displacement
     /// since the grab started (never the absolute pointer position: a
-    /// long-press with no movement must not relocate the pin).
-    fn drag_by(&mut self, dx: f32, dy: f32) {
+    /// long-press with no movement must not relocate the pin), with the
+    /// live modifier keys: Shift locks the aspect on a Free corner, snaps
+    /// Free rotation to 15° steps and constrains free moves to one axis;
+    /// Alt scales a Free corner about the frame center instead of the
+    /// opposite corner.
+    fn drag_by_mod(&mut self, dx: f32, dy: f32, shift: bool, alt: bool) {
         let Some(g) = self.grab else {
             return;
         };
@@ -7441,6 +7744,11 @@ impl XformState {
             XformMode::Off => {}
             XformMode::Mesh => {
                 if let Grab::Pin(i) = g {
+                    let (dx, dy) = if shift {
+                        constrain_axis(dx, dy)
+                    } else {
+                        (dx, dy)
+                    };
                     if let (Some(from), Some(slot)) =
                         (self.grab_from.get(i).copied(), self.grid.get_mut(i))
                     {
@@ -7450,6 +7758,11 @@ impl XformState {
             }
             XformMode::Distort | XformMode::Puppet => match g {
                 Grab::Pin(i) => {
+                    let (dx, dy) = if shift {
+                        constrain_axis(dx, dy)
+                    } else {
+                        (dx, dy)
+                    };
                     if let (Some(from), Some(slot)) =
                         (self.grab_from.get(i).copied(), self.pins.get_mut(i))
                     {
@@ -7468,22 +7781,18 @@ impl XformState {
                 _ => {}
             },
             XformMode::Free => match g {
-                Grab::Pin(i) => self.drag_scale(i, dx, dy),
+                Grab::Pin(i) => self.drag_scale_mod(i, dx, dy, shift, alt),
                 Grab::All => {
+                    let (dx, dy) = if shift {
+                        constrain_axis(dx, dy)
+                    } else {
+                        (dx, dy)
+                    };
                     for (p, f) in self.pins.iter_mut().zip(self.grab_from.iter()) {
                         *p = (f.0 + dx, f.1 + dy);
                     }
                 }
-                Grab::Rotate => {
-                    let (cx, cy) = xform_points_center(&self.grab_from);
-                    let a0 = (self.grab_at.1 - cy).atan2(self.grab_at.0 - cx);
-                    let a1 = (self.grab_at.1 + dy - cy).atan2(self.grab_at.0 + dx - cx);
-                    let (sin, cos) = (a1 - a0).sin_cos();
-                    for (p, f) in self.pins.iter_mut().zip(self.grab_from.iter()) {
-                        let (px, py) = (f.0 - cx, f.1 - cy);
-                        *p = (cx + px * cos - py * sin, cy + px * sin + py * cos);
-                    }
-                }
+                Grab::Rotate => self.drag_rotate(dx, dy, shift),
                 Grab::Selected => {}
             },
             XformMode::Skew => self.drag_skew(dx, dy),
@@ -7491,26 +7800,56 @@ impl XformState {
         }
     }
 
-    fn drag_scale(&mut self, i: usize, dx: f32, dy: f32) {
+    /// Scale a Free corner about the opposite corner (or the frame center
+    /// with `from_center`), optionally locking the frame's aspect ratio.
+    fn drag_scale_mod(&mut self, i: usize, dx: f32, dy: f32, lock_aspect: bool, from_center: bool) {
         if self.grab_from.len() != 4 || i >= 4 {
             return;
         }
-        let o = (i + 2) % 4;
-        let (ox, oy) = self.grab_from[o];
+        let s = XFORM_CORNER_SIGNS;
+        let (ox, oy, so) = if from_center {
+            let (cx, cy) = xform_points_center(&self.grab_from);
+            (cx, cy, (0.0, 0.0))
+        } else {
+            let o = (i + 2) % 4;
+            (self.grab_from[o].0, self.grab_from[o].1, s[o])
+        };
         let tl = self.grab_from[0];
         let u = xform_unit((self.grab_from[1].0 - tl.0, self.grab_from[1].1 - tl.1));
         let v = xform_unit((self.grab_from[3].0 - tl.0, self.grab_from[3].1 - tl.1));
         let (px, py) = (self.grab_at.0 + dx - ox, self.grab_at.1 + dy - oy);
-        let s = XFORM_CORNER_SIGNS;
-        let du = s[i].0 - s[o].0;
-        let dv = s[i].1 - s[o].1;
-        let hu = ((px * u.0 + py * u.1) / du).abs().max(XFORM_MIN_EXTENT);
-        let hv = ((px * v.0 + py * v.1) / dv).abs().max(XFORM_MIN_EXTENT);
+        let du = s[i].0 - so.0;
+        let dv = s[i].1 - so.1;
+        let mut hu = ((px * u.0 + py * u.1) / du).abs().max(XFORM_MIN_EXTENT);
+        let mut hv = ((px * v.0 + py * v.1) / dv).abs().max(XFORM_MIN_EXTENT);
+        if lock_aspect {
+            let (w0, h0) = frame_extents(&self.grab_from);
+            let k = (hu / w0).max(hv / h0);
+            hu = w0 * k;
+            hv = h0 * k;
+        }
         let (un, vn) = ((u.0 * hu, u.1 * hu), (v.0 * hv, v.1 * hv));
         for (k, slot) in self.pins.iter_mut().enumerate() {
-            let duk = s[k].0 - s[o].0;
-            let dvk = s[k].1 - s[o].1;
+            let duk = s[k].0 - so.0;
+            let dvk = s[k].1 - so.1;
             *slot = (ox + duk * un.0 + dvk * vn.0, oy + duk * un.1 + dvk * vn.1);
+        }
+    }
+
+    /// Rotate the Free frame about its center; `snap` quantizes the turn
+    /// to 15° steps.
+    fn drag_rotate(&mut self, dx: f32, dy: f32, snap: bool) {
+        let (cx, cy) = xform_points_center(&self.grab_from);
+        let a0 = (self.grab_at.1 - cy).atan2(self.grab_at.0 - cx);
+        let a1 = (self.grab_at.1 + dy - cy).atan2(self.grab_at.0 + dx - cx);
+        let mut delta = a1 - a0;
+        if snap {
+            delta = snap_angle(delta.to_degrees()).to_radians();
+        }
+        let (sin, cos) = delta.sin_cos();
+        for (p, f) in self.pins.iter_mut().zip(self.grab_from.iter()) {
+            let (px, py) = (f.0 - cx, f.1 - cy);
+            *p = (cx + px * cos - py * sin, cy + px * sin + py * cos);
         }
     }
 
@@ -7782,8 +8121,26 @@ enum TformOp {
     Scale(f32),
     /// Rotation in degrees (engine convention, matches `affine_layer`).
     Rotate(f32),
+    /// Absolute session scale as a percentage (100 = untouched).
+    SetScale(f32),
+    /// Absolute session rotation in degrees.
+    SetRotation(f32),
     FlipH,
     FlipV,
+    Reset,
+}
+
+/// Session scale bounds, shared by the slider and the absolute setter.
+const TFORM_SCALE_MIN: f32 = 0.25;
+const TFORM_SCALE_MAX: f32 = 4.0;
+
+/// Fold degrees into (-180, 180] so the angle slider never winds up.
+fn wrap_degrees(deg: f32) -> f32 {
+    let mut d = (deg + 180.0).rem_euclid(360.0) - 180.0;
+    if d == -180.0 {
+        d = 180.0;
+    }
+    d
 }
 
 /// Session base for the Transform-layer buttons: the layer's pixels and
@@ -7810,6 +8167,9 @@ struct TformPress {
     degrees: f32,
     flip_h: bool,
     flip_v: bool,
+    /// The current gesture already opened its undo step; live slider
+    /// frames share it instead of piling one snapshot per frame.
+    checkpointed: bool,
 }
 
 impl TformPress {
@@ -7820,8 +8180,50 @@ impl TformPress {
             degrees: 0.0,
             flip_h: false,
             flip_v: false,
+            checkpointed: false,
         }
     }
+
+    /// Close the current gesture so the next one opens a fresh undo step.
+    fn end_gesture(&mut self) {
+        self.checkpointed = false;
+    }
+}
+
+/// True when the session base no longer matches the layer in front of it.
+fn tform_base_stale(doc: &Document, t: &TformPress) -> bool {
+    let active = doc.active;
+    match t.base.as_ref() {
+        None => true,
+        Some(b) => {
+            b.layer != active
+                || b.rev != doc.revision()
+                || b.pixels.len() != doc.layers[active].pixels.len()
+        }
+    }
+}
+
+/// Re-capture the session base (and reset the session transform) when the
+/// document changed behind it, so panel readouts never describe a dead
+/// session.
+fn tform_refresh(doc: &Document, t: &mut TformPress) {
+    if !tform_base_stale(doc, t) {
+        return;
+    }
+    let layer = &doc.layers[doc.active];
+    t.base = Some(TformBase {
+        pixels: layer.pixels.clone(),
+        mask: layer.mask.clone(),
+        layer: doc.active,
+        rev: doc.revision(),
+        ox: layer.ox,
+        oy: layer.oy,
+    });
+    t.scale = 1.0;
+    t.degrees = 0.0;
+    t.flip_h = false;
+    t.flip_v = false;
+    t.checkpointed = false;
 }
 
 /// Exact in-place horizontal mirror of a `w`x`h` buffer, `stride` bytes
@@ -7861,36 +8263,19 @@ fn flip_buf_v(buf: &mut [u8], w: usize, h: usize, stride: usize) {
 /// re-apply everything from the pristine base in a single pass. Flips
 /// are exact pixel permutations; scale/rotation reuse
 /// [`Document::affine_layer`], whose quarter turns stay lossless.
-fn tform_button(doc: &mut Document, t: &mut TformPress, op: TformOp) -> XformApply {
+///
+/// `live` marks continuous slider frames: the first one opens the undo
+/// step, the rest ride on it, so a whole drag undoes in one go.
+fn tform_apply(doc: &mut Document, t: &mut TformPress, op: TformOp, live: bool) -> XformApply {
+    tform_refresh(doc, t);
     let active = doc.active;
-    let stale = match t.base.as_ref() {
-        None => true,
-        Some(b) => {
-            b.layer != active
-                || b.rev != doc.revision()
-                || b.pixels.len() != doc.layers[active].pixels.len()
-        }
-    };
-    if stale {
-        let layer = &doc.layers[active];
-        t.base = Some(TformBase {
-            pixels: layer.pixels.clone(),
-            mask: layer.mask.clone(),
-            layer: active,
-            rev: doc.revision(),
-            ox: layer.ox,
-            oy: layer.oy,
-        });
-        t.scale = 1.0;
-        t.degrees = 0.0;
-        t.flip_h = false;
-        t.flip_v = false;
-    }
     // Compose the press onto the session transform (T' = op o T). Flips
     // conjugate rotations (Fx R(a) Fx = R(-a)), hence the negations.
     match op {
         TformOp::Scale(f) => t.scale *= f,
         TformOp::Rotate(deg) => t.degrees += deg,
+        TformOp::SetScale(pct) => t.scale = (pct * 0.01).clamp(TFORM_SCALE_MIN, TFORM_SCALE_MAX),
+        TformOp::SetRotation(deg) => t.degrees = wrap_degrees(deg),
         TformOp::FlipH => {
             t.degrees = -t.degrees;
             t.flip_h = !t.flip_h;
@@ -7898,6 +8283,12 @@ fn tform_button(doc: &mut Document, t: &mut TformPress, op: TformOp) -> XformApp
         TformOp::FlipV => {
             t.degrees = -t.degrees;
             t.flip_v = !t.flip_v;
+        }
+        TformOp::Reset => {
+            t.scale = 1.0;
+            t.degrees = 0.0;
+            t.flip_h = false;
+            t.flip_v = false;
         }
     }
     if (t.scale - 1.0).abs() < 1e-4 && t.degrees.abs() < 1e-2 && !t.flip_h && !t.flip_v {
@@ -7917,7 +8308,10 @@ fn tform_button(doc: &mut Document, t: &mut TformPress, op: TformOp) -> XformApp
         }
         return XformApply::Restored;
     }
-    doc.checkpoint();
+    if !live || !t.checkpointed {
+        doc.checkpoint();
+        t.checkpointed = true;
+    }
     // Swap the pristine base in (offsets included), apply the flips as
     // exact permutations, then the scale/rotation resample over it.
     let (w, h) = (doc.w as usize, doc.h as usize);
@@ -7948,6 +8342,28 @@ fn tform_button(doc: &mut Document, t: &mut TformPress, op: TformOp) -> XformApp
         b.rev = doc.revision();
     }
     XformApply::Applied
+}
+
+/// One discrete press: its own undo step, gesture closed afterwards.
+fn tform_button(doc: &mut Document, t: &mut TformPress, op: TformOp) -> XformApply {
+    let result = tform_apply(doc, t, op, false);
+    t.end_gesture();
+    result
+}
+
+/// Status line describing the session transform, e.g. `125%, 15 deg`.
+fn tform_status(t: &TformPress) -> String {
+    let mut parts = vec![format!("{:.0}%", t.scale * 100.0)];
+    if t.degrees.abs() >= 0.5 {
+        parts.push(format!("{:.0} deg", t.degrees));
+    }
+    if t.flip_h {
+        parts.push("flip H".to_string());
+    }
+    if t.flip_v {
+        parts.push("flip V".to_string());
+    }
+    format!("Layer transform: {}.", parts.join(", "))
 }
 
 /// Per-point stabilizer coefficient for an `n`-point input trail: applying
@@ -10137,7 +10553,9 @@ impl eframe::App for ProCraftApp {
                             let (x, y) = to_canvas(pos);
                             if self.xform.grab.is_some() {
                                 let (dx, dy) = (x - self.xform.grab_at.0, y - self.xform.grab_at.1);
-                                self.xform.drag_by(dx, dy);
+                                let (shift, alt) =
+                                    ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
+                                self.xform.drag_by_mod(dx, dy, shift, alt);
                                 if !self.text_paint_blocked()
                                     && xform_preview(&mut self.doc, &mut self.xform)
                                         == XformApply::Skipped
@@ -11666,6 +12084,13 @@ mod tests {
         let mut d = a.clone();
         d.shortcuts.bindings.insert("undo".into(), None);
         assert!(settings_differ(&a, &d));
+        // Strip state persists immediately like the other discrete edits.
+        let mut e = a.clone();
+        e.strip_collapsed = true;
+        assert!(settings_differ(&a, &e));
+        let mut f = a.clone();
+        f.strip_dock = "left".into();
+        assert!(settings_differ(&a, &f));
     }
 
     #[test]
@@ -11976,6 +12401,36 @@ mod tests {
     }
 
     #[test]
+    fn pocket_strip_docks_to_three_thumb_positions() {
+        for dock in [StripDock::Left, StripDock::Center, StripDock::Right] {
+            assert_eq!(StripDock::from_str(dock.as_str()), dock);
+        }
+        assert_eq!(StripDock::from_str("somewhere"), StripDock::Center);
+
+        let (vp, pad, w) = (390.0, 12.0, 260.0);
+        assert_eq!(phone_strip_left(StripDock::Left, vp, pad, w), 12.0);
+        assert_eq!(phone_strip_left(StripDock::Center, vp, pad, w), 65.0);
+        assert_eq!(phone_strip_left(StripDock::Right, vp, pad, w), 118.0);
+        // A drag can never push the pill off either edge.
+        assert_eq!(phone_strip_left_clamped(-50.0, vp, pad, w), 12.0);
+        assert_eq!(phone_strip_left_clamped(500.0, vp, pad, w), 118.0);
+
+        // Release snaps to the nearest docked centre.
+        assert_eq!(phone_strip_dock(12.0, vp, pad, w), StripDock::Left);
+        assert_eq!(phone_strip_dock(65.0, vp, pad, w), StripDock::Center);
+        assert_eq!(phone_strip_dock(118.0, vp, pad, w), StripDock::Right);
+        assert_eq!(phone_strip_dock(70.0, vp, pad, w), StripDock::Center);
+    }
+
+    #[test]
+    fn pocket_strip_shrinks_to_fit_narrow_phones() {
+        assert_eq!(phone_mini_strip_width(390.0, 12.0), 260.0);
+        assert_eq!(phone_mini_strip_width(320.0, 12.0), 260.0);
+        assert_eq!(phone_mini_strip_width(280.0, 12.0), 256.0);
+        assert_eq!(phone_mini_strip_width(150.0, 12.0), 180.0);
+    }
+
+    #[test]
     fn status_inset_clamps_wild_values() {
         assert_eq!(clamp_status_inset(0), 0.0);
         assert_eq!(clamp_status_inset(72), 72.0);
@@ -12251,11 +12706,11 @@ mod tests {
         let mut s = XformState::off();
         s.arm(XformMode::Distort, &doc);
         s.begin_grab(0, (0.0, 0.0));
-        s.drag_by(2.5, 3.5);
+        s.drag_by_mod(2.5, 3.5, false, false);
         assert_eq!(s.pins[0], (2.5, 3.5));
         // Every tick measures from the grab start, not the last tick:
         // relative dragging never accumulates pointer jitter.
-        s.drag_by(1.0, 1.0);
+        s.drag_by_mod(1.0, 1.0, false, false);
         assert_eq!(s.pins[0], (1.0, 1.0));
     }
 
@@ -12269,7 +12724,7 @@ mod tests {
         let before = s.grid.clone();
         let at = s.grid[4];
         s.begin_grab(4, at);
-        s.drag_by(0.0, 0.0);
+        s.drag_by_mod(0.0, 0.0, false, false);
         assert_eq!(s.grid, before);
         assert_eq!(s.grid.as_slice(), s.grab_from.as_slice());
     }
@@ -12281,7 +12736,7 @@ mod tests {
         s.arm(XformMode::Distort, &doc);
         let before = s.pins.clone();
         s.begin_grab(1, before[1]);
-        s.drag_by(5.0, 5.0);
+        s.drag_by_mod(5.0, 5.0, false, false);
         assert_ne!(s.pins, before);
         s.cancel_grab();
         assert_eq!(s.pins, before);
@@ -12297,7 +12752,7 @@ mod tests {
         s.arm(XformMode::Mesh, &doc);
         let at = s.grid[4];
         s.begin_grab(4, at);
-        s.drag_by(3.0, 0.0);
+        s.drag_by_mod(3.0, 0.0, false, false);
         assert_eq!(s.grid[4], (at.0 + 3.0, at.1));
         s.arm(XformMode::Distort, &doc);
         assert_eq!(s.grid[4], at);
@@ -12314,7 +12769,7 @@ mod tests {
         s.arm(XformMode::Skew, &doc);
         let before = s.pins.clone();
         s.begin_grab(0, before[0]);
-        s.drag_by(4.0, 1.0);
+        s.drag_by_mod(4.0, 1.0, false, false);
         assert_eq!(s.skew_lock, Some(true));
         assert_eq!(s.pins[0], (before[0].0 + 4.0, before[0].1));
         assert_eq!(s.pins[1], (before[1].0 + 4.0, before[1].1));
@@ -12323,7 +12778,7 @@ mod tests {
         // A vertical second gesture slides the column instead.
         let mid = s.pins.clone();
         s.begin_grab(1, mid[1]);
-        s.drag_by(1.0, 5.0);
+        s.drag_by_mod(1.0, 5.0, false, false);
         assert_eq!(s.skew_lock, Some(false));
         assert_eq!(s.pins[1], (mid[1].0, mid[1].1 + 5.0));
         assert_eq!(s.pins[3], (mid[3].0, mid[3].1 + 5.0));
@@ -12338,7 +12793,7 @@ mod tests {
         s.arm(XformMode::Perspective, &doc);
         let before = s.pins.clone();
         s.begin_grab(0, before[0]);
-        s.drag_by(3.0, 2.0);
+        s.drag_by_mod(3.0, 2.0, false, false);
         assert_eq!(s.pins[0], (before[0].0 + 3.0, before[0].1 + 2.0));
         assert_eq!(s.pins[1], (before[1].0 - 3.0, before[1].1 + 2.0));
         assert_eq!(s.pins[2], before[2]);
@@ -12346,7 +12801,7 @@ mod tests {
         // Squeezing past the minimum width clamps instead of inverting.
         let at = s.pins[0];
         s.begin_grab(0, at);
-        s.drag_by(100.0, 0.0);
+        s.drag_by_mod(100.0, 0.0, false, false);
         assert!(s.pins[1].0 - s.pins[0].0 >= 4.0 - 1e-3);
     }
 
@@ -12359,7 +12814,7 @@ mod tests {
         assert!(s.point_in_frame((7.0, 7.0)));
         assert!(!s.point_in_frame((0.2, 0.2)));
         s.begin_all((7.0, 7.0));
-        s.drag_by(-2.0, 3.0);
+        s.drag_by_mod(-2.0, 3.0, false, false);
         for (p, f) in s.pins.iter().zip(before.iter()) {
             assert_eq!(*p, (f.0 - 2.0, f.1 + 3.0));
         }
@@ -12373,7 +12828,7 @@ mod tests {
         let before = s.pins.clone();
         let at = before[0];
         s.begin_grab(0, at);
-        s.drag_by(-3.0, -3.0);
+        s.drag_by_mod(-3.0, -3.0, false, false);
         // Corner 0 walks to the pointer; corner 2 anchors the gesture.
         assert_eq!(s.pins[0], (-3.0, -3.0));
         assert_eq!(s.pins[2], before[2]);
@@ -12382,7 +12837,7 @@ mod tests {
         // Dragging onto the anchor clamps to a 4px box, never a line.
         let at = s.pins[0];
         s.begin_grab(0, at);
-        s.drag_by(18.0, 18.0);
+        s.drag_by_mod(18.0, 18.0, false, false);
         assert_eq!(s.pins[1].0 - s.pins[0].0, 4.0);
         assert_eq!(s.pins[3].1 - s.pins[0].1, 4.0);
     }
@@ -12395,7 +12850,7 @@ mod tests {
         let before = s.pins.clone();
         let c = xform_points_center(&before);
         s.begin_rotate((c.0, c.1 - 10.0));
-        s.drag_by(10.0, 10.0);
+        s.drag_by_mod(10.0, 10.0, false, false);
         let after = xform_points_center(&s.pins);
         assert!((after.0 - c.0).abs() < 1e-3 && (after.1 - c.1).abs() < 1e-3);
         // Quarter turn: TL lands on TR's old spot, distance preserved.
@@ -12406,6 +12861,86 @@ mod tests {
         assert!((d0 - d1).abs() < 1e-3);
         assert!(s.rotate_handle(1.0).is_some());
         assert!(!s.point_in_frame(s.rotate_handle(1.0).unwrap()));
+    }
+
+    #[test]
+    fn xform_free_move_shift_locks_the_dominant_axis() {
+        let doc = xform_test_doc16();
+        let mut s = XformState::off();
+        s.arm(XformMode::Free, &doc);
+        let before = s.pins.clone();
+        s.begin_all((7.0, 7.0));
+        s.drag_by_mod(6.0, 2.0, true, false);
+        for (p, f) in s.pins.iter().zip(before.iter()) {
+            assert_eq!(*p, (f.0 + 6.0, f.1));
+        }
+        let mid = s.pins.clone();
+        s.begin_all((7.0, 7.0));
+        s.drag_by_mod(1.0, -4.0, true, false);
+        for (p, f) in s.pins.iter().zip(mid.iter()) {
+            assert_eq!(*p, (f.0, f.1 - 4.0));
+        }
+    }
+
+    #[test]
+    fn xform_free_corner_shift_locks_the_aspect_ratio() {
+        let doc = Document::new(16, 16);
+        let mut s = XformState::off();
+        s.arm(XformMode::Free, &doc);
+        let before = s.pins.clone();
+        s.begin_grab(0, before[0]);
+        s.drag_by_mod(-3.0, -6.0, true, false);
+        let (w0, h0) = frame_extents(&before);
+        let (w1, h1) = frame_extents(&s.pins);
+        assert!(
+            (w1 / h1 - w0 / h0).abs() < 1e-4,
+            "aspect drifted: {} vs {w0}/{h0} -> {w1}/{h1}",
+            w1 / h1
+        );
+        // The opposite corner still anchors the gesture.
+        assert_eq!(s.pins[2], before[2]);
+    }
+
+    #[test]
+    fn xform_free_corner_alt_anchors_at_the_center() {
+        let doc = Document::new(16, 16);
+        let mut s = XformState::off();
+        s.arm(XformMode::Free, &doc);
+        let before = s.pins.clone();
+        let c = xform_points_center(&before);
+        s.begin_grab(0, before[0]);
+        s.drag_by_mod(3.0, 3.0, false, true);
+        // Growth is symmetric about the center: the opposite corner
+        // travels as far as the dragged one, and the center never moves.
+        assert!((s.pins[0].0 - (before[0].0 + 3.0)).abs() < 1e-4);
+        assert!((s.pins[0].1 - (before[0].1 + 3.0)).abs() < 1e-4);
+        assert!((s.pins[2].0 - (before[2].0 - 3.0)).abs() < 1e-4);
+        assert!((s.pins[2].1 - (before[2].1 - 3.0)).abs() < 1e-4);
+        let c1 = xform_points_center(&s.pins);
+        assert!((c1.0 - c.0).abs() < 1e-4 && (c1.1 - c.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn xform_free_rotate_shift_snaps_to_fifteen_degrees() {
+        assert_eq!(snap_angle(7.4), 0.0);
+        assert_eq!(snap_angle(7.6), 15.0);
+        assert_eq!(snap_angle(-7.0), 0.0);
+        assert_eq!(snap_angle(-8.0), -15.0);
+        assert_eq!(snap_angle(52.0), 45.0);
+
+        let doc = Document::new(16, 16);
+        let mut s = XformState::off();
+        s.arm(XformMode::Free, &doc);
+        let c = xform_points_center(&s.pins);
+        // Pointer 10 px above the center, dragged 10 right / 3 down:
+        // a 55° turn, snapped to 60°.
+        s.begin_rotate((c.0, c.1 - 10.0));
+        s.drag_by_mod(10.0, 3.0, true, false);
+        let v = (s.pins[0].0 - c.0, s.pins[0].1 - c.1);
+        let deg = v.1.atan2(v.0).to_degrees();
+        assert!((deg - -75.0).abs() < 1e-3, "corner angle was {deg}");
+        assert_eq!(constrain_axis(6.0, 2.0), (6.0, 0.0));
+        assert_eq!(constrain_axis(1.0, -4.0), (0.0, -4.0));
     }
 
     #[test]
@@ -12502,7 +13037,7 @@ mod tests {
         s.prepare_pin_drag(4, false);
         s.begin_selected((0.0, 0.0));
         assert_eq!(s.grab, Some(Grab::Selected));
-        s.drag_by(2.0, -1.0);
+        s.drag_by_mod(2.0, -1.0, false, false);
         assert_eq!(s.pins[4], (9.0, 6.0));
         assert_eq!(s.pins[5], (11.0, 8.0));
         assert_eq!(s.pins[..4], frame[..]);
@@ -13206,6 +13741,105 @@ mod tests {
         );
         // The edit was baked into the re-captured base and survives.
         assert!(doc.layers[0].pixels.chunks(4).any(|p| p[1] > 0));
+    }
+
+    #[test]
+    fn tform_absolute_scale_sets_the_session_instead_of_compounding() {
+        let mut a = tform_doc();
+        let mut b = tform_doc();
+        let mut ta = TformPress::new();
+        let mut tb = TformPress::new();
+        tform_button(&mut a, &mut ta, TformOp::SetScale(150.0));
+        tform_button(&mut a, &mut ta, TformOp::SetScale(200.0));
+        tform_button(&mut b, &mut tb, TformOp::SetScale(200.0));
+        assert_eq!(ta.scale, 2.0);
+        assert_eq!(a.layers[0].pixels, b.layers[0].pixels);
+    }
+
+    #[test]
+    fn tform_absolute_scale_and_angle_clamp_to_the_slider_range() {
+        let mut doc = tform_doc();
+        let mut t = TformPress::new();
+        tform_button(&mut doc, &mut t, TformOp::SetScale(9999.0));
+        assert_eq!(t.scale, TFORM_SCALE_MAX);
+        tform_button(&mut doc, &mut t, TformOp::SetScale(1.0));
+        assert_eq!(t.scale, TFORM_SCALE_MIN);
+        assert!((wrap_degrees(370.0) - 10.0).abs() < 1e-4);
+        assert!((wrap_degrees(-370.0) + 10.0).abs() < 1e-4);
+        assert_eq!(wrap_degrees(180.0), 180.0);
+        assert_eq!(wrap_degrees(-180.0), 180.0);
+        assert!((wrap_degrees(540.0) - 180.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn tform_live_drag_frames_share_one_undo_step() {
+        let mut doc = tform_doc();
+        let pristine = doc.layers[0].pixels.clone();
+        let mut t = TformPress::new();
+        for pct in [102.0, 110.0, 125.0, 140.0] {
+            assert_eq!(
+                tform_apply(&mut doc, &mut t, TformOp::SetScale(pct), true),
+                XformApply::Applied
+            );
+        }
+        assert!(doc.undo());
+        assert_eq!(doc.layers[0].pixels, pristine);
+    }
+
+    #[test]
+    fn tform_discrete_press_after_live_drag_opens_a_new_step() {
+        let mut doc = tform_doc();
+        let mut t = TformPress::new();
+        tform_apply(&mut doc, &mut t, TformOp::SetScale(150.0), true);
+        tform_apply(&mut doc, &mut t, TformOp::SetScale(160.0), true);
+        let mid = doc.layers[0].pixels.clone();
+        t.end_gesture();
+        tform_button(&mut doc, &mut t, TformOp::SetRotation(20.0));
+        assert!(doc.undo());
+        assert_eq!(doc.layers[0].pixels, mid);
+    }
+
+    #[test]
+    fn tform_reset_returns_to_the_session_base() {
+        let mut doc = tform_doc();
+        let pristine = doc.layers[0].pixels.clone();
+        let mut t = TformPress::new();
+        tform_button(&mut doc, &mut t, TformOp::FlipH);
+        tform_button(&mut doc, &mut t, TformOp::SetRotation(30.0));
+        assert_eq!(
+            tform_button(&mut doc, &mut t, TformOp::Reset),
+            XformApply::Restored
+        );
+        assert_eq!(doc.layers[0].pixels, pristine);
+        assert_eq!(
+            (t.scale, t.degrees, t.flip_h, t.flip_v),
+            (1.0, 0.0, false, false)
+        );
+    }
+
+    #[test]
+    fn tform_refresh_resets_a_stale_session_for_the_panel_readout() {
+        let mut doc = tform_doc();
+        let mut t = TformPress::new();
+        tform_button(&mut doc, &mut t, TformOp::SetScale(200.0));
+        assert_eq!(t.scale, 2.0);
+        // Painting behind the session's back invalidates it; the panel
+        // must read 100% again, not a transform that no longer applies.
+        doc.layers[0].pixels[0] = 10;
+        doc.mark_full_dirty();
+        tform_refresh(&doc, &mut t);
+        assert_eq!((t.scale, t.degrees), (1.0, 0.0));
+        assert!(!t.flip_h && !t.flip_v && !t.checkpointed);
+    }
+
+    #[test]
+    fn tform_status_names_scale_angle_and_flips() {
+        let mut t = TformPress::new();
+        assert_eq!(tform_status(&t), "Layer transform: 100%.");
+        t.scale = 1.25;
+        t.degrees = 15.0;
+        t.flip_h = true;
+        assert_eq!(tform_status(&t), "Layer transform: 125%, 15 deg, flip H.");
     }
 
     #[test]

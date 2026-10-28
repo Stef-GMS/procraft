@@ -237,6 +237,8 @@ pub(crate) enum Icon {
     Moon,
     Sun,
     Paper,
+    ChevronUp,
+    ChevronDown,
 }
 
 /// What a pill shows and how it behaves.
@@ -333,6 +335,8 @@ pub(crate) fn icon_button(ui: &mut egui::Ui, t: &Tokens, icon: Icon, size: f32) 
         Icon::Undo => "Undo",
         Icon::Redo => "Redo",
         Icon::Moon | Icon::Sun | Icon::Paper => "Theme",
+        Icon::ChevronUp => "Expand",
+        Icon::ChevronDown => "Collapse",
     };
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
     response
@@ -407,7 +411,27 @@ pub(crate) fn paint_icon(
                 );
             }
         }
+        Icon::ChevronDown | Icon::ChevronUp => {
+            painter.add(egui::Shape::line(
+                chevron_geometry(rect, icon == Icon::ChevronUp),
+                stroke,
+            ));
+        }
     }
+}
+
+/// Three points of a chevron wide enough for a fingertip and small enough
+/// to read as a disclosure control at 26 pt.
+fn chevron_geometry(rect: egui::Rect, up: bool) -> Vec<egui::Pos2> {
+    let s = rect.width().min(rect.height());
+    let (w, h) = (s * 0.30, s * 0.15);
+    let dir = if up { -1.0 } else { 1.0 };
+    let c = rect.center();
+    vec![
+        egui::pos2(c.x - w * 0.5, c.y - dir * h * 0.5),
+        egui::pos2(c.x, c.y + dir * h * 0.5),
+        egui::pos2(c.x + w * 0.5, c.y - dir * h * 0.5),
+    ]
 }
 
 /// Arc points (screen space, y down) plus the tangent the head points along:
@@ -883,6 +907,26 @@ mod tests {
                         "size {size} mirror {mirror}: {p:?} escapes {rect:?}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn chevrons_stay_inside_their_button_and_point_both_ways() {
+        for size in [26.0f32, 44.0, 56.0] {
+            let rect = egui::Rect::from_center_size(egui::pos2(50.0, 50.0), egui::vec2(size, size));
+            for up in [false, true] {
+                let pts = chevron_geometry(rect, up);
+                for p in &pts {
+                    assert!(rect.contains(*p), "size {size} up {up}: {p:?} escapes");
+                }
+                let tip = pts[1];
+                let wings = (pts[0].y + pts[2].y) * 0.5;
+                assert_eq!(pts[0].y, pts[2].y);
+                assert!(
+                    if up { tip.y < wings } else { tip.y > wings },
+                    "size {size} up {up}: tip {tip:?} wings {wings}"
+                );
             }
         }
     }

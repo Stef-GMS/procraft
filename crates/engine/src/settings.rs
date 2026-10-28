@@ -28,6 +28,10 @@ pub struct Settings {
     pub recent: Vec<String>,
     /// Sparse shortcut overrides (only non-default entries).
     pub shortcuts: StoredShortcuts,
+    /// Phone strip: collapsed to its pocket pill, and which bottom third it
+    /// docks to ("left", "center", "right").
+    pub strip_collapsed: bool,
+    pub strip_dock: String,
 }
 
 impl Default for Settings {
@@ -40,6 +44,8 @@ impl Default for Settings {
             zoom: 1.0,
             recent: Vec::new(),
             shortcuts: StoredShortcuts::default(),
+            strip_collapsed: false,
+            strip_dock: "center".into(),
         }
     }
 }
@@ -73,6 +79,8 @@ mod tests {
             s.shortcuts,
             crate::shortcuts::Shortcuts::default().to_stored()
         );
+        assert!(!s.strip_collapsed);
+        assert_eq!(s.strip_dock, "center");
     }
 
     #[test]
@@ -82,6 +90,8 @@ mod tests {
             show_tools: false,
             zoom: 2.5,
             recent: vec!["a.procraft".into(), "b.procraft".into()],
+            strip_collapsed: true,
+            strip_dock: "left".into(),
             ..Settings::default()
         };
         let s2 = Settings::from_json(&s.to_json_pretty()).unwrap();

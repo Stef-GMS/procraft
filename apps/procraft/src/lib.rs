@@ -187,6 +187,17 @@ fn tool_label(tool: Tool, symbols: bool) -> &'static str {
     }
 }
 
+/// Compact glyph for the phone strip's paint-tool segment. The strip only
+/// has room for icons if the drawers are to stay visible.
+fn tool_glyph(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Brush => "✏",
+        Tool::Eraser => "⌫",
+        Tool::Smudge => "💧",
+        _ => "•",
+    }
+}
+
 /// One control in the context-sensitive bar under the top bar. The bar is
 /// driven by this list so every tool's quick options live in one place.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2171,6 +2182,52 @@ impl ProCraftApp {
         .clicked()
     }
 
+    /// Current paint colour as a tappable dot. On mobile it doubles as the
+    /// Tools entry point: it opens that drawer scrolled to the Color card.
+    fn color_dot(&mut self, ui: &mut egui::Ui, t: &design::Tokens) {
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(t.control_h, t.control_h), egui::Sense::click());
+        let dot_r = t.control_h * 0.5 - 8.0;
+        ui.painter().circle_filled(
+            rect.center(),
+            dot_r,
+            egui::Color32::from_rgb(self.color[0], self.color[1], self.color[2]),
+        );
+        ui.painter()
+            .circle_stroke(rect.center(), dot_r, egui::Stroke::new(1.0, t.stroke));
+        if resp.on_hover_text("Color").clicked() {
+            self.drawer = MobileDrawer::Tools;
+            self.show_tools = true;
+            self.show_layers = false;
+            self.mobile_scroll_color = true;
+        }
+    }
+
+    /// A pill that shows selection state (the phone strip's paint tools).
+    fn toggle_pill(&self, ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
+        let t = self.tokens(ui);
+        design::pill_button(
+            ui,
+            &t,
+            design::PillSpec {
+                glyph: None,
+                label: Some(label),
+                selected,
+                enabled: true,
+            },
+        )
+        .clicked()
+    }
+
+    /// Tool switch that also retires a live fill preview, mirroring the
+    /// tool radio list in the Tools panel.
+    fn choose_tool(&mut self, tool: Tool) {
+        if self.tool == Tool::Fill && tool != Tool::Fill {
+            self.fill_preview = None;
+        }
+        self.tool = tool;
+    }
+
     /// Clear the active layer as one undoable step. Shared by the desktop
     /// top bar and the mobile actions cluster.
     fn clear_layer(&mut self) {
@@ -3148,6 +3205,49 @@ impl ProCraftApp {
     }
 
     /// Layers panel body shared by the desktop dock and the mobile drawer.
+    /// Add/duplicate/merge/rasterize row, shared by the dock and the mobile
+    /// drawer (which wraps it instead of clipping at the drawer edge).
+    fn layer_action_row(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Add layer").clicked() {
+            self.ghost_dirty = true;
+            self.doc
+                .add_layer(format!("Layer {}", self.doc.layers.len() + 1));
+        }
+        if ui.button("Duplicate").clicked() {
+            let active = self.doc.active;
+            self.ghost_dirty = true;
+            self.doc.duplicate_layer(active);
+            self.status = "Layer duplicated.".to_string();
+        }
+        let can_merge = self.doc.active > 0 && self.doc.layers.len() > 1;
+        if ui
+            .add_enabled(can_merge, egui::Button::new("Merge down"))
+            .clicked()
+        {
+            let active = self.doc.active;
+            if self.doc.merge_down(active) {
+                self.ghost_dirty = true;
+                self.status = "Merged down.".to_string();
+            }
+        }
+        let can_raster = self
+            .doc
+            .layers
+            .get(self.doc.active)
+            .is_some_and(|l| l.is_text());
+        if ui
+            .add_enabled(can_raster, egui::Button::new("Rasterize"))
+            .clicked()
+        {
+            let active = self.doc.active;
+            self.doc.checkpoint();
+            if self.doc.rasterize_text_layer(active) {
+                self.ghost_dirty = true;
+                self.status = "Text rasterized.".to_string();
+            }
+        }
+    }
+
     fn layers_panel_body(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let t = self.tokens(ui);
@@ -3163,46 +3263,13 @@ impl ProCraftApp {
                     }
                 },
                 |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("Add layer").clicked() {
-                            self.ghost_dirty = true;
-                            self.doc
-                                .add_layer(format!("Layer {}", self.doc.layers.len() + 1));
-                        }
-                        if ui.button("Duplicate").clicked() {
-                            let active = self.doc.active;
-                            self.ghost_dirty = true;
-                            self.doc.duplicate_layer(active);
-                            self.status = "Layer duplicated.".to_string();
-                        }
-                        let can_merge = self.doc.active > 0 && self.doc.layers.len() > 1;
-                        if ui
-                            .add_enabled(can_merge, egui::Button::new("Merge down"))
-                            .clicked()
-                        {
-                            let active = self.doc.active;
-                            if self.doc.merge_down(active) {
-                                self.ghost_dirty = true;
-                                self.status = "Merged down.".to_string();
-                            }
-                        }
-                        let can_raster = self
-                            .doc
-                            .layers
-                            .get(self.doc.active)
-                            .is_some_and(|l| l.is_text());
-                        if ui
-                            .add_enabled(can_raster, egui::Button::new("Rasterize"))
-                            .clicked()
-                        {
-                            let active = self.doc.active;
-                            self.doc.checkpoint();
-                            if self.doc.rasterize_text_layer(active) {
-                                self.ghost_dirty = true;
-                                self.status = "Text rasterized.".to_string();
-                            }
-                        }
-                    });
+                    // Overlay drawers are narrower than the dock, so the
+                    // action row wraps there; the dock keeps one line.
+                    if mobile_shell() {
+                        ui.horizontal_wrapped(|ui| self.layer_action_row(ui));
+                    } else {
+                        ui.horizontal(|ui| self.layer_action_row(ui));
+                    }
                     if ui.button("New group").clicked() {
                         let name = format!("Group {}", self.doc.groups.len() + 1);
                         self.doc.new_group(name.clone());
@@ -4698,17 +4765,8 @@ impl ProCraftApp {
                 0.0
             }
         };
-        let safe_bottom = {
-            #[cfg(target_os = "ios")]
-            {
-                let (_, bottom) = rfd::ios_safe_area_insets().unwrap_or((0, 0));
-                clamp_status_inset(bottom)
-            }
-            #[cfg(not(target_os = "ios"))]
-            {
-                0.0
-            }
-        };
+        let safe_bottom = safe_bottom(true);
+        let phone = class == BarLayout::Narrow;
         // Floating islands sit slightly translucent over the canvas and use
         // fully rounded ends so they read as capsules, not panels.
         let island_fill =
@@ -4730,13 +4788,19 @@ impl ProCraftApp {
                 .inner_margin(egui::Margin::from(egui::vec2(6.0, 6.0)))
         };
         let island_h = mobile_island_height(t.control_h);
+        let strip_h = island_h;
         let hit = quick_hit_height(class);
         let capsule_visible = !quick_controls(self.tool).is_empty();
+        let capsule_offset = if phone {
+            phone_capsule_offset(safe_bottom, pad, strip_h, t.gap)
+        } else {
+            -(safe_bottom + pad)
+        };
 
         if capsule_visible {
             egui::Area::new(egui::Id::new("mobile-options"))
                 .order(egui::Order::Middle)
-                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -(safe_bottom + pad)])
+                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, capsule_offset])
                 .show(ctx, |ui| {
                     ui.set_max_width(mobile_capsule_width(vp.width()));
                     ui.spacing_mut().interact_size.y = hit;
@@ -4766,121 +4830,240 @@ impl ProCraftApp {
                 });
         }
 
-        egui::Area::new(egui::Id::new("mobile-top-left"))
-            .order(egui::Order::Foreground)
-            .anchor(egui::Align2::LEFT_TOP, [pad, safe_top + pad])
-            .show(ctx, |ui| {
-                island_frame().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
-                        if self.pill(ui, "Gallery") {
-                            self.gallery_open = !self.gallery_open;
-                        }
-                        egui::containers::menu::MenuButton::new("File")
-                            .config(
-                                egui::containers::menu::MenuConfig::new()
-                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
-                            )
-                            .ui(ui, |ui| {
-                                ui.spacing_mut().interact_size.y = t.control_h;
-                                self.file_menu_ui(ui, class, &t);
-                            });
-                        if self.pill(ui, "Reference") {
-                            self.ref_open = !self.ref_open;
-                        }
-                        if self.pill(ui, "Clear") {
-                            self.clear_layer();
-                        }
+        if !phone {
+            egui::Area::new(egui::Id::new("mobile-top-left"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::LEFT_TOP, [pad, safe_top + pad])
+                .show(ctx, |ui| {
+                    island_frame().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
+                            if self.pill(ui, "Gallery") {
+                                self.gallery_open = !self.gallery_open;
+                            }
+                            egui::containers::menu::MenuButton::new("File")
+                                .config(
+                                    egui::containers::menu::MenuConfig::new().close_behavior(
+                                        egui::PopupCloseBehavior::CloseOnClickOutside,
+                                    ),
+                                )
+                                .ui(ui, |ui| {
+                                    ui.spacing_mut().interact_size.y = t.control_h;
+                                    self.file_menu_ui(ui, class, &t);
+                                });
+                            if self.pill(ui, "Reference") {
+                                self.ref_open = !self.ref_open;
+                            }
+                            if self.pill(ui, "Clear") {
+                                self.clear_layer();
+                            }
+                        });
                     });
                 });
-            });
 
-        egui::Area::new(egui::Id::new("mobile-top-right"))
-            .order(egui::Order::Foreground)
-            .anchor(egui::Align2::RIGHT_TOP, [-pad, safe_top + pad])
-            .show(ctx, |ui| {
-                island_frame().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
-                        if ui
-                            .add_sized([t.control_h, t.control_h], egui::Button::new("↶"))
-                            .on_hover_text("Undo")
-                            .clicked()
-                            && self.doc.undo()
-                        {
-                            self.status = "Undone.".to_string();
-                        }
-                        if ui
-                            .add_sized([t.control_h, t.control_h], egui::Button::new("↷"))
-                            .on_hover_text("Redo")
-                            .clicked()
-                            && self.doc.redo()
-                        {
-                            self.status = "Redone.".to_string();
-                        }
-                        if self.pill(ui, "Tools") {
-                            self.drawer = self.drawer.toggled(MobileDrawer::Tools);
-                            self.show_tools = self.drawer == MobileDrawer::Tools;
-                            if self.drawer == MobileDrawer::Tools {
-                                self.show_layers = false;
+            egui::Area::new(egui::Id::new("mobile-top-right"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::RIGHT_TOP, [-pad, safe_top + pad])
+                .show(ctx, |ui| {
+                    island_frame().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
+                            if ui
+                                .add_sized([t.control_h, t.control_h], egui::Button::new("↶"))
+                                .on_hover_text("Undo")
+                                .clicked()
+                                && self.doc.undo()
+                            {
+                                self.status = "Undone.".to_string();
                             }
-                        }
-                        if self.pill(ui, "Layers") {
-                            self.drawer = self.drawer.toggled(MobileDrawer::Layers);
-                            self.show_layers = self.drawer == MobileDrawer::Layers;
-                            if self.drawer == MobileDrawer::Layers {
-                                self.show_tools = false;
+                            if ui
+                                .add_sized([t.control_h, t.control_h], egui::Button::new("↷"))
+                                .on_hover_text("Redo")
+                                .clicked()
+                                && self.doc.redo()
+                            {
+                                self.status = "Redone.".to_string();
                             }
-                        }
-                        let (dot_rect, dot_resp) = ui.allocate_exact_size(
-                            egui::vec2(t.control_h, t.control_h),
-                            egui::Sense::click(),
-                        );
-                        let dot_r = t.control_h * 0.5 - 8.0;
-                        ui.painter().circle_filled(
-                            dot_rect.center(),
-                            dot_r,
-                            egui::Color32::from_rgb(self.color[0], self.color[1], self.color[2]),
-                        );
-                        ui.painter().circle_stroke(
-                            dot_rect.center(),
-                            dot_r,
-                            egui::Stroke::new(1.0, t.stroke),
-                        );
-                        if dot_resp.on_hover_text("Color").clicked() {
-                            self.drawer = MobileDrawer::Tools;
-                            self.show_tools = true;
-                            self.show_layers = false;
-                            self.mobile_scroll_color = true;
-                        }
-                        if design::theme_toggle(ui, &t, &mut self.theme) {
-                            self.status = format!("{} theme.", self.theme.name());
-                        }
-                        egui::containers::menu::MenuButton::new("View")
-                            .config(
-                                egui::containers::menu::MenuConfig::new()
-                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                            if self.pill(ui, "Tools") {
+                                self.drawer = self.drawer.toggled(MobileDrawer::Tools);
+                                self.show_tools = self.drawer == MobileDrawer::Tools;
+                                if self.drawer == MobileDrawer::Tools {
+                                    self.show_layers = false;
+                                }
+                            }
+                            if self.pill(ui, "Layers") {
+                                self.drawer = self.drawer.toggled(MobileDrawer::Layers);
+                                self.show_layers = self.drawer == MobileDrawer::Layers;
+                                if self.drawer == MobileDrawer::Layers {
+                                    self.show_tools = false;
+                                }
+                            }
+                            self.color_dot(ui, &t);
+                            if design::theme_toggle(ui, &t, &mut self.theme) {
+                                self.status = format!("{} theme.", self.theme.name());
+                            }
+                            egui::containers::menu::MenuButton::new("View")
+                                .config(
+                                    egui::containers::menu::MenuConfig::new().close_behavior(
+                                        egui::PopupCloseBehavior::CloseOnClickOutside,
+                                    ),
+                                )
+                                .ui(ui, |ui| {
+                                    ui.spacing_mut().interact_size.y = t.control_h;
+                                    self.view_controls(ui, true);
+                                });
+                        });
+                    });
+                });
+        }
+
+        if phone {
+            // Phones trade the two top islands for one thumb-reachable strip.
+            let strip_w = vp.width() - 2.0 * pad;
+            egui::Area::new(egui::Id::new("mobile-strip"))
+                .order(egui::Order::Foreground)
+                .anchor(
+                    egui::Align2::CENTER_BOTTOM,
+                    [0.0, phone_strip_offset(safe_bottom, pad)],
+                )
+                .show(ctx, |ui| {
+                    ui.set_width(strip_w);
+                    ui.spacing_mut().interact_size.y = hit;
+                    // A widget covering the whole island keeps touches on its
+                    // gaps from reaching the canvas; buttons added after it
+                    // still win inside their own rects.
+                    let block =
+                        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(strip_w, strip_h));
+                    ui.interact(
+                        block,
+                        egui::Id::new("mobile-strip-block"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    island_frame().show(ui, |ui| {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("mobile-strip-scroll")
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
                             )
-                            .ui(ui, |ui| {
-                                ui.spacing_mut().interact_size.y = t.control_h;
-                                self.view_controls(ui, true);
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
+                                    for tool in PHONE_STRIP_TOOLS {
+                                        if self.toggle_pill(ui, tool_glyph(tool), self.tool == tool)
+                                        {
+                                            self.choose_tool(tool);
+                                        }
+                                    }
+                                    ui.label(format!("{:.0}", self.brush.size));
+                                    ui.separator();
+                                    if self.pill(ui, "Tools") {
+                                        self.drawer = self.drawer.toggled(MobileDrawer::Tools);
+                                        self.show_tools = self.drawer == MobileDrawer::Tools;
+                                        if self.drawer == MobileDrawer::Tools {
+                                            self.show_layers = false;
+                                        }
+                                    }
+                                    if self.pill(ui, "Layers") {
+                                        self.drawer = self.drawer.toggled(MobileDrawer::Layers);
+                                        self.show_layers = self.drawer == MobileDrawer::Layers;
+                                        if self.drawer == MobileDrawer::Layers {
+                                            self.show_tools = false;
+                                        }
+                                    }
+                                    self.color_dot(ui, &t);
+                                    ui.separator();
+                                    if ui
+                                        .add_sized([hit, hit], egui::Button::new("↶"))
+                                        .on_hover_text("Undo")
+                                        .clicked()
+                                        && self.doc.undo()
+                                    {
+                                        self.status = "Undone.".to_string();
+                                    }
+                                    if ui
+                                        .add_sized([hit, hit], egui::Button::new("↷"))
+                                        .on_hover_text("Redo")
+                                        .clicked()
+                                        && self.doc.redo()
+                                    {
+                                        self.status = "Redone.".to_string();
+                                    }
+                                    if self.pill(ui, "Gallery") {
+                                        self.gallery_open = !self.gallery_open;
+                                    }
+                                    egui::containers::menu::MenuButton::new("File")
+                                        .config(
+                                            egui::containers::menu::MenuConfig::new()
+                                                .close_behavior(
+                                                    egui::PopupCloseBehavior::CloseOnClickOutside,
+                                                ),
+                                        )
+                                        .ui(ui, |ui| {
+                                            ui.spacing_mut().interact_size.y = t.control_h;
+                                            self.file_menu_ui(ui, class, &t);
+                                        });
+                                    if self.pill(ui, "Reference") {
+                                        self.ref_open = !self.ref_open;
+                                    }
+                                    egui::containers::menu::MenuButton::new("More")
+                                        .config(
+                                            egui::containers::menu::MenuConfig::new()
+                                                .close_behavior(
+                                                    egui::PopupCloseBehavior::CloseOnClickOutside,
+                                                ),
+                                        )
+                                        .ui(ui, |ui| {
+                                            ui.spacing_mut().interact_size.y = t.control_h;
+                                            if ui.button("Clear layer").clicked() {
+                                                self.clear_layer();
+                                                ui.close();
+                                            }
+                                            if ui
+                                                .button(format!("Theme: {}", self.theme.name()))
+                                                .clicked()
+                                            {
+                                                self.theme = design::next_theme(self.theme);
+                                                self.status =
+                                                    format!("{} theme.", self.theme.name());
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                            self.view_controls(ui, true);
+                                        });
+                                });
                             });
                     });
                 });
-            });
+        }
 
         if self.drawer != MobileDrawer::None {
             let tools = self.drawer == MobileDrawer::Tools;
-            let w = mobile_drawer_width(vp.width());
-            let (top, h) = mobile_drawer_span(
-                vp.bottom(),
-                safe_top,
-                safe_bottom,
-                pad,
-                island_h,
-                t.gap,
-                capsule_visible,
-            );
+            let w = if phone {
+                phone_drawer_width(vp.width())
+            } else {
+                mobile_drawer_width(vp.width())
+            };
+            let (top, h) = if phone {
+                let room = PhoneRoom {
+                    safe_top,
+                    safe_bottom,
+                    pad,
+                    strip_h,
+                    island_h,
+                    gap: t.gap,
+                };
+                phone_drawer_span(vp.bottom(), room, capsule_visible)
+            } else {
+                mobile_drawer_span(
+                    vp.bottom(),
+                    safe_top,
+                    safe_bottom,
+                    pad,
+                    island_h,
+                    t.gap,
+                    capsule_visible,
+                )
+            };
             let pos = if tools {
                 egui::pos2(vp.left() + pad, top)
             } else {
@@ -6100,6 +6283,72 @@ impl MobileDrawer {
 /// narrow enough to leave a visible strip of canvas and the scrim.
 fn mobile_drawer_width(viewport_w: f32) -> f32 {
     (viewport_w * 0.88).clamp(240.0, 360.0)
+}
+
+/// Phones give the drawer slightly more room: there is no top-left island
+/// to peek around.
+fn phone_drawer_width(viewport_w: f32) -> f32 {
+    (viewport_w * 0.92).clamp(240.0, 360.0)
+}
+
+/// Paint tools that stay one tap away in the phone strip.
+const PHONE_STRIP_TOOLS: [Tool; 3] = [Tool::Brush, Tool::Eraser, Tool::Smudge];
+
+/// Bottom safe inset in points. iOS reports the home indicator; Android
+/// hosts keep 0 until the platform bridge exposes one.
+fn safe_bottom(mobile: bool) -> f32 {
+    if !mobile {
+        return 0.0;
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let (_, bottom) = rfd::ios_safe_area_insets().unwrap_or((0, 0));
+        clamp_status_inset(bottom)
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        0.0
+    }
+}
+
+/// Y offset (negative, for a bottom anchor) of the phone strip.
+fn phone_strip_offset(safe_bottom: f32, pad: f32) -> f32 {
+    -(safe_bottom + pad)
+}
+
+/// Y offset (negative, for a bottom anchor) of the options capsule: above
+/// the strip and its gap on phones, directly above the inset elsewhere.
+fn phone_capsule_offset(safe_bottom: f32, pad: f32, strip_h: f32, gap: f32) -> f32 {
+    -(safe_bottom + pad + strip_h + gap)
+}
+
+/// Vertical room available on a phone: safe insets, edge padding, the strip
+/// and the floating-island height used by the capsule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PhoneRoom {
+    safe_top: f32,
+    safe_bottom: f32,
+    pad: f32,
+    strip_h: f32,
+    island_h: f32,
+    gap: f32,
+}
+
+/// Drawer window `(top, height)` on phones: no top island, bottom clamped
+/// above the strip (and the capsule when it is showing).
+fn phone_drawer_span(viewport_bottom: f32, room: PhoneRoom, has_capsule: bool) -> (f32, f32) {
+    let top = room.safe_top + room.pad;
+    let bottom = viewport_bottom
+        - room.safe_bottom
+        - room.pad
+        - room.strip_h
+        - room.gap
+        - if has_capsule {
+            room.island_h + room.gap
+        } else {
+            0.0
+        };
+    (top, (bottom - top).max(200.0))
 }
 
 /// Options capsule width: nearly the whole canvas on phones, capped so it
@@ -11420,6 +11669,45 @@ mod tests {
         assert_eq!(taller - h, 64.0);
         let (_, floor) = mobile_drawer_span(300.0, 100.0, 0.0, 12.0, 56.0, 8.0, true);
         assert_eq!(floor, 200.0);
+    }
+
+    #[test]
+    fn phone_drawer_is_wider_and_has_no_top_island() {
+        assert!((phone_drawer_width(390.0) - 358.8).abs() < 0.01);
+        assert_eq!(phone_drawer_width(844.0), 360.0);
+        assert_eq!(phone_drawer_width(240.0), 240.0);
+        let room = PhoneRoom {
+            safe_top: 24.0,
+            safe_bottom: 20.0,
+            pad: 12.0,
+            strip_h: 56.0,
+            island_h: 56.0,
+            gap: 8.0,
+        };
+        let (top, h) = phone_drawer_span(844.0, room, true);
+        assert_eq!(top, 36.0);
+        assert_eq!(h, 844.0 - 20.0 - 12.0 - 56.0 - 8.0 - 56.0 - 8.0 - top);
+        let (_, taller) = phone_drawer_span(844.0, room, false);
+        assert_eq!(taller - h, 64.0);
+        assert_eq!(phone_drawer_span(300.0, room, true).1, 200.0);
+    }
+
+    #[test]
+    fn phone_strip_sits_above_the_home_indicator() {
+        assert_eq!(safe_bottom(false), 0.0);
+        assert_eq!(phone_strip_offset(0.0, 12.0), -12.0);
+        assert_eq!(phone_strip_offset(34.0, 12.0), -46.0);
+        assert_eq!(phone_capsule_offset(34.0, 12.0, 56.0, 8.0), -110.0);
+        assert_eq!(phone_capsule_offset(0.0, 12.0, 56.0, 8.0), -76.0);
+    }
+
+    #[test]
+    fn phone_strip_offers_the_three_paint_tools() {
+        assert_eq!(PHONE_STRIP_TOOLS, [Tool::Brush, Tool::Eraser, Tool::Smudge]);
+        for tool in PHONE_STRIP_TOOLS {
+            assert!(!quick_controls(tool).is_empty());
+            assert_ne!(tool_glyph(tool), "");
+        }
     }
 
     #[test]

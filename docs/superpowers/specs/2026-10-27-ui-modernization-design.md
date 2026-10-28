@@ -395,14 +395,11 @@ thick_slider(ui, tokens, value: &mut f32, range: RangeInclusive<f32>,
   tooltip naming the next theme. The pill is icon-only at every width — no
   `Dark`/`Light`/`Paper` text variant.
 - Tapping cycles **Dark → Light → Paper → Dark**.
-- **Paper is also reachable from the combo.** The theme combo is inline
-  at `Wide` (`view_controls(ui, false, true)` at `lib.rs:5656`) and inside
-  the View menu at `Tablet`/`Narrow`. That split is preserved exactly: at
-  `Wide`, the toggle sits *beside* the existing inline combo; on touch it
-  sits outside the fold while the combo stays in the View menu. Nothing is
-  removed, so no theme is stranded and no menu contents change. The combo
-  speaks the same icon language: its face and its rows show `☾` / `☀` /
-  `🖹`, with the names in the row tooltips.
+- The toggle is the **only** theme control. The old theme combo — inline at
+  `Wide`, inside the View menu on touch — is removed, so the bar spends one
+  square pill on the theme instead of a pill plus a named dropdown, and no
+  second control repeats the same job. Every theme stays reachable through
+  the cycle.
 - The toggle is the only control explicitly kept out of the
   `Narrow`/`Tablet` View-menu fold, because it is one pill and is the whole
   point of this item.
@@ -517,10 +514,10 @@ device confirmation still needs the iPad and the Pixel.
    controls and 26 px for quick-bar rows (was 20 / 34 / 40). This makes
    touch bars taller by design; §8.10 forbids gaining rows instead.
 3. **The toggle cycles all three themes**, showing the current one as a
-   glyph (☾ / ☀ / 🖹) and never as text, with the tooltip naming the next;
-   Paper stays in the combo at every width — inline at `Wide`, in the View
-   menu on touch — and the combo uses the same three glyphs, so it never
-   becomes unreachable.
+   glyph (☾ / ☀ / 🖹) and never as text, with the tooltip naming the next.
+   It is the only theme control: the old combo (inline at `Wide`, in the
+   View menu on touch) is removed, so two controls never do the same job
+   and the bar keeps a single square pill for theme at every width.
 4. **`thick_slider` keeps its `−` / `+` steppers and hit-tests only the
    track**, so horizontal scrolling in the quick bar still works and no
    existing way to nudge a value disappears.

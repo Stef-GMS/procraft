@@ -614,16 +614,14 @@ let t = design::tokens(self.theme, layout);
 design::theme_toggle(ui, &t, &mut self.theme);
 ```
 
-Because `self.theme` is borrowed mutably, capture the result into a local and let the existing `theme_applied` check pick the change up on the next frame. Leave `view_controls`'s `include_theme` combo exactly where it is — at `Wide` the toggle and the inline combo coexist; on touch the combo stays in the View menu — but make its face and rows icon-only.
-
-In `theme_control`, replace `ui.spacing_mut().interact_size.y = 40.0` with the token value for the current class.
+Because `self.theme` is borrowed mutably, capture the result into a local and let the existing `theme_applied` check pick the change up on the next frame. Delete the old theme combo: drop `theme_control`, drop the `include_theme` parameter and its separator block from `view_controls`, and drop the `Tablet` call that rendered it beside the View menu. The pill is then the only theme control at every width, and the touch-height line that used to live in `theme_control` disappears with it.
 
 - [ ] **Step 6: Run the suite and check every width**
 
 Run: `cargo test -p procraft --lib 2>&1 | Select-String -Pattern 'test result|failures:'`
 Expected: `88 passed`.
 
-Expected by eye: at 1400 px the toggle sits beside the theme combo; at 400 px it is visible without opening the View menu; tapping it cycles Dark → Light → Paper and repaints immediately; the pill shows the current theme (☾ / ☀ / 🖹); the top bar does not gain a row at any width.
+Expected by eye: at 1400 px exactly one theme pill sits in the right cluster (no dropdown beside it); at 400 px it is visible without opening the View menu; tapping it cycles Dark → Light → Paper and repaints immediately; the pill shows the current theme (☾ / ☀ / 🖹) and takes one square control of width; the top bar does not gain a row at any width.
 
 - [ ] **Step 7: Commit**
 

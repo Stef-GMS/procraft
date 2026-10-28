@@ -2165,13 +2165,11 @@ impl ProCraftApp {
         .clicked()
     }
 
-    /// Zoom/rotate/theme/About cluster shared by the wide bar (inline) and
-    /// the narrow/tablet bar (inside a View menu). `in_menu` dismisses the
-    /// popup after momentary actions, matching the File menu convention;
-    /// inline clicks must not close anything. `include_theme` is false on
-    /// the tablet bar, where the theme picker lives in its own dropdown
-    /// beside the View menu instead.
-    fn view_controls(&mut self, ui: &mut egui::Ui, in_menu: bool, include_theme: bool) {
+    /// Zoom/rotate/About cluster shared by the wide bar (inline) and the
+    /// narrow/tablet bar (inside a View menu). `in_menu` dismisses the popup
+    /// after momentary actions, matching the File menu convention; inline
+    /// clicks must not close anything.
+    fn view_controls(&mut self, ui: &mut egui::Ui, in_menu: bool) {
         ui.horizontal_wrapped(|ui| {
             if ui.button("−").clicked() {
                 self.zoom = (self.zoom / 1.25).clamp(0.1, 8.0);
@@ -2190,8 +2188,8 @@ impl ProCraftApp {
             }
         });
         let mut deg = self.view_angle.to_degrees();
-        // Desktop keeps this rail short enough to share the row with the
-        // theme cluster; touch menus have the width to keep the full rail.
+        // Desktop keeps the rail short so the cluster shares one row; touch
+        // menus have the width to keep the full rail.
         let rotate_rail = if self.tokens(ui).class == BarLayout::Wide {
             90.0
         } else {
@@ -2207,10 +2205,6 @@ impl ProCraftApp {
                 ui.close();
             }
             self.view_angle = 0.0;
-        }
-        if include_theme {
-            ui.separator();
-            self.theme_control(ui, false);
         }
         let about = if self.has_symbols {
             "ⓘ About"
@@ -2234,26 +2228,6 @@ impl ProCraftApp {
             }
             self.show_shortcuts = !self.show_shortcuts;
         }
-    }
-
-    /// Theme picker: a dropdown showing the current theme's glyph (☾ / ☀ / 🖹);
-    /// the names live in the row tooltips. On touch layouts the popup rows get
-    /// finger-sized height — popups resolve their style from the context, not
-    /// the parent bar, so the spacing is set inside the popup closure.
-    /// (ComboBox popups close on a row tap by design: selection applies
-    /// immediately, so a persistent popup would just hide the result.)
-    fn theme_control(&mut self, ui: &mut egui::Ui, touch: bool) {
-        egui::ComboBox::from_id_salt("theme")
-            .selected_text(design::theme_glyph(self.theme))
-            .show_ui(ui, |ui| {
-                if touch {
-                    ui.spacing_mut().interact_size.y = self.tokens(ui).control_h;
-                }
-                for theme in [Theme::Dark, Theme::Light, Theme::Paper] {
-                    ui.selectable_value(&mut self.theme, theme, design::theme_glyph(theme))
-                        .on_hover_text(theme.name());
-                }
-            });
     }
 
     fn tool_options_bar(&mut self, ui: &mut egui::Ui, layout: BarLayout) {
@@ -5738,8 +5712,8 @@ impl eframe::App for ProCraftApp {
                     }
                     self.doc.mark_full_dirty();
                 }
-                // The theme pill is the one control deliberately kept outside
-                // the touch fold: it is a single pill, and finding the theme
+                // The theme pill is the single theme control at every width,
+                // and it stays outside the touch fold: finding the theme
                 // setting is the whole point. It cycles Dark → Light → Paper.
                 let toggled_theme = design::theme_toggle(ui, &bar_t, &mut self.theme);
                 if toggled_theme {
@@ -5755,15 +5729,10 @@ impl eframe::App for ProCraftApp {
                             if layout == BarLayout::Tablet {
                                 ui.spacing_mut().interact_size.y = bar_t.control_h;
                             }
-                            // Tablet pulls the theme picker out of the menu
-                            // into its own dropdown beside it.
-                            self.view_controls(ui, true, layout == BarLayout::Narrow);
+                            self.view_controls(ui, true);
                         });
-                    if layout == BarLayout::Tablet {
-                        self.theme_control(ui, true);
-                    }
                 } else {
-                    self.view_controls(ui, false, true);
+                    self.view_controls(ui, false);
                 }
             });
         });
